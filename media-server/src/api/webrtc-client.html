@@ -1,0 +1,1048 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Media Server Control Center</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+            body {
+                background-color: #121212;
+                color: #eaeaea;
+            }
+            .video-container {
+                aspect-ratio: 16 / 9;
+                background: #000;
+                border-radius: 0.5rem;
+                overflow: hidden;
+                position: relative;
+            }
+            video {
+                width: 100%;
+                height: 100%;
+                object-fit: contain;
+            }
+            .status-pill {
+                padding: 0.25rem 0.75rem;
+                border-radius: 9999px;
+                font-size: 0.75rem;
+                font-weight: 600;
+            }
+            .timeline-container {
+                position: relative;
+                width: 100%;
+                height: 8px;
+                background: #212121;
+                border-radius: 4px;
+                cursor: pointer;
+            }
+            .timeline-progress {
+                position: absolute;
+                left: 0;
+                top: 0;
+                height: 100%;
+                background: linear-gradient(90deg, #f59e0b, #fbbf24);
+                border-radius: 4px;
+                transition: width 0.1s ease;
+            }
+            .timeline-handle {
+                position: absolute;
+                top: 50%;
+                transform: translate(-50%, -50%);
+                width: 16px;
+                height: 16px;
+                background: #f59e0b;
+                border: 2px solid #eaeaea;
+                border-radius: 50%;
+                cursor: grab;
+                transition: transform 0.1s ease;
+            }
+            .timeline-handle:hover {
+                transform: translate(-50%, -50%) scale(1.2);
+            }
+            .timeline-handle:active {
+                cursor: grabbing;
+            }
+            .live-indicator {
+                animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+            }
+            @keyframes pulse {
+                0%,
+                100% {
+                    opacity: 1;
+                }
+                50% {
+                    opacity: 0.5;
+                }
+            }
+        </style>
+    </head>
+    <body class="min-h-screen p-4 md:p-8">
+        <header
+            class="max-w-6xl mx-auto mb-8 flex flex-col md:flex-row md:items-center justify-between gap-4"
+        >
+            <div>
+                <h1 class="text-3xl font-bold tracking-tight">Media Server</h1>
+                <p class="text-[#bebebe]">RTSP to WebRTC & DVR Management</p>
+            </div>
+            <div id="server-status" class="flex items-center gap-2">
+                <span
+                    class="w-3 h-3 bg-[#333333] rounded-full"
+                    id="status-indicator"
+                ></span>
+                <span class="text-sm font-medium" id="status-text"
+                    >Connecting...</span
+                >
+            </div>
+        </header>
+
+        <main class="max-w-6xl mx-auto space-y-8">
+            <section
+                class="bg-[#212121] border border-[#333333] rounded-xl p-6 shadow-xl"
+            >
+                <h2 class="text-xl font-semibold mb-4">Add New Stream</h2>
+                <form
+                    id="add-stream-form"
+                    class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-4"
+                >
+                    <div class="space-y-1">
+                        <label
+                            class="text-xs uppercase font-bold text-[#8a8a8d]"
+                            >Stream ID</label
+                        >
+                        <input
+                            type="number"
+                            name="source_id"
+                            placeholder="1"
+                            required
+                            min="1"
+                            class="w-full bg-[#121212] border-[#333333] rounded-lg px-4 py-2 focus:ring-2 focus:ring-[#F59E0B] outline-none text-[#eaeaea]"
+                        />
+                    </div>
+                    <div class="space-y-1 lg:col-span-2">
+                        <label
+                            class="text-xs uppercase font-bold text-[#8a8a8d]"
+                            >RTSP URL</label
+                        >
+                        <input
+                            type="text"
+                            name="rtsp_url"
+                            placeholder="rtsp://192.168.1.50:554/ch1"
+                            required
+                            class="w-full bg-[#121212] border-[#333333] rounded-lg px-4 py-2 focus:ring-2 focus:ring-[#F59E0B] outline-none text-[#eaeaea]"
+                        />
+                    </div>
+                    <div class="space-y-1">
+                        <label
+                            class="text-xs uppercase font-bold text-[#8a8a8d]"
+                            >Username (Optional)
+                        </label>
+                        <input
+                            type="text"
+                            name="username"
+                            placeholder="admin"
+                            class="w-full bg-[#121212] border-[#333333] rounded-lg px-4 py-2 focus:ring-2 focus:ring-[#F59E0B] outline-none text-[#eaeaea]"
+                        />
+                    </div>
+                    <div class="space-y-1">
+                        <label
+                            class="text-xs uppercase font-bold text-[#8a8a8d]"
+                            >Password (Optional)</label
+                        >
+                        <input
+                            type="password"
+                            name="password"
+                            placeholder="password"
+                            class="w-full bg-[#121212] border-[#333333] rounded-lg px-4 py-2 focus:ring-2 focus:ring-[#F59E0B] outline-none text-[#eaeaea]"
+                        />
+                    </div>
+
+                    <div
+                        class="flex items-end pb-2 gap-4 md:col-span-2 lg:col-span-1"
+                    >
+                        <label class="flex items-center gap-2 cursor-pointer">
+                            <input
+                                type="checkbox"
+                                name="should_record"
+                                checked
+                                class="w-4 h-4 rounded border-[#333333] bg-[#121212]"
+                            />
+                            <span class="text-sm">Enable DVR</span>
+                        </label>
+                    </div>
+                    <div class="flex items-end md:col-span-2 lg:col-span-1">
+                        <button
+                            type="submit"
+                            class="w-full bg-[#F59E0B] hover:bg-[#D97706] text-[#121212] font-bold py-2 px-4 rounded-lg transition-colors"
+                        >
+                            Add Camera
+                        </button>
+                    </div>
+                </form>
+            </section>
+
+            <section>
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-xl font-semibold">Active Streams</h2>
+                    <div class="flex gap-2">
+                        <input
+                            type="text"
+                            id="api-override"
+                            placeholder="API Base URL (optional)"
+                            class="text-xs bg-[#121212] border-[#333333] rounded px-2 py-1 outline-none text-[#bebebe] w-48"
+                        />
+                        <button
+                            onclick="refreshStreams()"
+                            class="text-sm text-[#F59E0B] hover:text-[#D97706]"
+                        >
+                            Refresh
+                        </button>
+                    </div>
+                </div>
+                <div
+                    id="streams-grid"
+                    class="grid grid-cols-1 md:grid-cols-2 gap-6"
+                ></div>
+            </section>
+        </main>
+
+        <div
+            id="player-modal"
+            class="fixed inset-0 bg-black/90 z-50 hidden flex items-center justify-center p-4"
+        >
+            <div
+                class="bg-[#121212] w-full max-w-5xl rounded-2xl overflow-hidden shadow-2xl"
+            >
+                <div
+                    class="p-4 border-b border-[#333333] flex justify-between items-center"
+                >
+                    <div class="flex items-center gap-3">
+                        <h3 id="modal-title" class="font-bold">
+                            Stream Viewer
+                        </h3>
+                        <div
+                            id="mode-indicator"
+                            class="hidden items-center gap-2 px-3 py-1 rounded-full bg-[#212121]"
+                        >
+                            <span
+                                id="mode-dot"
+                                class="w-2 h-2 rounded-full"
+                            ></span>
+                            <span
+                                id="mode-text"
+                                class="text-xs font-bold uppercase"
+                            ></span>
+                        </div>
+                    </div>
+                    <button
+                        onclick="closePlayer()"
+                        class="p-2 hover:bg-[#212121] rounded-full text-2xl"
+                    >
+                        &times;
+                    </button>
+                </div>
+
+                <div class="p-6 space-y-4">
+                    <div class="video-container">
+                        <video
+                            id="remote-video"
+                            autoplay
+                            playsinline
+                            muted
+                        ></video>
+                        <div
+                            id="video-overlay"
+                            class="absolute inset-0 flex items-center justify-center bg-black/50 hidden"
+                        >
+                            <span class="text-[#eaeaea] font-bold"
+                                >Connecting...</span
+                            >
+                        </div>
+                    </div>
+
+                    <div
+                        id="playback-controls"
+                        class="space-y-4 bg-[#212121] p-5 rounded-xl"
+                    >
+                        <div class="flex items-center justify-between text-sm">
+                            <div class="flex items-center gap-2">
+                                <span class="text-[#bebebe]"
+                                    >Current Time:</span
+                                >
+                                <span
+                                    id="current-time-display"
+                                    class="font-mono text-[#F59E0B] font-bold"
+                                    >--:--:--</span
+                                >
+                            </div>
+                            <button
+                                id="btn-go-live"
+                                onclick="goLive()"
+                                class="px-4 py-1 bg-[#B91C1C] hover:bg-[#DC2626] rounded-lg font-bold text-sm flex items-center gap-2 hidden text-[#eaeaea]"
+                            >
+                                <span
+                                    class="w-2 h-2 bg-[#eaeaea] rounded-full live-indicator"
+                                ></span>
+                                GO LIVE
+                            </button>
+                        </div>
+
+                        <div class="space-y-2">
+                            <div id="timeline" class="timeline-container">
+                                <div
+                                    id="timeline-progress"
+                                    class="timeline-progress"
+                                ></div>
+                                <div
+                                    id="timeline-handle"
+                                    class="timeline-handle"
+                                ></div>
+                            </div>
+                            <div
+                                class="flex justify-between text-xs text-[#8a8a8d] font-mono"
+                            >
+                                <span id="timeline-start">00:00</span>
+                                <span id="timeline-end">--:--</span>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div class="space-y-2">
+                                <label
+                                    class="text-xs uppercase font-bold text-[#bebebe]"
+                                    >Seek to Date/Time</label
+                                >
+                                <div class="flex gap-2">
+                                    <input
+                                        type="datetime-local"
+                                        id="seek-datetime"
+                                        class="flex-grow bg-[#121212] border border-[#333333] rounded-lg px-3 py-2 text-sm text-[#eaeaea] focus:ring-2 focus:ring-[#F59E0B] outline-none"
+                                    />
+                                    <button
+                                        onclick="seekToDateTime()"
+                                        class="px-4 py-2 bg-[#F59E0B] hover:bg-[#D97706] rounded-lg font-bold text-sm text-[#121212]"
+                                    >
+                                        Seek
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div class="space-y-2">
+                                <label
+                                    class="text-xs uppercase font-bold text-[#bebebe]"
+                                    >Quick Jump</label
+                                >
+                                <div class="flex gap-2">
+                                    <button
+                                        onclick="skipTime(-60)"
+                                        class="flex-1 bg-[#212121] hover:bg-[#333333] py-2 rounded-lg text-sm font-bold"
+                                    >
+                                        -1m
+                                    </button>
+                                    <button
+                                        onclick="skipTime(-10)"
+                                        class="flex-1 bg-[#212121] hover:bg-[#333333] py-2 rounded-lg text-sm font-bold"
+                                    >
+                                        -10s
+                                    </button>
+                                    <button
+                                        onclick="skipTime(10)"
+                                        class="flex-1 bg-[#212121] hover:bg-[#333333] py-2 rounded-lg text-sm font-bold"
+                                    >
+                                        +10s
+                                    </button>
+                                    <button
+                                        onclick="skipTime(60)"
+                                        class="flex-1 bg-[#212121] hover:bg-[#333333] py-2 rounded-lg text-sm font-bold"
+                                    >
+                                        +1m
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="flex items-center gap-4">
+                            <span
+                                class="text-xs uppercase font-bold text-[#bebebe]"
+                                >Playback Speed:</span
+                            >
+                            <div class="flex gap-2 flex-wrap">
+                                <button
+                                    onclick="setSpeed(0.5)"
+                                    class="px-3 py-1 bg-[#212121] hover:bg-[#333333] rounded text-sm font-bold speed-btn"
+                                    data-speed="0.5"
+                                >
+                                    0.5x
+                                </button>
+                                <button
+                                    onclick="setSpeed(1)"
+                                    class="px-3 py-1 bg-[#F59E0B] rounded text-sm font-bold speed-btn text-[#121212]"
+                                    data-speed="1"
+                                >
+                                    1x
+                                </button>
+                                <button
+                                    onclick="setSpeed(1.5)"
+                                    class="px-3 py-1 bg-[#212121] hover:bg-[#333333] rounded text-sm font-bold speed-btn"
+                                    data-speed="1.5"
+                                >
+                                    1.5x
+                                </button>
+                                <button
+                                    onclick="setSpeed(2)"
+                                    class="px-3 py-1 bg-[#212121] hover:bg-[#333333] rounded text-sm font-bold speed-btn"
+                                    data-speed="2"
+                                >
+                                    2x
+                                </button>
+                                <button
+                                    onclick="setSpeed(4)"
+                                    class="px-3 py-1 bg-[#212121] hover:bg-[#333333] rounded text-sm font-bold speed-btn"
+                                    data-speed="4"
+                                >
+                                    4x
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            let pc = null;
+            let currentSession = {
+                streamId: null,
+                sessionId: null,
+                isLive: true,
+                currentSpeed: 1.0,
+                currentTimeMs: Date.now(),
+            };
+            let isDraggingTimeline = false;
+            let statusPollInterval = null;
+
+            function getApiBase() {
+                const override = document
+                    .getElementById("api-override")
+                    .value.trim();
+                if (override)
+                    return override.endsWith("/")
+                        ? override.slice(0, -1)
+                        : override;
+                return window.location.origin;
+            }
+
+            async function api(path, method = "GET", body = null) {
+                const base = getApiBase();
+                const cleanPath = path.startsWith("/") ? path : `/${path}`;
+                const url = `${base}${cleanPath}`;
+
+                const options = {
+                    method,
+                    headers: {
+                        "Content-Type": "application/json",
+                        Accept: "application/json",
+                    },
+                };
+                if (body) options.body = JSON.stringify(body);
+
+                try {
+                    const res = await fetch(url, options);
+
+                    const contentType = res.headers.get("content-type");
+                    if (
+                        !contentType ||
+                        !contentType.includes("application/json")
+                    ) {
+                        if (res.status === 204) return null;
+                        throw new Error(
+                            `Expected JSON but received ${contentType}`,
+                        );
+                    }
+
+                    if (res.status === 204) return null;
+                    const data = await res.json();
+                    if (!res.ok)
+                        throw new Error(
+                            data.message || `API Error: ${res.status}`,
+                        );
+                    return data;
+                } catch (err) {
+                    if (!path.includes("health") && !path.includes("mode")) {
+                        showToast(err.message, "error");
+                    }
+                    throw err;
+                }
+            }
+
+            async function checkHealth() {
+                try {
+                    const data = await api("/health");
+                    const indicator =
+                        document.getElementById("status-indicator");
+                    const text = document.getElementById("status-text");
+                    indicator.className =
+                        "w-3 h-3 bg-[#129B70] rounded-full shadow-[0_0_8px_rgba(18,155,112,0.6)]";
+                    text.innerText = `Healthy (v${data.version || "?"})`;
+                } catch (e) {
+                    document.getElementById("status-indicator").className =
+                        "w-3 h-3 bg-[#B91C1C] rounded-full";
+                    document.getElementById("status-text").innerText =
+                        "Offline";
+                }
+            }
+
+            async function refreshStreams() {
+                try {
+                    const data = await api("/streams");
+                    const grid = document.getElementById("streams-grid");
+                    if (!data || !data.streams || data.streams.length === 0) {
+                        grid.innerHTML =
+                            '<div class="col-span-full py-12 text-center text-[#8a8a8d]">No active streams found.</div>';
+                        return;
+                    }
+                    grid.innerHTML = data.streams
+                        .map(
+                            (stream) => `
+                    <div class="bg-[#121212] border border-[#333333] rounded-xl overflow-hidden hover:border-[#8a8a8d] transition-all">
+                        <div class="p-4 flex justify-between items-start border-b border-[#333333]">
+                            <div class="truncate mr-4">
+                                <div class="font-bold truncate" title="${stream.rtsp_url}">${stream.rtsp_url}</div>
+                                <div class="text-[10px] text-[#8a8a8d] font-mono">${stream.source_id}</div>
+                            </div>
+                            <span class="status-pill ${stream.state === "Running" ? "bg-[#129B70]/10 text-[#129B70]" : "bg-[#F59E0B]/10 text-[#F59E0B]"}">
+                                ${stream.state}
+                            </span>
+                        </div>
+                        <div class="p-4 flex gap-2">
+                            <button onclick="startViewing('${stream.source_id}')" class="flex-1 bg-[#F59E0B] hover:bg-[#D97706] py-2 rounded-lg text-sm font-semibold text-[#121212]">
+                                View Stream
+                            </button>
+                            <button onclick="deleteStream('${stream.source_id}')" class="p-2 text-[#B91C1C] hover:bg-[#B91C1C]/10 rounded-lg">
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                            </button>
+                        </div>
+                    </div>
+                `,
+                        )
+                        .join("");
+                } catch (e) {
+                    document.getElementById("streams-grid").innerHTML =
+                        `<div class="col-span-full py-12 text-center text-[#B91C1C]">Error connecting to server. Check API URL.</div>`;
+                }
+            }
+
+            document.getElementById("add-stream-form").onsubmit = async (e) => {
+                e.preventDefault();
+                const formData = new FormData(e.target);
+
+                let rtspUrl = formData.get("rtsp_url");
+                let username = formData.get("username") || null;
+                let password = formData.get("password") || null;
+
+                const rtspRegex =
+                    /^(rtsp(?:s)?:\/\/)(?:([^:@]+)(?::([^@]*))?@)?(.+)$/;
+                const match = rtspUrl.match(rtspRegex);
+
+                if (match) {
+                    const protocol = match[1];
+                    const urlUsername = match[2] || null;
+                    const urlPassword = match[3] || null;
+                    const hostAndPath = match[4];
+
+                    if (urlUsername || urlPassword) {
+                        if (!username && urlUsername) {
+                            username = urlUsername;
+                        }
+                        if (!password && urlPassword) {
+                            password = urlPassword;
+                        }
+                        rtspUrl = protocol + hostAndPath;
+                    }
+                }
+
+                const payload = {
+                    source_id: parseInt(formData.get("source_id")),
+                    rtsp_url: rtspUrl,
+                    username: username,
+                    password: password,
+                    should_record: formData.get("should_record") === "on",
+                };
+
+                try {
+                    await api("/streams", "POST", payload);
+                    e.target.reset();
+                    refreshStreams();
+                    showToast("Stream added successfully");
+                } catch (e) {}
+            };
+
+            async function deleteStream(id) {
+                if (!confirm("Are you sure you want to remove this stream?"))
+                    return;
+                try {
+                    await api(`/streams/${id}`, "DELETE");
+                    refreshStreams();
+                    showToast("Stream deleted");
+                } catch (e) {}
+            }
+
+            async function closeActiveSession() {
+                if (pc) {
+                    pc.close();
+                    pc = null;
+                }
+                if (statusPollInterval) {
+                    clearInterval(statusPollInterval);
+                    statusPollInterval = null;
+                }
+                if (currentSession.sessionId) {
+                    const endpoint = `/streams/${currentSession.streamId}/webrtc/${currentSession.sessionId}`;
+                    await api(endpoint, "DELETE").catch(() => {});
+                }
+            }
+
+            async function setupWebRTC(
+                streamId,
+                createPath,
+                payload,
+                isLiveSession,
+            ) {
+                const startTime = Date.now();
+                console.log(
+                    `[${startTime}] Starting WebRTC setup for stream ${streamId}`,
+                );
+
+                try {
+                    if (pc) pc.close();
+                    pc = new RTCPeerConnection({
+                        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+                    });
+
+                    const video = document.getElementById("remote-video");
+                    pc.ontrack = (e) => {
+                        const trackTime = Date.now();
+                        console.log(
+                            `[${trackTime}] Video track received, elapsed: ${trackTime - startTime}ms`,
+                        );
+                        video.srcObject = e.streams[0];
+                        document
+                            .getElementById("video-overlay")
+                            .classList.add("hidden");
+
+                        // Log when the video actually starts playing
+                        video.onloadeddata = () => {
+                            const loadedTime = Date.now();
+                            console.log(
+                                `[${loadedTime}] Video data loaded and playing, elapsed: ${loadedTime - startTime}ms`,
+                            );
+                        };
+
+                        video.oncanplay = () => {
+                            const canPlayTime = Date.now();
+                            console.log(
+                                `[${canPlayTime}] Video can play, elapsed: ${canPlayTime - startTime}ms`,
+                            );
+                        };
+
+                        video.onplay = () => {
+                            const playTime = Date.now();
+                            console.log(
+                                `[${playTime}] Video play event fired, elapsed: ${playTime - startTime}ms`,
+                            );
+                        };
+                    };
+
+                    pc.onconnectionstatechange = () => {
+                        console.log(
+                            `WebRTC connection state changed to: ${pc.connectionState}`,
+                        );
+                    };
+
+                    pc.onsignalingstatechange = () => {
+                        console.log(
+                            `WebRTC signaling state changed to: ${pc.signalingState}`,
+                        );
+                    };
+
+                    pc.oniceconnectionstatechange = () => {
+                        console.log(
+                            `WebRTC ICE connection state changed to: ${pc.iceConnectionState}`,
+                        );
+                    };
+
+                    pc.addTransceiver("video", { direction: "recvonly" });
+                    console.log(
+                        `[${Date.now()}] Added video transceiver, elapsed: ${Date.now() - startTime}ms`,
+                    );
+
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    console.log(
+                        `[${Date.now()}] Created and set local offer, elapsed: ${Date.now() - startTime}ms`,
+                    );
+
+                    const response = await api(createPath, "POST", {
+                        ...payload,
+                        offer: offer.sdp,
+                    });
+                    console.log(
+                        `[${Date.now()}] Received server response, elapsed: ${Date.now() - startTime}ms`,
+                    );
+
+                    await pc.setRemoteDescription(
+                        new RTCSessionDescription({
+                            type: "answer",
+                            sdp: response.answer,
+                        }),
+                    );
+                    console.log(
+                        `[${Date.now()}] Set remote description, elapsed: ${Date.now() - startTime}ms`,
+                    );
+
+                    currentSession.streamId = streamId;
+                    currentSession.sessionId = response.session_id;
+                    currentSession.isLive = isLiveSession;
+                    currentSession.currentSpeed = 1.0;
+
+                    updateModeIndicator();
+                    startPolling();
+
+                    console.log(
+                        `[${Date.now()}] WebRTC setup completed, total time: ${Date.now() - startTime}ms`,
+                    );
+                } catch (e) {
+                    const errorTime = Date.now();
+                    console.error(
+                        `[${errorTime}] WebRTC setup failed after ${errorTime - startTime}ms:`,
+                        e,
+                    );
+                    showToast("Failed to start stream", "error");
+                }
+            }
+
+            async function startLiveSession(streamId) {
+                await closeActiveSession();
+                await setupWebRTC(
+                    streamId,
+                    `/streams/${streamId}/webrtc`,
+                    {},
+                    true,
+                );
+            }
+
+            async function startDvrSession(streamId, timestampMs) {
+                await closeActiveSession();
+                await setupWebRTC(
+                    streamId,
+                    `/streams/${streamId}/webrtc/dvr`,
+                    { timestamp: timestampMs },
+                    false,
+                );
+                currentSession.currentTimeMs = timestampMs;
+            }
+
+            function startViewing(streamId) {
+                document.getElementById("modal-title").innerText =
+                    "Stream Viewer";
+                document
+                    .getElementById("player-modal")
+                    .classList.remove("hidden");
+                document
+                    .getElementById("video-overlay")
+                    .classList.remove("hidden");
+                document
+                    .getElementById("mode-indicator")
+                    .classList.remove("hidden");
+                document.getElementById("mode-indicator").classList.add("flex");
+                startLiveSession(streamId);
+            }
+
+            function closePlayer() {
+                closeActiveSession().catch(() => {});
+                document.getElementById("player-modal").classList.add("hidden");
+                document.getElementById("remote-video").srcObject = null;
+                currentSession = {
+                    streamId: null,
+                    sessionId: null,
+                    isLive: true,
+                    currentSpeed: 1.0,
+                    currentTimeMs: Date.now(),
+                };
+            }
+
+            function updateModeIndicator() {
+                const dot = document.getElementById("mode-dot");
+                const text = document.getElementById("mode-text");
+                const goLiveBtn = document.getElementById("btn-go-live");
+
+                if (currentSession.isLive) {
+                    dot.className =
+                        "w-2 h-2 rounded-full bg-[#B91C1C] live-indicator";
+                    text.innerText = "LIVE";
+                    text.className =
+                        "text-xs font-bold uppercase text-[#B91C1C]";
+                    goLiveBtn.classList.add("hidden");
+                } else {
+                    dot.className = "w-2 h-2 rounded-full bg-[#F59E0B]";
+                    text.innerText = "DVR";
+                    text.className =
+                        "text-xs font-bold uppercase text-[#F59E0B]";
+                    goLiveBtn.classList.remove("hidden");
+                }
+            }
+
+            async function goLive() {
+                if (!currentSession.sessionId) return;
+                try {
+                    // Use the /live endpoint to switch mode without creating new session
+                    const result = await api(
+                        `/streams/${currentSession.streamId}/webrtc/${currentSession.sessionId}/live`,
+                        "POST",
+                    );
+                    currentSession.isLive = true;
+                    currentSession.currentTimeMs = Date.now();
+                    currentSession.currentSpeed = 1.0;
+                    updateModeIndicator();
+                    updateSpeedButtonsUI(1.0);
+                    showToast("Switched to live mode");
+                } catch (e) {
+                    showToast("Failed to switch to live", "error");
+                }
+            }
+
+            function updateSpeedButtonsUI(speed) {
+                document.querySelectorAll(".speed-btn").forEach((btn) => {
+                    if (parseFloat(btn.dataset.speed) === speed) {
+                        btn.className =
+                            "px-3 py-1 bg-[#F59E0B] rounded text-sm font-bold speed-btn text-[#121212]";
+                    } else {
+                        btn.className =
+                            "px-3 py-1 bg-[#212121] hover:bg-[#333333] rounded text-sm font-bold speed-btn";
+                    }
+                });
+            }
+
+            async function seekToTimestamp(timestampMs) {
+                if (!currentSession.sessionId) return;
+
+                try {
+                    // Always use the seek endpoint - backend handles switching from live to DVR
+                    const result = await api(
+                        `/streams/${currentSession.streamId}/webrtc/${currentSession.sessionId}/seek`,
+                        "POST",
+                        {
+                            timestamp: timestampMs,
+                        },
+                    );
+
+                    // Update from server response
+                    currentSession.currentTimeMs =
+                        result.current_time_ms || timestampMs;
+                    currentSession.isLive = result.is_live;
+                    currentSession.currentSpeed = result.speed;
+                    updateModeIndicator();
+                    updateTimelineDisplay();
+                    updateSpeedButtonsUI(result.speed);
+                } catch (e) {
+                    throw e;
+                }
+            }
+
+            async function seekToDateTime() {
+                const input = document.getElementById("seek-datetime");
+                if (!input.value) {
+                    showToast("Please select a date and time", "error");
+                    return;
+                }
+
+                try {
+                    const timestampMs = new Date(input.value).getTime();
+                    await seekToTimestamp(timestampMs);
+                    showToast(
+                        `Seeked to ${new Date(timestampMs).toLocaleString()}`,
+                    );
+                } catch (e) {
+                    showToast("Seek failed: " + e.message, "error");
+                }
+            }
+
+            async function skipTime(seconds) {
+                if (!currentSession.sessionId) return;
+
+                try {
+                    const baseTime = currentSession.isLive
+                        ? Date.now()
+                        : currentSession.currentTimeMs;
+                    const targetMs = baseTime + seconds * 1000;
+                    await seekToTimestamp(targetMs);
+                } catch (e) {
+                    showToast("Skip failed: " + e.message, "error");
+                }
+            }
+
+            async function setSpeed(speed) {
+                if (!currentSession.sessionId) return;
+                if (currentSession.isLive) {
+                    showToast(
+                        "Speed control only available in DVR mode",
+                        "error",
+                    );
+                    return;
+                }
+
+                try {
+                    const result = await api(
+                        `/streams/${currentSession.streamId}/webrtc/${currentSession.sessionId}/speed`,
+                        "POST",
+                        {
+                            speed: speed,
+                        },
+                    );
+
+                    currentSession.currentSpeed = result.speed;
+                    updateSpeedButtonsUI(result.speed);
+                    showToast(`Playback speed set to ${speed}x`);
+                } catch (e) {
+                    showToast("Failed to change speed", "error");
+                }
+            }
+
+            function startPolling() {
+                if (statusPollInterval) {
+                    clearInterval(statusPollInterval);
+                }
+
+                statusPollInterval = setInterval(async () => {
+                    if (currentSession.sessionId) {
+                        try {
+                            const status = await api(
+                                `/streams/${currentSession.streamId}/webrtc/${currentSession.sessionId}/mode`,
+                            );
+                            if (status) {
+                                currentSession.isLive = status.is_live;
+                                currentSession.currentTimeMs =
+                                    status.current_time_ms;
+                                currentSession.currentSpeed = status.speed;
+
+                                if (!isDraggingTimeline) {
+                                    updateModeIndicator();
+                                    updateTimelineDisplay();
+                                }
+                            }
+                        } catch (e) {
+                            // Silent fail on poll
+                        }
+                    }
+                }, 1000);
+            }
+
+            function updateTimelineDisplay() {
+                const timeDisplay = document.getElementById(
+                    "current-time-display",
+                );
+
+                let displayTime = currentSession.currentTimeMs;
+                if (currentSession.isLive) {
+                    displayTime = Date.now();
+                }
+
+                timeDisplay.innerText = new Date(
+                    displayTime,
+                ).toLocaleTimeString();
+
+                const progress = document.getElementById("timeline-progress");
+                const handle = document.getElementById("timeline-handle");
+
+                if (currentSession.isLive) {
+                    progress.style.width = "100%";
+                    handle.style.left = "100%";
+                } else {
+                    // For DVR, we'd ideally show position within a window.
+                    // For now, let's keep it simple: 100% if live, or we need a relative window.
+                    // A simple window: last 1 hour.
+                    const now = Date.now();
+                    const windowSize = 60 * 60 * 1000; // 1 hour
+                    const start = now - windowSize;
+
+                    let pct = ((displayTime - start) / windowSize) * 100;
+                    pct = Math.max(0, Math.min(100, pct));
+
+                    progress.style.width = `${pct}%`;
+                    handle.style.left = `${pct}%`;
+
+                    document.getElementById("timeline-start").innerText =
+                        new Date(start).toLocaleTimeString();
+                    document.getElementById("timeline-end").innerText =
+                        new Date(now).toLocaleTimeString();
+                }
+            }
+
+            const timeline = document.getElementById("timeline");
+            const timelineHandle = document.getElementById("timeline-handle");
+
+            timeline.addEventListener("mousedown", (e) => {
+                isDraggingTimeline = true;
+                updateTimelinePosition(e);
+            });
+
+            document.addEventListener("mousemove", (e) => {
+                if (!isDraggingTimeline) return;
+                updateTimelinePosition(e);
+            });
+
+            document.addEventListener("mouseup", (e) => {
+                if (!isDraggingTimeline) return;
+                isDraggingTimeline = false;
+
+                // Seek on release
+                const rect = timeline.getBoundingClientRect();
+                const x = Math.max(
+                    0,
+                    Math.min(e.clientX - rect.left, rect.width),
+                );
+                const percentage = x / rect.width;
+
+                const now = Date.now();
+                const windowSize = 60 * 60 * 1000; // 1 hour
+                const start = now - windowSize;
+                const seekTime = start + percentage * windowSize;
+
+                seekToTimestamp(Math.floor(seekTime));
+            });
+
+            function updateTimelinePosition(e) {
+                const rect = timeline.getBoundingClientRect();
+                const x = Math.max(
+                    0,
+                    Math.min(e.clientX - rect.left, rect.width),
+                );
+                const percentage = (x / rect.width) * 100;
+
+                const progress = document.getElementById("timeline-progress");
+                const handle = document.getElementById("timeline-handle");
+
+                progress.style.width = percentage + "%";
+                handle.style.left = percentage + "%";
+            }
+
+            function showToast(msg, type = "info") {
+                const toast = document.createElement("div");
+                toast.className = `fixed bottom-4 right-4 px-6 py-3 rounded-lg shadow-2xl z-[100] ${type === "error" ? "bg-[#B91C1C]" : "bg-[#F59E0B]"} text-[#121212] font-medium`;
+                toast.innerText = msg;
+                document.body.appendChild(toast);
+                setTimeout(() => toast.remove(), 3000);
+            }
+
+            window.onload = () => {
+                checkHealth();
+                refreshStreams();
+                setInterval(checkHealth, 30000);
+
+                const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+                const formatted = oneHourAgo.toISOString().slice(0, 16);
+                document.getElementById("seek-datetime").value = formatted;
+            };
+        </script>
+    </body>
+</html>

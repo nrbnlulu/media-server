@@ -1,0 +1,49 @@
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.local
+
+# Recordings
+recordings/
+*.mp4
+*.mkv
+*.avi
+
+# Logs
+*.log
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Temporary files
+*.tmp
+*.temp
+
+# Debug
+debug/
+*.dmp
+
+# Build
+dist/
+build/
+
+# Test artifacts
+test-output/
+cam1
+!media-server/assets/placeholder_h264.mp4
+!media-server/assets/placeholder_h265.mp4
+media-server/dvr
