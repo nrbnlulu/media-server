@@ -1,6 +1,7 @@
 pub mod dvr;
 pub mod recording;
 
+use media_server_api_models::UnixTimestamp;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -32,8 +33,8 @@ pub struct StreamInfo {
     pub rtsp_url: String,
     pub state: StreamState,
     pub should_record: bool,
-    pub webrtc_sessions: Vec<Uuid>,
     pub restart_interval_secs: Option<u64>,
+    pub recording_start_time: Option<UnixTimestamp>
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

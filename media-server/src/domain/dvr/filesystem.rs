@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::utils::UnixTimestamp;
+use media_server_api_models::UnixTimestamp;
 
 const DVR_BASE_DIR: &str = "dvr";
 

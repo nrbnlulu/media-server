@@ -2,7 +2,7 @@ use crate::common::nal_utils::{self, FramingFormat};
 use crate::common::traits::FfmpegConsumer;
 use crate::common::{TimeBase, VideoCodec};
 use crate::domain::dvr::filesystem;
-use crate::utils::UnixTimestamp;
+use media_server_api_models::UnixTimestamp;
 use anyhow::{bail, Result};
 use axum::async_trait;
 use gstreamer as gst;

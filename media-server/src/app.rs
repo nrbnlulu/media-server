@@ -7,15 +7,17 @@ use crate::publishers::webrtc::{WebRtcSession, WebrtcManager};
 use crate::publishers::wsc_rtp::{WscRtpPublisher, WscRtpUdpManager};
 use crate::sources::dvr::DvrPlayer;
 use crate::sources::rtsp::RtspClient;
-use crate::utils::UnixTimestamp;
 use anyhow::{anyhow, bail, Result};
 use dashmap::DashMap;
+use futures::TryFutureExt;
 use gstreamer::glib::clone::Downgrade;
 use media_server_api_models::CreateWebRtcSessionRequest;
+use media_server_api_models::UnixTimestamp;
 use parking_lot::Mutex;
 use serde::Deserialize;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -24,6 +26,7 @@ struct SourceWrapper {
     source: Arc<dyn VideoSource>,
     task: tokio::task::JoinHandle<()>,
     rtp_packetizer: Arc<RtpPacketizer>,
+    recorder: Option<Arc<DvrRecorder>>,
 }
 
 pub type ClientSessionId = Uuid;
@@ -107,8 +110,10 @@ impl ClientSession {
     pub async fn seek(&self, timestamp: UnixTimestamp, codec: &VideoCodec) -> Result<()> {
         let mut state_guard = self.state.lock().await;
         // first check that we're on dvr mode otherwise disable the live packetizer
-        let player = match *state_guard {
-            ClientSessionState::Dvr(ref player, _) => player.clone(),
+        match *state_guard {
+            ClientSessionState::Dvr(ref player, _) => {
+                player.seek_to_timestamp(timestamp, 1.0).await?;
+            }
             ClientSessionState::Live => {
                 // Remove from live packetizer - we'll feed from DVR instead
                 self.live_packetizer
@@ -122,19 +127,16 @@ impl ClientSession {
                 )?;
                 let player = Arc::new(player);
                 *state_guard = ClientSessionState::Dvr(player.clone(), None);
-                player
+                let player_clone = player.clone();
+                let join_handle = tokio::spawn(async move {
+                    player_clone.play().await;
+                });
+                // wait for the player to start.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                player.seek_to_timestamp(timestamp, 1.0).await?;
+                *state_guard = ClientSessionState::Dvr(player.clone(), Some(Arc::new(join_handle)));
             }
         };
-        drop(state_guard);
-
-        let player_clone = player.clone();
-        let join_handle = tokio::spawn(async move {
-            player_clone.play().await;
-        });
-
-        // Update the state with the new player and handle
-        let mut state_guard = self.state.lock().await;
-        *state_guard = ClientSessionState::Dvr(player, Some(Arc::new(join_handle)));
         Ok(())
     }
 }
@@ -195,16 +197,19 @@ impl GlobalState {
             vec![rtp_packetizer.clone()],
         )?);
 
+        let mut recorder = None;
         if config.should_record {
             filesystem::ensure_stream_dvr_dir(source_id)?;
             match DvrRecorder::new(source_id) {
-                Ok(recorder) => {
-                    rtsp_client.add_consumer(Arc::new(recorder)).await;
+                Ok(res) => {
+                    let recorder_arc = Arc::new(res);
+                    rtsp_client.add_consumer(recorder_arc.clone()).await;
+                    recorder.replace(recorder_arc);
                 }
                 Err(e) => {
                     log::error!("Failed to create recorder for stream {}: {}", source_id, e);
                 }
-            }
+            };
         }
         let rtsp_client_clone = rtsp_client.clone();
         let handle = tokio::spawn(async move {
@@ -218,6 +223,7 @@ impl GlobalState {
                 source: rtsp_client,
                 task: handle,
                 rtp_packetizer,
+                recorder,
             },
         );
 
@@ -242,20 +248,19 @@ impl GlobalState {
             .ok_or_else(|| anyhow!("Stream {} not found", source_id))?;
 
         let state = source.source.state().await;
-        let webrtc_sessions: Vec<Uuid> = self
-            .client_sessions
-            .iter()
-            .filter(|entry| entry.value().source_id() == &source_id)
-            .map(|entry| entry.key().clone())
-            .collect();
+
+        let recording_start_time = match source.recorder.as_ref() {
+            Some(recorder) => recorder.start_time(),
+            None => None,
+        };
 
         Ok(StreamInfo {
             session_id: source_id,
             rtsp_url: source.source.url().to_string(),
             state,
             should_record: source.source.config().should_record,
-            webrtc_sessions,
             restart_interval_secs: source.source.config().restart_interval_secs,
+            recording_start_time,
         })
     }
 

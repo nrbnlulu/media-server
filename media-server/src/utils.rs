@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use media_server_api_models::UnixTimestamp;
 
 pub fn check_dependencies() -> Result<()> {
     // Initialize FFmpeg
@@ -180,7 +181,6 @@ fn extract_all_h264_frames_from_mp4(mp4_data: &[u8]) -> Result<Vec<Vec<u8>>> {
 
     Ok(frames)
 }
-pub type UnixTimestamp = u64;
 
 pub fn get_current_unix_timestamp() -> UnixTimestamp {
     std::time::SystemTime::now()

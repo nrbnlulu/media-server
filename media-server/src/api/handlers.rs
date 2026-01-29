@@ -124,8 +124,8 @@ pub async fn list_streams(State(state): State<Arc<GlobalState>>) -> Json<ListStr
             rtsp_url: s.rtsp_url,
             state: format!("{:?}", s.state),
             should_record: s.should_record,
-            webrtc_sessions: s.webrtc_sessions,
             restart_interval_secs: s.restart_interval_secs,
+            recording_start_time: s.recording_start_time
         })
         .collect();
     Json(ListStreamsResponse { streams })
@@ -157,8 +157,8 @@ pub async fn get_stream(
         rtsp_url: info.rtsp_url,
         state: format!("{:?}", info.state),
         should_record: info.should_record,
-        webrtc_sessions: info.webrtc_sessions,
         restart_interval_secs: info.restart_interval_secs,
+        recording_start_time: info.recording_start_time
     }))
 }
 

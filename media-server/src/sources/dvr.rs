@@ -4,7 +4,7 @@ use crate::common::rtp::RtpPacketizer;
 use crate::common::traits::RtpConsumer;
 use crate::common::VideoCodec;
 use crate::domain::dvr::filesystem::{self, FindNextRecRes, RecordingMetadata};
-use crate::utils::UnixTimestamp;
+use media_server_api_models::UnixTimestamp;
 use anyhow::{anyhow, bail, Result};
 use chrono::Duration;
 use futures::StreamExt;
@@ -379,7 +379,7 @@ fn create_pipeline(
 
             frame_count += 1;
             if frame_count <= 5 || frame_count % 100 == 0 {
-                log::info!(
+                log::trace!(
                     "DVR frame {}: raw_size={}, pts={:?}, rtp_ts={}, nal_count={}",
                     frame_count,
                     raw_data.len(),
@@ -393,7 +393,7 @@ fn create_pipeline(
             let rtp_packets = rtp_packetizer.packetize(&nal_units, rtp_timestamp, &codec_clone);
 
             if frame_count <= 5 {
-                log::info!(
+                log::trace!(
                     "DVR frame {}: generated {} RTP packets",
                     frame_count,
                     rtp_packets.len()
@@ -411,9 +411,13 @@ fn create_pipeline(
     Ok((pipeline, bus))
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SeekError {
+    #[error("seek before start")]
     SeekBeforeStart,
+    #[error("seek after end")]
     SeekAfterEnd,
+    #[error(transparent)]
     GstError(anyhow::Error),
 }
+
