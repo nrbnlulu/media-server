@@ -1,12 +1,12 @@
 [workspace]
-members = ["media-server", "media-server-api-models"]
+members = ["media-server", "crates/media-server-api-models"]
 resolver = "2"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
 uuid = { version = "1.6", features = ["serde"] }
 utoipa = { version = "4.2", features = ["uuid"] }
-media-server-api-models = { path = "media-server-api-models" }
+media-server-api-models = { path = "crates/media-server-api-models" }
 
 [profile.release]
 opt-level = 3
