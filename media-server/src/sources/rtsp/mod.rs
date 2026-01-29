@@ -89,7 +89,8 @@ impl RtspClient {
         let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel::<ffmpeg::Packet>(30);
 
         let rtsp_url = self.build_rtsp_url();
-        let session_id = self.config.source_id;
+        let session_id = self.config.source_id.clone();
+        let session_id_for_loop = session_id.clone();
         let shutdown_sig = Arc::clone(&self.shutdown);
         let restart_delay =
             std::time::Duration::from_secs(self.config.restart_interval_secs.unwrap_or(5));
@@ -109,6 +110,7 @@ impl RtspClient {
                 restart_delay,
             );
         });
+        let session_id = session_id_for_loop;
 
         let mut fallback_is_running = false;
         let fallback_terminate_sig = Arc::new(AtomicBool::new(true));
@@ -129,10 +131,10 @@ impl RtspClient {
                             fallback_is_running = false;
                         },
                         LiveStreamState::Offline => {
-                            log::info!("Live stream down for {}, checking fallback state", session_id);
+                            log::info!("Live stream down for {}, checking fallback state", &session_id);
                             if !fallback_is_running {
                                 if let (Some(codec), Some(timebase)) = (current_codec, live_timebase) {
-                                    log::info!("Starting fallback pipeline for {} with codec {:?}", session_id, codec);
+                                    log::info!("Starting fallback pipeline for {} with codec {:?}", &session_id, codec);
 
                                     // Calculate offset for fallback: continue from where live stream left off
                                     let fallback_ts_offset = last_dts + last_duration;
@@ -148,16 +150,17 @@ impl RtspClient {
                                     };
 
                                     let termination_sig_clone = fallback_terminate_sig.clone();
+                                    let session_id_clone = session_id.clone();
                                     tokio::task::spawn_blocking(move || {
                                         run_fallback_pipeline(
                                             ctx,
-                                            session_id,
+                                            session_id_clone,
                                             termination_sig_clone,
                                             fallback_packet_tx,
                                         );
                                     });
                                 } else {
-                                    log::warn!("Cannot start fallback for {}: codec or timebase not yet detected", session_id);
+                                    log::debug!("Cannot start fallback for {}: codec or timebase not yet detected", &session_id);
                                 }
                             }
                         }
@@ -263,9 +266,13 @@ fn run_live_ffmpeg_pipeline(
     restart_delay: time::Duration,
 ) {
     use ffmpeg;
+
+    // Track restart count for debugging memory leaks
+    let mut restart_count = 0u64;
+
     fn real_impl(
         url: &str,
-        session_id: VideoSourceId,
+        session_id: &VideoSourceId,
         shutdown_sig: &Arc<AtomicBool>,
         state_tx: &mpsc::Sender<LiveStreamState>,
         packet_tx: &mpsc::Sender<ffmpeg::Packet>,
@@ -328,7 +335,6 @@ fn run_live_ffmpeg_pipeline(
         log::info!("RTSP stream opened for stream {}", session_id);
 
         let mut packet_count = 0u64;
-        let mut packet = ffmpeg::Packet::empty();
         let mut should_emit_state_online = true;
         loop {
             if shutdown_sig.load(Ordering::SeqCst) {
@@ -336,13 +342,22 @@ fn run_live_ffmpeg_pipeline(
                 break;
             }
 
-            match packet.read(&mut ictx) {
-                Ok(_) => {
+            match ictx.next_packet() {
+                Ok(packet) => {
                     if should_emit_state_online {
                         should_emit_state_online = false;
                         if let Err(err) = state_tx.blocking_send(LiveStreamState::Online) {
                             log::error!("Failed to send online state: {}", err);
                         }
+                    }
+                    if packet.stream() != video_stream_index || packet.is_corrupt() {
+                        continue;
+                    }
+
+                    packet_count += 1;
+                    if let Err(e) = packet_tx.blocking_send(packet) {
+                        log::error!("Failed to send packet: {}", e);
+                        break;
                     }
                 }
                 Err(ffmpeg::Error::Eof) => {
@@ -354,16 +369,6 @@ fn run_live_ffmpeg_pipeline(
                     bail!("Failed to read packet");
                 }
             }
-
-            if packet.stream() != video_stream_index || packet.is_corrupt() {
-                continue;
-            }
-
-            packet_count += 1;
-            if let Err(e) = packet_tx.blocking_send(packet.clone()) {
-                log::error!("Failed to send packet: {}", e);
-                break;
-            }
         }
 
         log::info!(
@@ -373,14 +378,25 @@ fn run_live_ffmpeg_pipeline(
         );
         Ok(())
     }
+
     loop {
         if shutdown_sig.load(Ordering::SeqCst) {
             log::info!("Shutdown signal received for stream {}", session_id);
             break;
         }
+
+        restart_count += 1;
+        if restart_count > 1 {
+            log::info!(
+                "[MEMORY_DEBUG] Stream {} restart #{} - monitor RSS to detect FFmpeg context leaks",
+                session_id,
+                restart_count
+            );
+        }
+
         match real_impl(
             &rtsp_url,
-            session_id,
+            &session_id,
             &shutdown_sig,
             &state_tx,
             &packet_tx,
@@ -472,14 +488,14 @@ fn run_fallback_pipeline(
         // Reset playback timing for each loop iteration
         let start_time = time::Instant::now();
 
-        let mut packet = ffmpeg::Packet::empty();
         loop {
             if terminate_sig.load(Ordering::SeqCst) {
                 log::info!("Fallback terminated for {} (terminate signal)", session_id);
                 return;
             }
+            let mut packet = ffmpeg::Packet::empty();
 
-            match packet.read(&mut ictx) {
+            match ictx.next_packet() {
                 Ok(_) => {}
                 Err(ffmpeg::Error::Eof) => {
                     // End of file - update cumulative offset before seeking back
@@ -549,7 +565,7 @@ fn run_fallback_pipeline(
             }
 
             packet_count += 1;
-            if packet_tx.blocking_send(packet.clone()).is_err() {
+            if packet_tx.blocking_send(packet).is_err() {
                 log::info!("Fallback terminated for {} (channel closed)", session_id);
                 return;
             }

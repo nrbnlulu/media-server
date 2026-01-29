@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use media_server_api_models::UnixTimestamp;
 
 pub fn check_dependencies() -> Result<()> {
     // Initialize FFmpeg
@@ -78,7 +79,6 @@ use std::sync::OnceLock;
 static PLACEHOLDER_FRAMES: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
 static PLACEHOLDER_FRAME_INDEX: AtomicUsize = AtomicUsize::new(0);
 
-
 fn log_nal_units(data: &[u8]) {
     let mut i = 0;
     let mut nal_types = Vec::new();
@@ -110,8 +110,6 @@ fn log_nal_units(data: &[u8]) {
         data.len()
     );
 }
-
-
 
 fn extract_all_h264_frames_from_mp4(mp4_data: &[u8]) -> Result<Vec<Vec<u8>>> {
     use gstreamer::prelude::*;
@@ -180,7 +178,6 @@ fn extract_all_h264_frames_from_mp4(mp4_data: &[u8]) -> Result<Vec<Vec<u8>>> {
 
     Ok(frames)
 }
-pub type UnixTimestamp = u64;
 
 pub fn get_current_unix_timestamp() -> UnixTimestamp {
     std::time::SystemTime::now()
@@ -210,7 +207,7 @@ pub fn get_stream_hash(rtsp_url: &str) -> String {
     hash_string
 }
 
-pub fn get_dvr_path(source_id: u64) -> std::path::PathBuf {
+pub fn get_dvr_path(source_id: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(DVR_DIRECTORY).join(format!("{}.mp4", source_id))
 }
 

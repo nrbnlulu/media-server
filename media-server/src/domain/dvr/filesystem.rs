@@ -4,7 +4,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::utils::UnixTimestamp;
+use media_server_api_models::UnixTimestamp;
+
+use crate::app::VideoSourceId;
+use crate::common::traits::VideoSource;
 
 const DVR_BASE_DIR: &str = "dvr";
 
@@ -20,11 +23,11 @@ impl RecordingMetadata {
         self.start_time <= epoch && self.end_time.map_or(true, |end| epoch <= end)
     }
 }
-pub fn get_stream_dvr_dir(stream_id: u64) -> PathBuf {
+pub fn get_stream_dvr_dir(stream_id: &VideoSourceId) -> PathBuf {
     PathBuf::from(DVR_BASE_DIR).join(stream_id.to_string())
 }
 
-pub fn ensure_stream_dvr_dir(stream_id: u64) -> Result<PathBuf> {
+pub fn ensure_stream_dvr_dir(stream_id: &VideoSourceId) -> Result<PathBuf> {
     let dir = get_stream_dvr_dir(stream_id);
     if !dir.exists() {
         fs::create_dir_all(&dir)?;
@@ -43,7 +46,7 @@ pub fn generate_finished_recording_filename(
     format!("{}_{}.mp4", start_time, end_time)
 }
 
-pub fn list_recordings_for_stream_id(stream_id: u64) -> Result<Vec<RecordingMetadata>> {
+pub fn list_recordings_for_stream_id(stream_id: &VideoSourceId) -> Result<Vec<RecordingMetadata>> {
     let dir = get_stream_dvr_dir(stream_id);
     if !dir.exists() {
         return Ok(Vec::new());
@@ -103,7 +106,7 @@ pub fn list_recordings_for_stream_id(stream_id: u64) -> Result<Vec<RecordingMeta
 
 pub type FindNextRecRes = Option<(RecordingMetadata, Option<chrono::Duration>)>;
 
-pub fn find_next_recording(stream_id: u64, timestamp: u64) -> FindNextRecRes {
+pub fn find_next_recording(stream_id: &VideoSourceId, timestamp: u64) -> FindNextRecRes {
     let mut recordings = list_recordings_for_stream_id(stream_id).ok()?;
     recordings.sort_by_key(|r| r.start_time);
 
@@ -126,7 +129,7 @@ pub fn find_next_recording(stream_id: u64, timestamp: u64) -> FindNextRecRes {
 }
 
 /// finds the recording that contains the timestamp if exists
-pub fn find_recording_for_timestamp(stream_id: u64, timestamp: u64) -> Option<RecordingMetadata> {
+pub fn find_recording_for_timestamp(stream_id: &VideoSourceId, timestamp: u64) -> Option<RecordingMetadata> {
     let recordings = list_recordings_for_stream_id(stream_id).ok()?;
     for recording in recordings {
         if timestamp >= recording.start_time {

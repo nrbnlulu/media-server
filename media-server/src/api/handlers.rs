@@ -1,5 +1,5 @@
 use crate::api::{models::*, GlobalState};
-use crate::app::ClientSessionId;
+use crate::app::{ClientSessionId, VideoSourceId};
 use crate::domain::StreamConfig;
 use crate::publishers::wsc_rtp::handle_incoming_wsc_trp_websocket;
 use axum::extract::ws::WebSocketUpgrade;
@@ -66,7 +66,7 @@ pub async fn create_stream(
     State(state): State<Arc<GlobalState>>,
     Json(req): Json<CreateStreamRequest>,
 ) -> Result<(StatusCode, Json<CreateStreamResponse>), ApiError> {
-    let source_id = req.source_id;
+    let source_id = req.source_id.clone();
 
     let rtsp_url = req
         .rtsp_url
@@ -77,7 +77,7 @@ pub async fn create_stream(
         .map_err(|e| ApiError::BadRequest(format!("Invalid RTSP URL: {}", e)))?;
 
     let config = StreamConfig {
-        source_id: req.source_id,
+        source_id: req.source_id.clone(),
         rtsp_url,
         username: req.username,
         password: req.password,
@@ -120,12 +120,12 @@ pub async fn list_streams(State(state): State<Arc<GlobalState>>) -> Json<ListStr
     let streams = streams
         .into_iter()
         .map(|s| StreamResponse {
-            source_id: s.session_id,
+            source_id: s.source_id,
             rtsp_url: s.rtsp_url,
             state: format!("{:?}", s.state),
             should_record: s.should_record,
-            webrtc_sessions: s.webrtc_sessions,
             restart_interval_secs: s.restart_interval_secs,
+            recording_start_time: s.recording_start_time,
         })
         .collect();
     Json(ListStreamsResponse { streams })
@@ -135,7 +135,7 @@ pub async fn list_streams(State(state): State<Arc<GlobalState>>) -> Json<ListStr
     get,
     path = "/streams/{source_id}",
     params(
-        ("source_id" = u64, Path, description = "Stream unique identifier")
+        ("source_id" = String, Path, description = "Stream unique identifier")
     ),
     responses(
         (status = 200, description = "Stream details", body = StreamResponse),
@@ -145,20 +145,20 @@ pub async fn list_streams(State(state): State<Arc<GlobalState>>) -> Json<ListStr
 )]
 pub async fn get_stream(
     State(state): State<Arc<GlobalState>>,
-    Path(source_id): Path<u64>,
+    Path(source_id): Path<VideoSourceId>,
 ) -> Result<Json<StreamResponse>, ApiError> {
     let info = state
-        .get_stream(source_id)
+        .get_stream(&source_id)
         .await
         .map_err(|_| ApiError::NotFound(format!("Stream {} not found", source_id)))?;
 
     Ok(Json(StreamResponse {
-        source_id: info.session_id,
+        source_id: info.source_id,
         rtsp_url: info.rtsp_url,
         state: format!("{:?}", info.state),
         should_record: info.should_record,
-        webrtc_sessions: info.webrtc_sessions,
         restart_interval_secs: info.restart_interval_secs,
+        recording_start_time: info.recording_start_time,
     }))
 }
 
@@ -166,7 +166,7 @@ pub async fn get_stream(
     delete,
     path = "/streams/{source_id}",
     params(
-        ("source_id" = u64, Path, description = "Stream unique identifier")
+        ("source_id" = String, Path, description = "Stream unique identifier")
     ),
     responses(
         (status = 204, description = "Stream deleted successfully"),
@@ -176,10 +176,10 @@ pub async fn get_stream(
 )]
 pub async fn delete_stream(
     State(state): State<Arc<GlobalState>>,
-    Path(source_id): Path<u64>,
+    Path(source_id): Path<VideoSourceId>,
 ) -> Result<StatusCode, ApiError> {
     state
-        .delete_stream(source_id)
+        .delete_stream(&source_id)
         .await
         .map_err(|e| ApiError::NotFound(e.to_string()))?;
 
@@ -190,11 +190,11 @@ pub async fn delete_stream(
 pub async fn wsc_rtp(
     State(state): State<Arc<GlobalState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Path(source_id): Path<u64>,
+    Path(source_id): Path<VideoSourceId>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     // Validate that the stream exists before upgrading to WebSocket
-    if state.get_stream(source_id).await.is_err() {
+    if state.get_stream(&source_id).await.is_err() {
         return (
             StatusCode::NOT_FOUND,
             format!("Stream {} not found", source_id),
@@ -211,7 +211,7 @@ pub async fn wsc_rtp(
     post,
     path = "/streams/{source_id}/webrtc",
     params(
-        ("source_id" = u64, Path, description = "Stream unique identifier")
+        ("source_id" = String, Path, description = "Stream unique identifier")
     ),
     request_body = CreateWebRtcSessionRequest,
     responses(
@@ -223,7 +223,7 @@ pub async fn wsc_rtp(
 )]
 pub async fn create_webrtc_session(
     State(state): State<Arc<GlobalState>>,
-    Path(source_id): Path<u64>,
+    Path(source_id): Path<VideoSourceId>,
     Json(req): Json<CreateWebRtcSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateWebRtcSessionResponse>), ApiError> {
     log::debug!("Creating WebRTC session for stream {}", source_id);
@@ -234,7 +234,7 @@ pub async fn create_webrtc_session(
     );
 
     let (session_id, answer) = state
-        .create_websocket_session(req, source_id)
+        .create_websocket_session(req, source_id.clone())
         .await
         .map_err(|e| {
             log::error!(
@@ -281,7 +281,7 @@ pub async fn delete_webrtc_session(
     post,
     path = "/streams/{source_id}/webrtc/dvr",
     params(
-        ("source_id" = u64, Path, description = "Stream unique identifier")
+        ("source_id" = String, Path, description = "Stream unique identifier")
     ),
     request_body = CreateDvrWebRtcSessionRequest,
     responses(
@@ -293,7 +293,7 @@ pub async fn delete_webrtc_session(
 )]
 pub async fn create_dvr_webrtc_session(
     State(state): State<Arc<GlobalState>>,
-    Path(source_id): Path<u64>,
+    Path(source_id): Path<VideoSourceId>,
     Json(req): Json<CreateDvrWebRtcSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateWebRtcSessionResponse>), ApiError> {
     log::debug!(
@@ -309,7 +309,7 @@ pub async fn create_dvr_webrtc_session(
 
     let (session_id, answer) = state
         .clone()
-        .create_websocket_session(create_req, source_id)
+        .create_websocket_session(create_req, source_id.clone())
         .await
         .map_err(|e| {
             log::error!(
@@ -344,7 +344,7 @@ pub async fn create_dvr_webrtc_session(
     get,
     path = "/streams/{source_id}/webrtc",
     params(
-        ("source_id" = u64, Path, description = "Stream unique identifier")
+        ("source_id" = String, Path, description = "Stream unique identifier")
     ),
     responses(
         (status = 200, description = "List of WebRTC sessions for this stream", body = ListWebRtcSessionsResponse),
@@ -354,15 +354,15 @@ pub async fn create_dvr_webrtc_session(
 )]
 pub async fn list_webrtc_sessions(
     State(state): State<Arc<GlobalState>>,
-    Path(source_id): Path<u64>,
+    Path(source_id): Path<VideoSourceId>,
 ) -> Result<Json<ListWebRtcSessionsResponse>, ApiError> {
     // Verify stream exists
     state
-        .get_stream(source_id)
+        .get_stream(&source_id)
         .await
         .map_err(|_| ApiError::NotFound(format!("Stream {} not found", source_id)))?;
 
-    let sessions = state.list_webrtc_sessions(source_id).await;
+    let sessions = state.list_webrtc_sessions(&source_id).await;
 
     Ok(Json(ListWebRtcSessionsResponse { sessions }))
 }
@@ -383,7 +383,7 @@ pub async fn webrtc_client() -> Html<&'static str> {
     post,
     path = "/streams/{source_id}/webrtc/{session_id}/seek",
     params(
-        ("source_id" = u64, Path, description = "Stream unique identifier"),
+        ("source_id" = String, Path, description = "Stream unique identifier"),
         ("session_id" = Uuid, Path, description = "WebRTC session unique identifier")
     ),
     request_body = SeekRequest,
@@ -396,12 +396,12 @@ pub async fn webrtc_client() -> Html<&'static str> {
 )]
 pub async fn seek_session(
     State(state): State<Arc<GlobalState>>,
-    Path((source_id, session_id)): Path<(u64, Uuid)>,
+    Path((source_id, session_id)): Path<(VideoSourceId, Uuid)>,
     Json(req): Json<SeekRequest>,
 ) -> Result<Json<SessionModeResponse>, ApiError> {
     log::debug!("seeking session {session_id} of stream {source_id} to {req:?}");
     state
-        .seek_webrtc_session(source_id, session_id, req.timestamp)
+        .seek_webrtc_session(source_id.clone(), session_id, req.timestamp)
         .await
         .map_err(|e| {
             log::error!(
@@ -431,7 +431,7 @@ pub async fn seek_session(
     post,
     path = "/streams/{source_id}/webrtc/{session_id}/speed",
     params(
-        ("source_id" = u64, Path, description = "Stream unique identifier"),
+        ("source_id" = String, Path, description = "Stream unique identifier"),
         ("session_id" = Uuid, Path, description = "WebRTC session unique identifier")
     ),
     request_body = SpeedRequest,
@@ -444,11 +444,11 @@ pub async fn seek_session(
 )]
 pub async fn set_session_speed(
     State(state): State<Arc<GlobalState>>,
-    Path((source_id, session_id)): Path<(u64, Uuid)>,
+    Path((source_id, session_id)): Path<(VideoSourceId, Uuid)>,
     Json(req): Json<SpeedRequest>,
 ) -> Result<Json<SessionModeResponse>, ApiError> {
     state
-        .set_session_speed(source_id, session_id, req.speed)
+        .set_session_speed(source_id.clone(), session_id, req.speed)
         .await
         .map_err(|e| {
             log::error!("Failed to set speed for session {}: {}", session_id, e);
@@ -469,7 +469,7 @@ pub async fn set_session_speed(
     post,
     path = "/streams/{source_id}/webrtc/{session_id}/live",
     params(
-        ("source_id" = u64, Path, description = "Stream unique identifier"),
+        ("source_id" = String, Path, description = "Stream unique identifier"),
         ("session_id" = Uuid, Path, description = "WebRTC session unique identifier")
     ),
     responses(
@@ -480,7 +480,7 @@ pub async fn set_session_speed(
 )]
 pub async fn switch_session_to_live(
     State(state): State<Arc<GlobalState>>,
-    Path((source_id, client_session_id)): Path<(u64, Uuid)>,
+    Path((source_id, client_session_id)): Path<(VideoSourceId, Uuid)>,
 ) -> Result<Json<SessionModeResponse>, ApiError> {
     state
         .switch_session_to_live(&client_session_id)
@@ -508,7 +508,7 @@ pub async fn switch_session_to_live(
     get,
     path = "/streams/{source_id}/webrtc/{session_id}/mode",
     params(
-        ("source_id" = u64, Path, description = "Stream unique identifier"),
+        ("source_id" = String, Path, description = "Stream unique identifier"),
         ("session_id" = Uuid, Path, description = "WebRTC session unique identifier")
     ),
     responses(
@@ -519,7 +519,7 @@ pub async fn switch_session_to_live(
 )]
 pub async fn get_session_mode(
     State(state): State<Arc<GlobalState>>,
-    Path((source_id, session_id)): Path<(u64, Uuid)>,
+    Path((source_id, session_id)): Path<(VideoSourceId, Uuid)>,
 ) -> Result<Json<SessionModeResponse>, ApiError> {
     let mode = state
         .get_session_mode(source_id, session_id)

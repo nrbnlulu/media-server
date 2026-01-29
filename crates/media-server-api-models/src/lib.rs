@@ -2,9 +2,11 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+pub type UnixTimestamp = u64;
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateStreamRequest {
-    pub source_id: u64,
+    pub source_id: String,
     pub rtsp_url: String,
     pub username: Option<String>,
     pub password: Option<String>,
@@ -14,7 +16,7 @@ pub struct CreateStreamRequest {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateStreamResponse {
-    pub source_id: u64,
+    pub source_id: String,
     pub rtsp_url: String,
     pub should_record: bool,
     pub restart_interval_secs: Option<u64>,
@@ -22,12 +24,12 @@ pub struct CreateStreamResponse {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct StreamResponse {
-    pub source_id: u64,
+    pub source_id: String,
     pub rtsp_url: String,
     pub state: String,
     pub should_record: bool,
-    pub webrtc_sessions: Vec<Uuid>,
     pub restart_interval_secs: Option<u64>,
+    pub recording_start_time: Option<UnixTimestamp>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -84,7 +86,7 @@ pub struct SessionModeResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct WebRtcSessionResponse {
     pub session_id: Uuid,
-    pub source_id: u64,
+    pub source_id: String,
     pub is_live: bool,
 }
 

@@ -1,4 +1,4 @@
-use crate::app::{AppSettings, ClientSessionId, GlobalState};
+use crate::app::{AppSettings, ClientSessionId, GlobalState, VideoSourceId};
 use crate::common::rtp::RtpPacket;
 use crate::common::traits::{RtpConsumer, RtpVideoPublisher};
 use crate::common::VideoCodec;
@@ -24,7 +24,7 @@ use sdp::description::media::{MediaDescription, MediaName, RangedPort};
 use sdp::description::session::{Origin, SessionDescription, TimeDescription, Timing};
 
 pub fn build_unicast_sdp(
-    source_id: u64,
+    source_id: &VideoSourceId,
     codec: &VideoCodec,
     addr: SocketAddr,
     params: &CodecParameters,
@@ -36,9 +36,13 @@ pub fn build_unicast_sdp(
     let client_port = addr.port();
     let mut session = SessionDescription::default();
     session.version = 0;
+    // Use a hash of the source_id string for the numeric session_id in SDP
+    let session_id_hash = source_id
+        .bytes()
+        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
     session.origin = Origin {
         username: "-".to_string(),
-        session_id: source_id,
+        session_id: session_id_hash,
         session_version: 0,
         network_type: "IN".to_string(),
         address_type: address_type.to_string(),
@@ -213,13 +217,13 @@ impl WscRtpUdpManager {
 
 pub struct WscRtpPublisher {
     id: ClientSessionId,
-    video_source_id: u64,
+    video_source_id: VideoSourceId,
     dest_sock: Mutex<Option<Arc<UdpSocket>>>,
     dead: std::sync::atomic::AtomicBool,
 }
 
 impl WscRtpPublisher {
-    pub fn new(video_source_id: u64) -> Self {
+    pub fn new(video_source_id: VideoSourceId) -> Self {
         Self {
             id: Uuid::new_v4(),
             video_source_id,
@@ -241,7 +245,7 @@ impl WscRtpPublisher {
             }
         };
         Some(build_unicast_sdp(
-            self.video_source_id,
+            &self.video_source_id,
             codec,
             addr,
             codec_params,
@@ -273,17 +277,13 @@ impl RtpConsumer for WscRtpPublisher {
             // this would usually error out in loopback if there is no actual destination
             // for "real" destinations there is no way we'd know if the packet reached the destination (its UDP after all)
             // so we can't rely on this error for anything useful.
-            log::warn!(
-                "wsc session {}: send failed: {}",
-                self.id,
-                err
-            );
+            log::warn!("wsc session {}: send failed: {}", self.id, err);
         }
     }
 }
 
 impl RtpVideoPublisher for WscRtpPublisher {
-    fn source_id(&self) -> &u64 {
+    fn source_id(&self) -> &VideoSourceId {
         &self.video_source_id
     }
 }
@@ -304,7 +304,7 @@ async fn handle_wsc_rtp_message(
     session_id: &ClientSessionId,
     _app_state: Arc<GlobalState>,
     sender: &mut WsSender,
-    _source_id: u64,
+    _source_id: &VideoSourceId,
     payload: &[u8],
     last_ping: &Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
@@ -365,13 +365,13 @@ async fn last_ping_checker(
 pub async fn handle_incoming_wsc_trp_websocket(
     ws: WebSocket,
     app_state: Arc<GlobalState>,
-    source_id: u64,
+    source_id: VideoSourceId,
     client_port: Option<u16>,
     client_addr: SocketAddr,
 ) {
     let (mut sender, mut receiver) = ws.split();
     let session_id = match app_state
-        .create_wsc_rtp_registration(source_id, client_port)
+        .create_wsc_rtp_registration(source_id.clone(), client_port)
         .await
     {
         Ok(session_id) => session_id,
@@ -418,7 +418,7 @@ pub async fn handle_incoming_wsc_trp_websocket(
         client_addr
     );
 
-    if let Ok(info) = app_state.get_stream(source_id).await {
+    if let Ok(info) = app_state.get_stream(&source_id).await {
         let _ = send_wsc_rtp_message(
             &mut sender,
             WscRtpServerMessage::StreamState {
@@ -476,7 +476,7 @@ pub async fn handle_incoming_wsc_trp_websocket(
                     },
                     Message::Close(_) => break,
                 };
-                if let Err(err) = handle_wsc_rtp_message(&session_id, Arc::clone(&app_state), &mut sender, source_id, &data, &last_ping).await {
+                if let Err(err) = handle_wsc_rtp_message(&session_id, Arc::clone(&app_state), &mut sender, &source_id, &data, &last_ping).await {
                     log::error!("Error handling wsc-rtp message: {}", err);
                     break;
                 }

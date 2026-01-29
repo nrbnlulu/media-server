@@ -63,6 +63,51 @@
             .timeline-handle:active {
                 cursor: grabbing;
             }
+            .timeline-handle.at-live {
+                background: #b91c1c;
+                border-color: #eaeaea;
+                animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+            }
+            .timeline-live-marker {
+                position: absolute;
+                right: 0;
+                top: 50%;
+                transform: translateY(-50%);
+                width: 3px;
+                height: 14px;
+                background: #b91c1c;
+                border-radius: 2px;
+                box-shadow: 0 0 8px rgba(185, 28, 28, 0.6);
+            }
+            .timeline-tooltip {
+                position: absolute;
+                bottom: 120%;
+                left: 50%;
+                transform: translateX(-50%);
+                background: rgba(18, 18, 18, 0.95);
+                border: 1px solid #333333;
+                padding: 6px 12px;
+                border-radius: 6px;
+                font-size: 12px;
+                font-family: monospace;
+                white-space: nowrap;
+                pointer-events: none;
+                opacity: 0;
+                transition: opacity 0.15s ease;
+                z-index: 100;
+            }
+            .timeline-tooltip.visible {
+                opacity: 1;
+            }
+            .timeline-tooltip::after {
+                content: "";
+                position: absolute;
+                top: 100%;
+                left: 50%;
+                transform: translateX(-50%);
+                border: 6px solid transparent;
+                border-top-color: #333333;
+            }
             .live-indicator {
                 animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
             }
@@ -294,9 +339,18 @@
                                     class="timeline-progress"
                                 ></div>
                                 <div
+                                    id="timeline-live-marker"
+                                    class="timeline-live-marker"
+                                ></div>
+                                <div
                                     id="timeline-handle"
                                     class="timeline-handle"
-                                ></div>
+                                >
+                                    <div
+                                        id="timeline-tooltip"
+                                        class="timeline-tooltip"
+                                    ></div>
+                                </div>
                             </div>
                             <div
                                 class="flex justify-between text-xs text-[#8a8a8d] font-mono"
@@ -417,6 +471,7 @@
                 isLive: true,
                 currentSpeed: 1.0,
                 currentTimeMs: Date.now(),
+                recordingStartTimeMs: null, // Unix timestamp when recording started
             };
             let isDraggingTimeline = false;
             let statusPollInterval = null;
@@ -742,7 +797,7 @@
                 currentSession.currentTimeMs = timestampMs;
             }
 
-            function startViewing(streamId) {
+            async function startViewing(streamId) {
                 document.getElementById("modal-title").innerText =
                     "Stream Viewer";
                 document
@@ -755,6 +810,22 @@
                     .getElementById("mode-indicator")
                     .classList.remove("hidden");
                 document.getElementById("mode-indicator").classList.add("flex");
+
+                // Fetch stream info to get recording_start_time
+                try {
+                    const streamInfo = await api(`/streams/${streamId}`);
+                    if (streamInfo && streamInfo.recording_start_time) {
+                        // The API returns UnixTimestamp which is u64 in milliseconds
+                        currentSession.recordingStartTimeMs =
+                            streamInfo.recording_start_time;
+                    } else {
+                        currentSession.recordingStartTimeMs = null;
+                    }
+                } catch (e) {
+                    console.warn("Failed to fetch stream info:", e);
+                    currentSession.recordingStartTimeMs = null;
+                }
+
                 startLiveSession(streamId);
             }
 
@@ -768,6 +839,7 @@
                     isLive: true,
                     currentSpeed: 1.0,
                     currentTimeMs: Date.now(),
+                    recordingStartTimeMs: null,
                 };
             }
 
@@ -953,37 +1025,94 @@
 
                 const progress = document.getElementById("timeline-progress");
                 const handle = document.getElementById("timeline-handle");
+                const now = Date.now();
 
-                if (currentSession.isLive) {
-                    progress.style.width = "100%";
-                    handle.style.left = "100%";
+                // Determine timeline start
+                let start;
+                if (currentSession.recordingStartTimeMs) {
+                    start = currentSession.recordingStartTimeMs;
                 } else {
-                    // For DVR, we'd ideally show position within a window.
-                    // For now, let's keep it simple: 100% if live, or we need a relative window.
-                    // A simple window: last 1 hour.
-                    const now = Date.now();
                     const windowSize = 60 * 60 * 1000; // 1 hour
-                    const start = now - windowSize;
-
-                    let pct = ((displayTime - start) / windowSize) * 100;
-                    pct = Math.max(0, Math.min(100, pct));
-
-                    progress.style.width = `${pct}%`;
-                    handle.style.left = `${pct}%`;
-
-                    document.getElementById("timeline-start").innerText =
-                        new Date(start).toLocaleTimeString();
-                    document.getElementById("timeline-end").innerText =
-                        new Date(now).toLocaleTimeString();
+                    start = now - windowSize;
                 }
+
+                const totalDuration = now - start;
+                let pct = ((displayTime - start) / totalDuration) * 100;
+                pct = Math.max(0, Math.min(100, pct));
+
+                progress.style.width = `${pct}%`;
+                handle.style.left = `${pct}%`;
+
+                // Update handle appearance based on live status
+                if (currentSession.isLive || pct >= 99) {
+                    handle.classList.add("at-live");
+                } else {
+                    handle.classList.remove("at-live");
+                }
+
+                // Update timeline labels
+                document.getElementById("timeline-start").innerText = new Date(
+                    start,
+                ).toLocaleTimeString();
+                document.getElementById("timeline-end").innerText = new Date(
+                    now,
+                ).toLocaleTimeString();
+
+                // Update tooltip content to show current time
+                const tooltip = document.getElementById("timeline-tooltip");
+                if (tooltip && !isDraggingTimeline) {
+                    tooltip.innerText = formatTimeForTooltip(displayTime);
+                }
+            }
+
+            function formatTimeForTooltip(timestampMs) {
+                const date = new Date(timestampMs);
+                const hours = String(date.getHours()).padStart(2, "0");
+                const minutes = String(date.getMinutes()).padStart(2, "0");
+                const seconds = String(date.getSeconds()).padStart(2, "0");
+                return `${hours}:${minutes}:${seconds}`;
             }
 
             const timeline = document.getElementById("timeline");
             const timelineHandle = document.getElementById("timeline-handle");
+            const timelineTooltip = document.getElementById("timeline-tooltip");
 
             timeline.addEventListener("mousedown", (e) => {
                 isDraggingTimeline = true;
                 updateTimelinePosition(e);
+            });
+
+            timeline.addEventListener("mouseenter", () => {
+                timelineTooltip.classList.add("visible");
+            });
+
+            timeline.addEventListener("mouseleave", () => {
+                timelineTooltip.classList.remove("visible");
+            });
+
+            timeline.addEventListener("mousemove", (e) => {
+                if (!isDraggingTimeline) {
+                    // Update tooltip position and content when hovering
+                    const rect = timeline.getBoundingClientRect();
+                    const x = Math.max(
+                        0,
+                        Math.min(e.clientX - rect.left, rect.width),
+                    );
+                    const percentage = x / rect.width;
+
+                    const now = Date.now();
+                    let start;
+                    if (currentSession.recordingStartTimeMs) {
+                        start = currentSession.recordingStartTimeMs;
+                    } else {
+                        const windowSize = 60 * 60 * 1000;
+                        start = now - windowSize;
+                    }
+
+                    const totalDuration = now - start;
+                    const hoverTime = start + percentage * totalDuration;
+                    timelineTooltip.innerText = formatTimeForTooltip(hoverTime);
+                }
             });
 
             document.addEventListener("mousemove", (e) => {
@@ -1004,9 +1133,19 @@
                 const percentage = x / rect.width;
 
                 const now = Date.now();
-                const windowSize = 60 * 60 * 1000; // 1 hour
-                const start = now - windowSize;
-                const seekTime = start + percentage * windowSize;
+                let start;
+
+                if (currentSession.recordingStartTimeMs) {
+                    // Use the actual recording start time
+                    start = currentSession.recordingStartTimeMs;
+                } else {
+                    // Fallback to 1-hour window if no recording start time
+                    const windowSize = 60 * 60 * 1000; // 1 hour
+                    start = now - windowSize;
+                }
+
+                const totalDuration = now - start;
+                const seekTime = start + percentage * totalDuration;
 
                 seekToTimestamp(Math.floor(seekTime));
             });
@@ -1024,6 +1163,21 @@
 
                 progress.style.width = percentage + "%";
                 handle.style.left = percentage + "%";
+
+                // Update tooltip during dragging
+                const now = Date.now();
+                let start;
+                if (currentSession.recordingStartTimeMs) {
+                    start = currentSession.recordingStartTimeMs;
+                } else {
+                    const windowSize = 60 * 60 * 1000;
+                    start = now - windowSize;
+                }
+
+                const totalDuration = now - start;
+                const dragTime = start + (percentage / 100) * totalDuration;
+                timelineTooltip.innerText = formatTimeForTooltip(dragTime);
+                timelineTooltip.classList.add("visible");
             }
 
             function showToast(msg, type = "info") {

@@ -1,13 +1,14 @@
+use crate::app::VideoSourceId;
 use crate::common::nal_utils::{self, FramingFormat};
 use crate::common::traits::FfmpegConsumer;
 use crate::common::{TimeBase, VideoCodec};
 use crate::domain::dvr::filesystem;
-use crate::utils::UnixTimestamp;
 use anyhow::{bail, Result};
 use axum::async_trait;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
+use media_server_api_models::UnixTimestamp;
 use parking_lot::Mutex;
 use std::fs;
 use std::path::PathBuf;
@@ -287,14 +288,14 @@ impl RecordingState {
 }
 
 pub struct DvrRecorder {
-    stream_id: u64,
+    stream_id: VideoSourceId,
     recording_state: Mutex<Option<RecordingState>>,
 }
 
 impl DvrRecorder {
-    pub fn new(stream_id: u64) -> Result<Self> {
+    pub fn new(stream_id: &VideoSourceId) -> Result<Self> {
         Ok(Self {
-            stream_id,
+            stream_id: stream_id.clone(),
             recording_state: Mutex::new(None),
         })
     }
@@ -359,7 +360,7 @@ impl DvrRecorder {
         );
 
         let start_time = crate::utils::get_current_unix_timestamp();
-        let dir = filesystem::ensure_stream_dvr_dir(self.stream_id)?;
+        let dir = filesystem::ensure_stream_dvr_dir(&self.stream_id)?;
         let filename = filesystem::generate_active_recording_filename(start_time);
         let path = dir.join(filename);
 
@@ -429,8 +430,8 @@ impl DvrRecorder {
             .map(|s| s.file_path.clone())
     }
 
-    pub fn stream_id(&self) -> u64 {
-        self.stream_id
+    pub fn stream_id(&self) -> &VideoSourceId {
+        &self.stream_id
     }
 
     pub fn start_time(&self) -> Option<UnixTimestamp> {

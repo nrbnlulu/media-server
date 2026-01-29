@@ -56,7 +56,6 @@ async fn main() -> Result<()> {
         addr
     );
 
-
     // Clone the stream manager to be able to clean up on shutdown
     let app_state_clone = Arc::clone(&app_state);
 

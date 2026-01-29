@@ -10,7 +10,7 @@ axum = { version = "0.7", features = ["ws"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 
-ffmpeg = { git = "https://github.com/nrbnlulu/rffmpeg", branch = "master",  package = "rffmpeg" }
+ffmpeg = { git = "https://github.com/nrbnlulu/rffmpeg", branch = "main",  package = "rffmpeg" }
 rand = "0.8"
 
 gstreamer = "0.22"

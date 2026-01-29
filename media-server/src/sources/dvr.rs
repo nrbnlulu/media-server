@@ -4,13 +4,13 @@ use crate::common::rtp::RtpPacketizer;
 use crate::common::traits::RtpConsumer;
 use crate::common::VideoCodec;
 use crate::domain::dvr::filesystem::{self, FindNextRecRes, RecordingMetadata};
-use crate::utils::UnixTimestamp;
 use anyhow::{anyhow, bail, Result};
 use chrono::Duration;
 use futures::StreamExt;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::{self as gst_app, AppSinkCallbacks};
+use media_server_api_models::UnixTimestamp;
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -79,8 +79,8 @@ impl DvrPlayer {
         consumer: Arc<dyn RtpConsumer>,
     ) -> Result<Self> {
         let initial_state = Self::resolve_new_state(
-            source_id,
-            filesystem::find_next_recording(source_id, initial_start_time),
+            &source_id,
+            filesystem::find_next_recording(&source_id, initial_start_time),
             initial_start_time,
             consumer.clone(),
             &codec,
@@ -129,7 +129,7 @@ impl DvrPlayer {
     }
 
     fn resolve_new_state(
-        source_id: VideoSourceId,
+        source_id: &VideoSourceId,
         res: FindNextRecRes,
         initial_start_time: UnixTimestamp,
         consumer: Arc<dyn RtpConsumer>,
@@ -152,35 +152,33 @@ impl DvrPlayer {
     }
 
     pub async fn play(&self) {
-        loop {
-            let join_handle = {
-                let bus = {
-                    let state = self.state.lock().await;
-                    if let Err(e) = state.play().await {
-                        log::error!("Failed to play pipeline: {}", e);
-                        return;
-                    }
-                    // wait for EOS task
-                    state.bus.clone()
-                };
-                let join_handle = tokio::spawn(async move {
-                    let mut bus_stream = bus.stream();
-                    while let Some(msg) = bus_stream.next().await {
-                        match msg.view() {
-                            gst::MessageView::Eos(_) => {
-                                // check the TODO.md
-                                log::warn!("EOS is not expected");
-                                break;
-                            }
-                            _ => (),
-                        }
-                    }
-                });
-                join_handle
+        let join_handle = {
+            let bus = {
+                let state = self.state.lock().await;
+                if let Err(e) = state.play().await {
+                    log::error!("Failed to play pipeline: {}", e);
+                    return;
+                }
+                // wait for EOS task
+                state.bus.clone()
             };
-            join_handle.await;
-        }
-    }
+            let join_handle = tokio::spawn(async move {
+                let mut bus_stream = bus.stream();
+                while let Some(msg) = bus_stream.next().await {
+                    match msg.view() {
+                        gst::MessageView::Eos(_) => {
+                            // check the TODO.md
+                            log::warn!("EOS is not expected");
+                            break;
+                        }
+                        _ => (),
+                    }
+                }
+            });
+            join_handle
+        };
+        let _ = join_handle.await;
+}
 
     pub async fn terminate(&self) -> Result<()> {
         let state_guard = self.state.lock().await;
@@ -379,7 +377,7 @@ fn create_pipeline(
 
             frame_count += 1;
             if frame_count <= 5 || frame_count % 100 == 0 {
-                log::info!(
+                log::trace!(
                     "DVR frame {}: raw_size={}, pts={:?}, rtp_ts={}, nal_count={}",
                     frame_count,
                     raw_data.len(),
@@ -393,7 +391,7 @@ fn create_pipeline(
             let rtp_packets = rtp_packetizer.packetize(&nal_units, rtp_timestamp, &codec_clone);
 
             if frame_count <= 5 {
-                log::info!(
+                log::trace!(
                     "DVR frame {}: generated {} RTP packets",
                     frame_count,
                     rtp_packets.len()
@@ -411,9 +409,12 @@ fn create_pipeline(
     Ok((pipeline, bus))
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SeekError {
+    #[error("seek before start")]
     SeekBeforeStart,
+    #[error("seek after end")]
     SeekAfterEnd,
+    #[error(transparent)]
     GstError(anyhow::Error),
 }

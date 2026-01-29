@@ -7,15 +7,17 @@ use crate::publishers::webrtc::{WebRtcSession, WebrtcManager};
 use crate::publishers::wsc_rtp::{WscRtpPublisher, WscRtpUdpManager};
 use crate::sources::dvr::DvrPlayer;
 use crate::sources::rtsp::RtspClient;
-use crate::utils::UnixTimestamp;
 use anyhow::{anyhow, bail, Result};
 use dashmap::DashMap;
+use futures::TryFutureExt;
 use gstreamer::glib::clone::Downgrade;
 use media_server_api_models::CreateWebRtcSessionRequest;
+use media_server_api_models::UnixTimestamp;
 use parking_lot::Mutex;
 use serde::Deserialize;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -24,10 +26,11 @@ struct SourceWrapper {
     source: Arc<dyn VideoSource>,
     task: tokio::task::JoinHandle<()>,
     rtp_packetizer: Arc<RtpPacketizer>,
+    recorder: Option<Arc<DvrRecorder>>,
 }
 
 pub type ClientSessionId = Uuid;
-pub type VideoSourceId = u64;
+pub type VideoSourceId = String;
 pub type SharedGlobalState = Arc<GlobalState>;
 pub type WeakGlobalState = Weak<GlobalState>;
 
@@ -107,8 +110,10 @@ impl ClientSession {
     pub async fn seek(&self, timestamp: UnixTimestamp, codec: &VideoCodec) -> Result<()> {
         let mut state_guard = self.state.lock().await;
         // first check that we're on dvr mode otherwise disable the live packetizer
-        let player = match *state_guard {
-            ClientSessionState::Dvr(ref player, _) => player.clone(),
+        match *state_guard {
+            ClientSessionState::Dvr(ref player, _) => {
+                player.seek_to_timestamp(timestamp, 1.0).await?;
+            }
             ClientSessionState::Live => {
                 // Remove from live packetizer - we'll feed from DVR instead
                 self.live_packetizer
@@ -122,19 +127,16 @@ impl ClientSession {
                 )?;
                 let player = Arc::new(player);
                 *state_guard = ClientSessionState::Dvr(player.clone(), None);
-                player
+                let player_clone = player.clone();
+                let join_handle = tokio::spawn(async move {
+                    player_clone.play().await;
+                });
+                // wait for the player to start.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                player.seek_to_timestamp(timestamp, 1.0).await?;
+                *state_guard = ClientSessionState::Dvr(player.clone(), Some(Arc::new(join_handle)));
             }
         };
-        drop(state_guard);
-
-        let player_clone = player.clone();
-        let join_handle = tokio::spawn(async move {
-            player_clone.play().await;
-        });
-
-        // Update the state with the new player and handle
-        let mut state_guard = self.state.lock().await;
-        *state_guard = ClientSessionState::Dvr(player, Some(Arc::new(join_handle)));
         Ok(())
     }
 }
@@ -170,8 +172,8 @@ impl GlobalState {
         &self.settings
     }
 
-    pub async fn create_rtsp_stream(&self, config: StreamConfig) -> Result<u64> {
-        let source_id = config.source_id;
+    pub async fn create_rtsp_stream(&self, config: StreamConfig) -> Result<VideoSourceId> {
+        let source_id = config.source_id.clone();
 
         if self.sources.contains_key(&source_id) {
             bail!("Stream {} already exists", source_id);
@@ -195,16 +197,19 @@ impl GlobalState {
             vec![rtp_packetizer.clone()],
         )?);
 
+        let mut recorder = None;
         if config.should_record {
-            filesystem::ensure_stream_dvr_dir(source_id)?;
-            match DvrRecorder::new(source_id) {
-                Ok(recorder) => {
-                    rtsp_client.add_consumer(Arc::new(recorder)).await;
+            filesystem::ensure_stream_dvr_dir(&source_id)?;
+            match DvrRecorder::new(&source_id) {
+                Ok(res) => {
+                    let recorder_arc = Arc::new(res);
+                    rtsp_client.add_consumer(recorder_arc.clone()).await;
+                    recorder.replace(recorder_arc);
                 }
                 Err(e) => {
                     log::error!("Failed to create recorder for stream {}: {}", source_id, e);
                 }
-            }
+            };
         }
         let rtsp_client_clone = rtsp_client.clone();
         let handle = tokio::spawn(async move {
@@ -213,11 +218,12 @@ impl GlobalState {
         });
 
         self.sources.insert(
-            source_id,
+            source_id.clone(),
             SourceWrapper {
                 source: rtsp_client,
                 task: handle,
                 rtp_packetizer,
+                recorder,
             },
         );
 
@@ -225,8 +231,8 @@ impl GlobalState {
         Ok(source_id)
     }
 
-    pub async fn delete_stream(&self, source_id: u64) -> Result<()> {
-        if let Some((_, src)) = self.sources.remove(&source_id) {
+    pub async fn delete_stream(&self, source_id: &VideoSourceId) -> Result<()> {
+        if let Some((_, src)) = self.sources.remove(source_id) {
             let _ = src.source.stop().await;
             src.task.abort();
 
@@ -235,34 +241,33 @@ impl GlobalState {
         Ok(())
     }
 
-    pub async fn get_stream(&self, source_id: u64) -> Result<StreamInfo> {
+    pub async fn get_stream(&self, source_id: &VideoSourceId) -> Result<StreamInfo> {
         let source = self
             .sources
-            .get(&source_id)
+            .get(source_id)
             .ok_or_else(|| anyhow!("Stream {} not found", source_id))?;
 
         let state = source.source.state().await;
-        let webrtc_sessions: Vec<Uuid> = self
-            .client_sessions
-            .iter()
-            .filter(|entry| entry.value().source_id() == &source_id)
-            .map(|entry| entry.key().clone())
-            .collect();
+
+        let recording_start_time = match source.recorder.as_ref() {
+            Some(recorder) => recorder.start_time(),
+            None => None,
+        };
 
         Ok(StreamInfo {
-            session_id: source_id,
+            source_id: source_id.clone(),
             rtsp_url: source.source.url().to_string(),
             state,
             should_record: source.source.config().should_record,
-            webrtc_sessions,
             restart_interval_secs: source.source.config().restart_interval_secs,
+            recording_start_time,
         })
     }
 
     pub async fn list_streams(&self) -> Vec<StreamInfo> {
         let mut streams = Vec::new();
         for entry in self.sources.iter() {
-            if let Ok(info) = self.get_stream(*entry.key()).await {
+            if let Ok(info) = self.get_stream(entry.key()).await {
                 streams.push(info);
             }
         }
@@ -271,11 +276,11 @@ impl GlobalState {
 
     pub async fn subscribe_stream_state(
         &self,
-        source_id: u64,
+        source_id: &VideoSourceId,
     ) -> Result<broadcast::Receiver<StreamState>> {
         let source = self
             .sources
-            .get(&source_id)
+            .get(source_id)
             .ok_or_else(|| anyhow!("Stream {} not found", source_id))?;
 
         Ok(source.source.subscribe_state())
@@ -308,7 +313,7 @@ impl GlobalState {
             let (session, answer_sdp) = self
                 .webrtc_manager
                 .create_new_session(
-                    source_id,
+                    source_id.clone(),
                     codec,
                     codec_params,
                     sdp_request,
@@ -344,7 +349,7 @@ impl GlobalState {
     ) -> Result<ClientSessionId> {
         if let Some(source) = self.sources.get(&source_id).as_ref() {
             let packetizer = &source.rtp_packetizer;
-            let publisher = Arc::new(WscRtpPublisher::new(source_id));
+            let publisher = Arc::new(WscRtpPublisher::new(source_id.clone()));
             let client_id = publisher.id().clone();
 
             // Register the publisher with the UDP manager for holepunching
@@ -354,7 +359,7 @@ impl GlobalState {
             // Create and store the client session
             let client_session = ClientSession::new_live(
                 client_id.clone(),
-                source_id,
+                source_id.clone(),
                 publisher.clone(),
                 packetizer.clone(),
             );
@@ -374,7 +379,7 @@ impl GlobalState {
         let source_id = self
             .client_sessions
             .get(client_session_id)
-            .map(|session| *session.value().source_id())
+            .map(|session| session.value().source_id().clone())
             .ok_or_else(|| anyhow::anyhow!("Stream not found"))?;
         let source = self
             .sources
@@ -502,16 +507,16 @@ impl GlobalState {
 
     pub async fn list_webrtc_sessions(
         &self,
-        source_id: VideoSourceId,
+        source_id: &VideoSourceId,
     ) -> Vec<media_server_api_models::WebRtcSessionResponse> {
         let mut sessions = Vec::new();
         for entry in self.client_sessions.iter() {
-            if entry.value().source_id() == &source_id {
+            if entry.value().source_id() == source_id {
                 let state = entry.value().state.lock().await;
                 let is_live = matches!(*state, ClientSessionState::Live);
                 sessions.push(media_server_api_models::WebRtcSessionResponse {
                     session_id: entry.key().clone(),
-                    source_id,
+                    source_id: source_id.clone(),
                     is_live,
                 });
             }
@@ -526,11 +531,15 @@ impl GlobalState {
     pub async fn cleanup(&self) -> Result<()> {
         log::info!("Starting cleanup of all streams...");
 
-        let source_ids: Vec<u64> = self.sources.iter().map(|entry| *entry.key()).collect();
+        let source_ids: Vec<VideoSourceId> = self
+            .sources
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
 
         for source_id in source_ids {
             log::info!("Stopping stream {} during cleanup", source_id);
-            if let Err(e) = self.delete_stream(source_id).await {
+            if let Err(e) = self.delete_stream(&source_id).await {
                 log::error!("Error stopping stream {} during cleanup: {}", source_id, e);
             }
         }

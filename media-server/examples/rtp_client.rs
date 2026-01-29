@@ -49,7 +49,7 @@ EXAMPLE:
 
 fn main() -> anyhow::Result<()> {
     let mut server = "http://127.0.0.1:8009".to_string();
-    let mut source_id: u64 = 1;
+    let mut source_id: String = "1".to_string();
     let mut client_port: u16 = 5004;
     let mut ffplay = "ffplay".to_string();
 
@@ -66,7 +66,7 @@ fn main() -> anyhow::Result<()> {
                 i += 1;
             }
             "--source-id" if i + 1 < args.len() => {
-                source_id = args[i + 1].parse().unwrap_or(source_id);
+                source_id = args[i + 1].clone();
                 i += 1;
             }
             "--client-port" if i + 1 < args.len() => {
@@ -92,7 +92,7 @@ fn main() -> anyhow::Result<()> {
     println!("Connecting to {} for stream {}", server, source_id);
 
     let server_url = Url::parse(&server)?;
-    let ws_url = build_ws_url(&server_url, source_id)?;
+    let ws_url = build_ws_url(&server_url, &source_id)?;
     println!("WebSocket URL: {}", ws_url);
 
     let (mut socket, _) = connect(&ws_url)?;
@@ -315,7 +315,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_ws_url(base: &Url, source_id: u64) -> anyhow::Result<Url> {
+fn build_ws_url(base: &Url, source_id: &str) -> anyhow::Result<Url> {
     let mut ws_url = base.clone();
     let scheme = match ws_url.scheme() {
         "https" => "wss",
