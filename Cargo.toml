@@ -1,5 +1,5 @@
 [workspace]
-members = ["media-server", "crates/media-server-api-models"]
+members = ["media-server", "crates/media-server-api-models", "crates/rtp"]
 resolver = "2"
 
 [workspace.dependencies]

@@ -154,8 +154,12 @@ impl GlobalState {
         let settings = AppSettings::new()?;
         let wsc_rtp_listener = Arc::new(WscRtpUdpManager::new(&settings).await?);
         let wsc_rtp_listener_clone = wsc_rtp_listener.clone();
-        tokio::spawn(async move { wsc_rtp_listener_clone.run().await });
+        let wsc_rtp_manager_handle =
+            tokio::spawn(async move { wsc_rtp_listener_clone.run().await });
         let webrtc_manager = WebrtcManager::new()?;
+
+        let mut extra_shutdown_tasks = Vec::new();
+        extra_shutdown_tasks.push(wsc_rtp_manager_handle);
 
         let res = Self {
             sources: DashMap::new(),
@@ -542,6 +546,9 @@ impl GlobalState {
             if let Err(e) = self.delete_stream(&source_id).await {
                 log::error!("Error stopping stream {} during cleanup: {}", source_id, e);
             }
+        }
+        for task in &self.extra_shutdown_tasks {
+            task.abort();
         }
 
         log::info!("Cleanup complete");

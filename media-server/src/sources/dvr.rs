@@ -178,7 +178,7 @@ impl DvrPlayer {
             join_handle
         };
         let _ = join_handle.await;
-}
+    }
 
     pub async fn terminate(&self) -> Result<()> {
         let state_guard = self.state.lock().await;

@@ -153,6 +153,7 @@ impl WscRtpUdpManager {
                 Ok(value) => value,
                 Err(_) => continue,
             };
+            log::debug!("got payload {:?} from {:?}", payload, src);
             let mut parts = payload.split_whitespace();
             if let Some(header_maybe) = parts.next() {
                 if header_maybe == UDP_HOLEPUNCH_HEADER {
@@ -268,7 +269,7 @@ impl RtpConsumer for WscRtpPublisher {
             match dest_sock_guard.as_ref() {
                 Some(dest_sock) => dest_sock.clone(),
                 None => {
-                    log::debug!("dest socket not yet configured");
+                    log::warn!("dest socket not yet configured");
                     return;
                 }
             }
@@ -277,7 +278,12 @@ impl RtpConsumer for WscRtpPublisher {
             // this would usually error out in loopback if there is no actual destination
             // for "real" destinations there is no way we'd know if the packet reached the destination (its UDP after all)
             // so we can't rely on this error for anything useful.
-            log::warn!("wsc session {}: send failed: {}", self.id, err);
+            log::warn!(
+                "wsc session {}: failed to send packet to {:?} due to {}",
+                self.id,
+                dest_sock,
+                err
+            );
         }
     }
 }

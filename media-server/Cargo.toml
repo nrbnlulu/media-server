@@ -48,6 +48,7 @@ async-stream = "0.3.6"
 media-server-api-models = { workspace = true }
 parking_lot = "0.12.5"
 envy = "0.4.2"
+rtp = { path = "../crates/rtp" }
 
 [dev-dependencies]
 tungstenite = { version = "0.21", features = ["native-tls"] }

@@ -464,6 +464,39 @@
         </div>
 
         <script>
+            // Feature detection for WebRTC APIs with Firefox compatibility
+            const detectWebRTC = () => {
+                // Check for RTCPeerConnection with vendor prefixes for older browsers
+                const RTCPeerConnection = window.RTCPeerConnection ||
+                                         window.webkitRTCPeerConnection ||
+                                         window.mozRTCPeerConnection;
+
+                // Check for RTCSessionDescription with vendor prefixes
+                const RTCSessionDescription = window.RTCSessionDescription ||
+                                             window.webkitRTCSessionDescription ||
+                                             window.mozRTCSessionDescription;
+
+                // Check for RTCIceCandidate with vendor prefixes
+                const RTCIceCandidate = window.RTCIceCandidate ||
+                                       window.webkitRTCIceCandidate ||
+                                       window.mozRTCIceCandidate;
+
+                return {
+                    RTCPeerConnection,
+                    RTCSessionDescription,
+                    RTCIceCandidate,
+                    isSupported: !!RTCPeerConnection && !!RTCSessionDescription && !!RTCIceCandidate
+                };
+            };
+
+            // Check WebRTC support on page load
+            window.addEventListener('load', () => {
+                const webrtcSupport = detectWebRTC();
+                if (!webrtcSupport.isSupported) {
+                    alert('WebRTC is not supported in your browser. Please try using a modern browser like Chrome, Firefox, or Edge.');
+                }
+            });
+
             let pc = null;
             let currentSession = {
                 streamId: null,
@@ -668,9 +701,17 @@
                     `[${startTime}] Starting WebRTC setup for stream ${streamId}`,
                 );
 
+                // Check WebRTC support before proceeding
+                const webrtcSupport = detectWebRTC();
+                if (!webrtcSupport.isSupported) {
+                    throw new Error('WebRTC is not supported in your browser. Please try using a modern browser like Chrome, Firefox, or Edge.');
+                }
+
                 try {
                     if (pc) pc.close();
-                    pc = new RTCPeerConnection({
+
+                    // Use the detected RTCPeerConnection constructor
+                    pc = new webrtcSupport.RTCPeerConnection({
                         iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
                     });
 
@@ -745,8 +786,9 @@
                         `[${Date.now()}] Received server response, elapsed: ${Date.now() - startTime}ms`,
                     );
 
+                    // Use the detected RTCSessionDescription constructor
                     await pc.setRemoteDescription(
-                        new RTCSessionDescription({
+                        new webrtcSupport.RTCSessionDescription({
                             type: "answer",
                             sdp: response.answer,
                         }),
@@ -772,7 +814,14 @@
                         `[${errorTime}] WebRTC setup failed after ${errorTime - startTime}ms:`,
                         e,
                     );
-                    showToast("Failed to start stream", "error");
+
+                    // Check if we're in Firefox and provide specific guidance
+                    const isFirefox = typeof InstallTrigger !== 'undefined';
+                    if (isFirefox) {
+                        showToast("Failed to start stream. Firefox may require additional configuration for WebRTC.", "error");
+                    } else {
+                        showToast("Failed to start stream", "error");
+                    }
                 }
             }
 
@@ -1188,7 +1237,8 @@
                 setTimeout(() => toast.remove(), 3000);
             }
 
-            window.onload = () => {
+            // Initialize the app after checking WebRTC support
+            function initializeApp() {
                 checkHealth();
                 refreshStreams();
                 setInterval(checkHealth, 30000);
@@ -1196,7 +1246,23 @@
                 const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
                 const formatted = oneHourAgo.toISOString().slice(0, 16);
                 document.getElementById("seek-datetime").value = formatted;
-            };
+            }
+
+            // Wait for DOM to be loaded and check WebRTC support
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', () => {
+                    const webrtcSupport = detectWebRTC();
+                    if (webrtcSupport.isSupported) {
+                        initializeApp();
+                    }
+                });
+            } else {
+                // DOM is already loaded
+                const webrtcSupport = detectWebRTC();
+                if (webrtcSupport.isSupported) {
+                    initializeApp();
+                }
+            }
         </script>
     </body>
 </html>

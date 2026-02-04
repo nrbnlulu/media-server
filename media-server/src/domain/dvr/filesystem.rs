@@ -129,7 +129,10 @@ pub fn find_next_recording(stream_id: &VideoSourceId, timestamp: u64) -> FindNex
 }
 
 /// finds the recording that contains the timestamp if exists
-pub fn find_recording_for_timestamp(stream_id: &VideoSourceId, timestamp: u64) -> Option<RecordingMetadata> {
+pub fn find_recording_for_timestamp(
+    stream_id: &VideoSourceId,
+    timestamp: u64,
+) -> Option<RecordingMetadata> {
     let recordings = list_recordings_for_stream_id(stream_id).ok()?;
     for recording in recordings {
         if timestamp >= recording.start_time {
