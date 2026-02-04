@@ -1,11 +1,10 @@
-use crate::app::{AppSettings, ClientSessionId, GlobalState, VideoSourceId};
+use crate::app::{ClientSessionId, VideoSourceId};
 use crate::common::rtp::RtpPacket;
 use crate::common::traits::{RtpConsumer, RtpVideoPublisher};
 use crate::common::VideoCodec;
 use crate::utils::get_current_unix_timestamp;
 use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket};
-use dashmap::DashMap;
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
 use media_server_api_models::{WscRtpClientMessage, WscRtpServerMessage};
@@ -92,72 +91,107 @@ pub fn build_unicast_sdp(
 }
 
 const UDP_HOLEPUNCH_HEADER: &str = "t5rtp";
-const REGISTRATION_TTL: Duration = Duration::from_secs(30);
+const PORT_RANGE_START: u16 = 30000;
+const PORT_RANGE_END: u16 = 40000;
 
-#[derive(Clone)]
-pub struct WscRtpRegistrationSnapshot {
-    pub destination: Option<SocketAddr>,
-    pub client_port: Option<u16>,
+pub struct WscRtpPublisher {
+    id: ClientSessionId,
+    video_source_id: VideoSourceId,
+    dest_sock: Mutex<Option<Arc<UdpSocket>>>,
+    holepunch_listener: Mutex<Option<UdpSocket>>,
+    holepunch_port: Mutex<Option<u16>>,
+    dead: std::sync::atomic::AtomicBool,
 }
 
-/// A global listener for hole punching
-/// client sends a packet to the server in a certain port
-/// and adds a data about the session for the stream it expect to receive
-/// in that port.
-pub struct WscRtpUdpManager {
-    socket: UdpSocket,
-    wsc_publishers: DashMap<ClientSessionId, Arc<WscRtpPublisher>>,
-}
-
-impl WscRtpUdpManager {
-    pub async fn new(app_settings: &AppSettings) -> anyhow::Result<Self> {
-        let socket =
-            UdpSocket::bind(format!("0.0.0.0:{}", app_settings.wsc_holepunch_port)).await?;
-        Ok(Self {
-            socket,
-            wsc_publishers: DashMap::new(),
-        })
-    }
-    pub fn register_publisher(&self, session_id: ClientSessionId, publisher: Arc<WscRtpPublisher>) {
-        self.wsc_publishers.insert(session_id, publisher);
-    }
-    pub fn remove_publisher(&self, session_id: &ClientSessionId) {
-        self.wsc_publishers.remove(session_id);
-    }
-    pub fn get_sdp_for_session(
-        &self,
-        session_id: &ClientSessionId,
-        codec: &VideoCodec,
-        codec_params: &CodecParameters,
-    ) -> Option<String> {
-        if let Some(publisher) = self.wsc_publishers.get(session_id) {
-            Some(publisher.get_sdp(codec, codec_params)?)
-        } else {
-            None
+impl WscRtpPublisher {
+    pub fn new(video_source_id: VideoSourceId) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            video_source_id,
+            dest_sock: Mutex::new(None),
+            holepunch_listener: Mutex::new(None),
+            holepunch_port: Mutex::new(None),
+            dead: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    pub async fn run(&self) {
-        loop {
-            let mut buf = [0; 1024];
-            let res = self.socket.recv_from(&mut buf).await;
-            if let Err(err) = res {
-                log::error!("Failed to receive UDP packet: {}", err);
-                continue;
+    /// Allocate a UDP listener port in the range 30000-40000 and start listening for hole punch
+    pub async fn start_holepunch_listener(self: &Arc<Self>) -> anyhow::Result<u16> {
+        // Try to bind to a port in the range
+        for port in PORT_RANGE_START..=PORT_RANGE_END {
+            match UdpSocket::bind(format!("0.0.0.0:{}", port)).await {
+                Ok(socket) => {
+                    log::debug!("Session {} allocated holepunch port {}", self.id, port);
+                    *self.holepunch_port.lock() = Some(port);
+                    *self.holepunch_listener.lock() = Some(socket);
+
+                    // Spawn the listener task
+                    let self_clone = Arc::clone(self);
+                    tokio::spawn(async move {
+                        self_clone.run_holepunch_listener().await;
+                    });
+
+                    return Ok(port);
+                }
+                Err(_) => continue,
             }
+        }
+
+        anyhow::bail!(
+            "No available ports in range {}-{}",
+            PORT_RANGE_START,
+            PORT_RANGE_END
+        )
+    }
+
+    async fn run_holepunch_listener(&self) {
+        // Take ownership of the socket
+        let socket = {
+            let mut guard = self.holepunch_listener.lock();
+            match guard.take() {
+                Some(sock) => sock,
+                None => return,
+            }
+        };
+
+        let mut buf = [0u8; 1024];
+        loop {
+            let res = socket.recv_from(&mut buf).await;
+            if let Err(err) = res {
+                log::error!("Session {}: Failed to receive UDP packet: {}", self.id, err);
+                break;
+            }
+
             let (len, src) = res.unwrap();
             if len == 0 {
                 continue;
             }
+
             let payload = match std::str::from_utf8(&buf[..len]) {
                 Ok(value) => value,
                 Err(_) => continue,
             };
-            log::debug!("got payload {:?} from {:?}", payload, src);
+
+            log::debug!(
+                "Session {}: got holepunch payload {:?} from {:?}",
+                self.id,
+                payload,
+                src
+            );
+
             let mut parts = payload.split_whitespace();
             if let Some(header_maybe) = parts.next() {
                 if header_maybe == UDP_HOLEPUNCH_HEADER {
-                    if let Some(Ok(wsc_rtp_session_id)) = parts.next().map(Uuid::parse_str) {
+                    if let Some(Ok(session_id)) = parts.next().map(Uuid::parse_str) {
+                        if session_id != self.id {
+                            log::warn!(
+                                "Session {}: received holepunch for wrong session {}",
+                                self.id,
+                                session_id
+                            );
+                            continue;
+                        }
+
                         // Parse optional client port (third parameter in hole punch packet)
                         let client_port = parts.next().and_then(|p| p.parse::<u16>().ok());
 
@@ -171,7 +205,10 @@ impl WscRtpUdpManager {
                             match client_port {
                                 Some(port) => SocketAddr::new(src.ip(), port),
                                 None => {
-                                    log::error!("a local connection must send dest port");
+                                    log::error!(
+                                        "Session {}: local connection must send dest port",
+                                        self.id
+                                    );
                                     continue;
                                 }
                             }
@@ -183,58 +220,44 @@ impl WscRtpUdpManager {
                         match UdpSocket::bind("0.0.0.0:0").await {
                             Ok(dst_sock) => {
                                 // Connect the socket to the destination so we can use send() instead of send_to()
-                                // arguably this is better due to kernel caching and isolation.
                                 if let Err(err) = dst_sock.connect(dest_addr).await {
                                     log::error!(
-                                        "Failed to connect UDP socket to {}: {}",
+                                        "Session {}: Failed to connect UDP socket to {}: {}",
+                                        self.id,
                                         dest_addr,
                                         err
                                     );
                                     continue;
                                 }
 
-                                if let Some(publisher) =
-                                    self.wsc_publishers.get(&wsc_rtp_session_id).as_ref()
-                                {
-                                    publisher.set_socket(dst_sock);
-                                } else {
-                                    log::error!("Failed to set UDP address for RTP session, make sure first create a session");
-                                }
-                                continue;
+                                log::info!(
+                                    "Session {}: UDP destination set to {}",
+                                    self.id,
+                                    dest_addr
+                                );
+                                *self.dest_sock.lock() = Some(Arc::new(dst_sock));
+
+                                // We got what we need, we can stop listening
+                                break;
                             }
                             Err(err) => {
-                                log::error!("Failed to bind UDP socket: {}", err);
+                                log::error!(
+                                    "Session {}: Failed to bind UDP socket: {}",
+                                    self.id,
+                                    err
+                                );
                             }
-                        };
-
-                        continue;
+                        }
                     }
                 }
             }
-            log::warn!("unable to parse udp holepunch header");
         }
-    }
-}
 
-pub struct WscRtpPublisher {
-    id: ClientSessionId,
-    video_source_id: VideoSourceId,
-    dest_sock: Mutex<Option<Arc<UdpSocket>>>,
-    dead: std::sync::atomic::AtomicBool,
-}
-
-impl WscRtpPublisher {
-    pub fn new(video_source_id: VideoSourceId) -> Self {
-        Self {
-            id: Uuid::new_v4(),
-            video_source_id,
-            dest_sock: Mutex::new(None),
-            dead: std::sync::atomic::AtomicBool::new(false),
-        }
+        log::debug!("Session {}: holepunch listener stopped", self.id);
     }
 
-    pub fn set_socket(&self, sock: UdpSocket) {
-        *self.dest_sock.lock() = Some(Arc::new(sock));
+    pub fn get_holepunch_port(&self) -> Option<u16> {
+        *self.holepunch_port.lock()
     }
 
     pub fn get_sdp(&self, codec: &VideoCodec, codec_params: &CodecParameters) -> Option<String> {
@@ -251,6 +274,13 @@ impl WscRtpPublisher {
             addr,
             codec_params,
         ))
+    }
+
+    pub fn shutdown(&self) {
+        self.dead.store(true, Ordering::Relaxed);
+        // Clear the sockets to close them
+        *self.dest_sock.lock() = None;
+        *self.holepunch_listener.lock() = None;
     }
 }
 
@@ -269,21 +299,12 @@ impl RtpConsumer for WscRtpPublisher {
             match dest_sock_guard.as_ref() {
                 Some(dest_sock) => dest_sock.clone(),
                 None => {
-                    log::warn!("dest socket not yet configured");
                     return;
                 }
             }
         };
         if let Err(err) = dest_sock.send(&packet.to_bytes()).await {
-            // this would usually error out in loopback if there is no actual destination
-            // for "real" destinations there is no way we'd know if the packet reached the destination (its UDP after all)
-            // so we can't rely on this error for anything useful.
-            log::warn!(
-                "wsc session {}: failed to send packet to {:?} due to {}",
-                self.id,
-                dest_sock,
-                err
-            );
+            log::warn!("Session {}: failed to send RTP packet: {}", self.id, err);
         }
     }
 }
@@ -303,14 +324,12 @@ fn should_override_port(ip: IpAddr) -> bool {
     }
 }
 
-// WS stuff
+// WebSocket handling
 pub type WsSender = SplitSink<WebSocket, Message>;
 
 async fn handle_wsc_rtp_message(
     session_id: &ClientSessionId,
-    _app_state: Arc<GlobalState>,
     sender: &mut WsSender,
-    _source_id: &VideoSourceId,
     payload: &[u8],
     last_ping: &Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
@@ -329,7 +348,7 @@ async fn handle_wsc_rtp_message(
 
     match message {
         WscRtpClientMessage::Ping => {
-            log::trace!("wsc received ping session {}", session_id);
+            log::trace!("Session {}: received ping", session_id);
             last_ping.store(get_current_unix_timestamp(), Ordering::Relaxed);
             send_wsc_rtp_message(sender, WscRtpServerMessage::Pong).await
         }
@@ -362,105 +381,137 @@ async fn last_ping_checker(
         let last_ping_time = last_ping.load(Ordering::Relaxed);
         if (current_time - last_ping_time) >= 5000 {
             let _ = ping_timeout_tx.send(());
-            log::warn!("Client {} timed out", session_id);
+            log::warn!("Session {}: ping timeout", session_id);
             return;
         }
     }
 }
 
-pub async fn handle_incoming_wsc_trp_websocket(
+pub async fn handle_incoming_wsc_rtp_websocket(
     ws: WebSocket,
-    app_state: Arc<GlobalState>,
-    source_id: VideoSourceId,
-    client_port: Option<u16>,
-    client_addr: SocketAddr,
+    publisher: Arc<WscRtpPublisher>,
+    get_sdp: impl Fn() -> Option<String>,
 ) {
+    let session_id = *publisher.id();
+    let source_id = publisher.source_id().clone();
+
     let (mut sender, mut receiver) = ws.split();
-    let session_id = match app_state
-        .create_wsc_rtp_registration(source_id.clone(), client_port)
-        .await
-    {
-        Ok(session_id) => session_id,
+
+    let mut holepunch_port = None;
+    while holepunch_port.is_none() {
+        tokio::select! {
+            port_result = publisher.start_holepunch_listener() => {
+                match port_result {
+                    Ok(port) => holepunch_port = Some(port),
+                    Err(err) => {
+                        log::error!(
+                            "Session {}: failed to allocate holepunch port: {}",
+                            session_id,
+                            err
+                        );
+                        let _ = send_wsc_rtp_message(
+                            &mut sender,
+                            WscRtpServerMessage::Error {
+                                message: format!("Failed to allocate port: {}", err),
+                            },
+                        )
+                        .await;
+                        publisher.shutdown();
+                        return;
+                    }
+                }
+            }
+            // make sure that we don't hang for ever waiting for an holepunch
+            msg = receiver.next() => {
+                if let Some(msg) = msg {
+                    // if websocket disconnects, we need to stop the holepunch listener
+                    match msg {
+                        Err(err) => {
+                            log::info!("Session {}: websocket disconnected: {}", session_id, err);
+                            publisher.shutdown();
+                            return;
+                        }
+                        _ =>{}
+                    }
+                }
+            }
+        }
+    }
+    // Start the holepunch listener and get the allocated port
+    
+    let holepunch_port = match publisher.start_holepunch_listener().await {
+        Ok(port) => port,
         Err(err) => {
+            log::error!(
+                "Session {}: failed to allocate holepunch port: {}",
+                session_id,
+                err
+            );
             let _ = send_wsc_rtp_message(
                 &mut sender,
                 WscRtpServerMessage::Error {
-                    message: err.to_string(),
+                    message: format!("Failed to allocate port: {}", err),
                 },
             )
             .await;
+            publisher.shutdown();
             return;
         }
     };
-
     let last_ping = Arc::new(AtomicU64::new(get_current_unix_timestamp()));
     let (ping_timeout_tx, mut ping_timeout_rx) = tokio::sync::oneshot::channel();
 
     let _last_ping_checker_task = tokio::spawn(last_ping_checker(
         last_ping.clone(),
         ping_timeout_tx,
-        session_id.clone(),
+        session_id,
     ));
 
-    let udp_holepunch_required = !(client_addr.ip().is_loopback() && client_port.is_some());
+    // Send init message with the allocated holepunch port
     if send_wsc_rtp_message(
         &mut sender,
         WscRtpServerMessage::Init {
             token: session_id.to_string(),
-            server_port: app_state.settings().wsc_holepunch_port,
-            udp_holepunch_required,
+            holepunch_port,
         },
     )
     .await
     .is_err()
     {
-        let _ = app_state.delete_wsc_rtp_session(&session_id);
+        publisher.shutdown();
         return;
     }
-    log::debug!(
-        "wsc-rtp session {} started for stream {} from {}",
+
+    log::info!(
+        "Session {}: started for stream {} on port {}",
         session_id,
         source_id,
-        client_addr
+        holepunch_port
     );
-
-    if let Ok(info) = app_state.get_stream(&source_id).await {
-        let _ = send_wsc_rtp_message(
-            &mut sender,
-            WscRtpServerMessage::StreamState {
-                state: format!("{:?}", info.state),
-            },
-        )
-        .await;
-    }
 
     let mut last_sdp = None;
 
     loop {
         tokio::select! {
             _ = &mut ping_timeout_rx => {
-                log::warn!("wsc-rtp session {} closed due to ping timeout", session_id);
+                log::warn!("Session {}: closed due to ping timeout", session_id);
                 break;
             }
             _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                if let Ok(sdp) = app_state
-                    .try_get_wsc_rtp_sdp_info( &session_id)
-                    .await
-                {
+                if let Some(sdp) = get_sdp() {
                     let new_sdp = Some(sdp.clone());
                     if last_sdp != new_sdp {
                         if send_wsc_rtp_message(&mut sender, WscRtpServerMessage::Sdp { sdp }).await.is_ok() {
                             last_sdp = new_sdp;
                         }
                     }
-                    continue;
                 }
             }
             res = receiver.next() => {
                 let msg = match res {
                     Some(Ok(msg)) => msg,
                     Some(Err(err)) => {
-                        log::error!("Error receiving WebSocket message: {}", err);
+                        log::error!("Session {}: error receiving WebSocket message: {}", session_id, err);
                         break;
                     }
                     None => break,
@@ -482,17 +533,15 @@ pub async fn handle_incoming_wsc_trp_websocket(
                     },
                     Message::Close(_) => break,
                 };
-                if let Err(err) = handle_wsc_rtp_message(&session_id, Arc::clone(&app_state), &mut sender, &source_id, &data, &last_ping).await {
-                    log::error!("Error handling wsc-rtp message: {}", err);
+
+                if let Err(err) = handle_wsc_rtp_message(&session_id, &mut sender, &data, &last_ping).await {
+                    log::error!("Session {}: error handling message: {}", session_id, err);
                     break;
                 }
             }
         }
     }
-    log::debug!(
-        "wsc-rtp session {} closed for stream {}",
-        session_id,
-        source_id
-    );
-    let _ = app_state.delete_wsc_rtp_session(&session_id);
+
+    log::info!("Session {}: closed for stream {}", session_id, source_id);
+    publisher.shutdown();
 }

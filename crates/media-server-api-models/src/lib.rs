@@ -113,8 +113,8 @@ pub enum SessionMode {
 pub enum WscRtpServerMessage {
     Init {
         token: String,
-        server_port: u16,
-        udp_holepunch_required: bool,
+        /// The port allocated for this session's UDP hole punch listener (30000-40000 range)
+        holepunch_port: u16,
     },
     Sdp {
         sdp: String,

@@ -4,7 +4,7 @@ use crate::common::VideoCodec;
 use crate::domain::dvr::{filesystem, recorder::DvrRecorder};
 use crate::domain::{StreamConfig, StreamInfo, StreamState};
 use crate::publishers::webrtc::{WebRtcSession, WebrtcManager};
-use crate::publishers::wsc_rtp::{WscRtpPublisher, WscRtpUdpManager};
+use crate::publishers::wsc_rtp::WscRtpPublisher;
 use crate::sources::dvr::DvrPlayer;
 use crate::sources::rtsp::RtspClient;
 use anyhow::{anyhow, bail, Result};
@@ -35,14 +35,7 @@ pub type SharedGlobalState = Arc<GlobalState>;
 pub type WeakGlobalState = Weak<GlobalState>;
 
 #[derive(Deserialize, Debug)]
-pub struct AppSettings {
-    #[serde(default = "default_wsc_holepunch_port")]
-    pub wsc_holepunch_port: u16,
-}
-
-fn default_wsc_holepunch_port() -> u16 {
-    5000
-}
+pub struct AppSettings {}
 
 impl AppSettings {
     pub fn new() -> anyhow::Result<Self> {
@@ -143,7 +136,7 @@ impl ClientSession {
 pub struct GlobalState {
     sources: DashMap<VideoSourceId, SourceWrapper>,
     client_sessions: DashMap<ClientSessionId, ClientSession>,
-    wsc_manager: Arc<WscRtpUdpManager>,
+    wsc_publishers: DashMap<ClientSessionId, Arc<WscRtpPublisher>>,
     extra_shutdown_tasks: Vec<tokio::task::JoinHandle<()>>,
     webrtc_manager: WebrtcManager,
     settings: AppSettings,
@@ -152,22 +145,15 @@ pub struct GlobalState {
 impl GlobalState {
     pub async fn new() -> anyhow::Result<Self> {
         let settings = AppSettings::new()?;
-        let wsc_rtp_listener = Arc::new(WscRtpUdpManager::new(&settings).await?);
-        let wsc_rtp_listener_clone = wsc_rtp_listener.clone();
-        let wsc_rtp_manager_handle =
-            tokio::spawn(async move { wsc_rtp_listener_clone.run().await });
         let webrtc_manager = WebrtcManager::new()?;
-
-        let mut extra_shutdown_tasks = Vec::new();
-        extra_shutdown_tasks.push(wsc_rtp_manager_handle);
 
         let res = Self {
             sources: DashMap::new(),
             client_sessions: DashMap::new(),
-            wsc_manager: wsc_rtp_listener,
+            wsc_publishers: DashMap::new(),
             extra_shutdown_tasks: Vec::new(),
             webrtc_manager,
-            settings: settings,
+            settings,
         };
         Ok(res)
     }
@@ -349,31 +335,28 @@ impl GlobalState {
     pub async fn create_wsc_rtp_registration(
         &self,
         source_id: VideoSourceId,
-        client_port: Option<u16>,
-    ) -> Result<ClientSessionId> {
+    ) -> Result<Arc<WscRtpPublisher>> {
         if let Some(source) = self.sources.get(&source_id).as_ref() {
             let packetizer = &source.rtp_packetizer;
             let publisher = Arc::new(WscRtpPublisher::new(source_id.clone()));
-            let client_id = publisher.id().clone();
+            let client_id = *publisher.id();
 
-            // Register the publisher with the UDP manager for holepunching
-            self.wsc_manager
-                .register_publisher(client_id.clone(), publisher.clone());
+            // Store the publisher for later retrieval
+            self.wsc_publishers.insert(client_id, publisher.clone());
 
             // Create and store the client session
             let client_session = ClientSession::new_live(
-                client_id.clone(),
+                client_id,
                 source_id.clone(),
                 publisher.clone(),
                 packetizer.clone(),
             );
             let stitching_consumer = client_session.stitching_consumer.clone();
-            self.client_sessions
-                .insert(client_id.clone(), client_session);
+            self.client_sessions.insert(client_id, client_session);
 
             // Add the stitching consumer (which wraps the publisher) to the packetizer
             packetizer.add_consumer(stitching_consumer);
-            Ok(client_id)
+            Ok(publisher)
         } else {
             bail!("Stream not found")
         }
@@ -384,7 +367,7 @@ impl GlobalState {
             .client_sessions
             .get(client_session_id)
             .map(|session| session.value().source_id().clone())
-            .ok_or_else(|| anyhow::anyhow!("Stream not found"))?;
+            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
         let source = self
             .sources
             .get(&source_id)
@@ -398,9 +381,15 @@ impl GlobalState {
             .rtp_packetizer
             .get_codec_params()
             .ok_or(anyhow!("source has no RTP packetizer"))?;
-        self.wsc_manager
-            .get_sdp_for_session(client_session_id, &codec, &codec_params)
-            .ok_or(anyhow!("failed to get "))
+
+        let publisher = self
+            .wsc_publishers
+            .get(client_session_id)
+            .ok_or_else(|| anyhow!("Publisher not found"))?;
+
+        publisher
+            .get_sdp(&codec, &codec_params)
+            .ok_or_else(|| anyhow!("Failed to generate SDP"))
     }
 
     pub fn delete_client_session(&self, session_id: &ClientSessionId) -> anyhow::Result<()> {
@@ -421,7 +410,9 @@ impl GlobalState {
 
     pub async fn delete_wsc_rtp_session(&self, id: &ClientSessionId) -> Result<()> {
         self.delete_client_session(id)?;
-        self.wsc_manager.remove_publisher(id);
+        if let Some((_, publisher)) = self.wsc_publishers.remove(id) {
+            publisher.shutdown();
+        }
         Ok(())
     }
 
@@ -528,10 +519,6 @@ impl GlobalState {
         sessions
     }
 
-    pub fn wsc_manager(&self) -> &WscRtpUdpManager {
-        &self.wsc_manager
-    }
-
     pub async fn cleanup(&self) -> Result<()> {
         log::info!("Starting cleanup of all streams...");
 
@@ -553,16 +540,5 @@ impl GlobalState {
 
         log::info!("Cleanup complete");
         Ok(())
-    }
-}
-
-fn should_override_wsc_rtp_port(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(addr) => {
-            addr.is_loopback() || addr.is_private() || addr.is_link_local()
-        }
-        std::net::IpAddr::V6(addr) => {
-            addr.is_loopback() || addr.is_unique_local() || addr.is_unicast_link_local()
-        }
     }
 }
