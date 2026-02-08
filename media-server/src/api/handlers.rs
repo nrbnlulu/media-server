@@ -1,16 +1,16 @@
-use crate::api::{models::*, GlobalState};
+use crate::api::{GlobalState, models::*};
 use crate::app::{ClientSessionId, VideoSourceId};
 use crate::common::traits::RtpConsumer;
 use crate::domain::StreamConfig;
 use crate::publishers::wsc_rtp::handle_incoming_wsc_rtp_websocket;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::{
-    extract::{ConnectInfo, Path, State},
+    Json,
+    extract::{ConnectInfo, Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
-    Json,
 };
-use media_server_api_models::CreateWebRtcSessionRequest;
+use media_server_api_models::{CreateWebRtcSessionRequest, WscRtpQuery};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -192,6 +192,7 @@ pub async fn wsc_rtp(
     State(state): State<Arc<GlobalState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(source_id): Path<VideoSourceId>,
+    Query(query): Query<WscRtpQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     // Create the WSC-RTP publisher (which also validates the stream exists)
@@ -206,15 +207,8 @@ pub async fn wsc_rtp(
         }
     };
 
-    let session_id = *publisher.id();
-    let state_clone = state.clone();
-
-    ws.on_upgrade(move |socket| {
-        let get_sdp = move || {
-            // Use blocking API since we're in async context
-            futures::executor::block_on(state_clone.try_get_wsc_rtp_sdp_info(&session_id)).ok()
-        };
-        handle_incoming_wsc_rtp_websocket(socket, publisher, get_sdp)
+   ws.on_upgrade(move |socket| {
+        handle_incoming_wsc_rtp_websocket(socket, publisher, query.force_websocket_transport)
     })
 }
 

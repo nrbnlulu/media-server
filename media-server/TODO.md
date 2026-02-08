@@ -1,10 +1,14 @@
 - [x] Consumers
     - [x] RTSP(h264/5) support with restarts
 - [ ] Publishers
-    - [x] raw rtp with NAT hole punch 
+    - [x] webrtc
+        - [x] H264
+        - [ ] H265
+    - [x] wsc-rtp
         - [x] H264
         - [x] H265
-        
+        - [ ] revise the sdp publishment mechanism currently too much of a spagetti
+        - [ ] support initializing a client directly with websocket, don'y try udp at all.
 - [x] RTSP->webrtc proxy
     - [ ] make sure that if the camera is initially not working we can still open rtp / webrtc session.    
     - [ ] GOP caching for rtsp streams (https://github.com/bluenviron/mediamtx/pull/4189)

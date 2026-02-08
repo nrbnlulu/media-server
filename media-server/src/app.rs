@@ -1,13 +1,13 @@
-use crate::common::rtp::{CodecParameters, RtpPacket, RtpPacketizer, StitchingConsumer};
-use crate::common::traits::{RtpConsumer, RtpVideoPublisher, VideoSource};
 use crate::common::VideoCodec;
+use crate::common::rtp::{RtpPacket, RtpPacketizer, StitchingConsumer};
+use crate::common::traits::{RtpConsumer, RtpVideoPublisher, VideoSource};
 use crate::domain::dvr::{filesystem, recorder::DvrRecorder};
 use crate::domain::{StreamConfig, StreamInfo, StreamState};
 use crate::publishers::webrtc::{WebRtcSession, WebrtcManager};
 use crate::publishers::wsc_rtp::WscRtpPublisher;
 use crate::sources::dvr::DvrPlayer;
 use crate::sources::rtsp::RtspClient;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use dashmap::DashMap;
 use futures::TryFutureExt;
 use gstreamer::glib::clone::Downgrade;
@@ -79,7 +79,7 @@ impl ClientSession {
     pub async fn switch_to_live(&self) {
         let mut state_guard = self.state.lock().await;
         match &*state_guard {
-            ClientSessionState::Dvr(ref player, ref handle_opt) => {
+            ClientSessionState::Dvr(player, handle_opt) => {
                 if let Err(err) = player.terminate().await {
                     log::error!("Failed to stop pipeline: {}", err);
                 }
@@ -282,18 +282,11 @@ impl GlobalState {
         source_id: VideoSourceId,
     ) -> Result<(ClientSessionId, String)> {
         if let Some(source) = self.sources.get(&source_id).as_ref() {
-            let codec = source.source.codec().await;
-            log::debug!(
-                "create_websocket_session: source_id={}, codec={:?}",
-                source_id,
-                codec
-            );
-            let codec = codec
-                .ok_or_else(|| anyhow::anyhow!("Codec not found - stream may not be ready"))?;
             let packetizer = &source.rtp_packetizer;
             let codec_params = packetizer.get_codec_params();
             log::debug!(
-                "create_websocket_session: codec_params={:?}",
+                "create_websocket_session: source_id={}, codec_params={:?}",
+                source_id,
                 codec_params.is_some()
             );
             let codec_params = codec_params.ok_or_else(|| {
@@ -304,7 +297,6 @@ impl GlobalState {
                 .webrtc_manager
                 .create_new_session(
                     source_id.clone(),
-                    codec,
                     codec_params,
                     sdp_request,
                     self.downgrade(),
@@ -360,36 +352,6 @@ impl GlobalState {
         } else {
             bail!("Stream not found")
         }
-    }
-
-    pub async fn try_get_wsc_rtp_sdp_info(&self, client_session_id: &Uuid) -> Result<String> {
-        let source_id = self
-            .client_sessions
-            .get(client_session_id)
-            .map(|session| session.value().source_id().clone())
-            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-        let source = self
-            .sources
-            .get(&source_id)
-            .ok_or_else(|| anyhow::anyhow!("Stream not found"))?;
-        let codec = source
-            .source
-            .codec()
-            .await
-            .ok_or(anyhow!("source has no codec set"))?;
-        let codec_params = source
-            .rtp_packetizer
-            .get_codec_params()
-            .ok_or(anyhow!("source has no RTP packetizer"))?;
-
-        let publisher = self
-            .wsc_publishers
-            .get(client_session_id)
-            .ok_or_else(|| anyhow!("Publisher not found"))?;
-
-        publisher
-            .get_sdp(&codec, &codec_params)
-            .ok_or_else(|| anyhow!("Failed to generate SDP"))
     }
 
     pub fn delete_client_session(&self, session_id: &ClientSessionId) -> anyhow::Result<()> {

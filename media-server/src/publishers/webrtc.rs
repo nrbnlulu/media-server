@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
@@ -8,10 +8,10 @@ use std::sync::Arc;
 use uuid::Uuid;
 use webrtc::{
     peer_connection::{
-        peer_connection_state::RTCPeerConnectionState,
-        sdp::session_description::RTCSessionDescription, RTCPeerConnection,
+        RTCPeerConnection, peer_connection_state::RTCPeerConnectionState,
+        sdp::session_description::RTCSessionDescription,
     },
-    track::track_local::{track_local_static_rtp::TrackLocalStaticRTP, TrackLocalWriter},
+    track::track_local::{TrackLocalWriter, track_local_static_rtp::TrackLocalStaticRTP},
 };
 
 use crate::{
@@ -19,7 +19,6 @@ use crate::{
     common::{
         rtp::{CodecParameters, RtpPacket},
         traits::{RtpConsumer, RtpVideoPublisher},
-        VideoCodec,
     },
 };
 
@@ -51,11 +50,11 @@ impl WebrtcManager {
     pub async fn create_new_session(
         &self,
         source_id: VideoSourceId,
-        codec: VideoCodec,
         params: CodecParameters,
         request: CreateWebRtcSessionRequest,
         app_state: WeakGlobalState,
     ) -> anyhow::Result<(Arc<WebRtcSession>, String)> {
+        let codec = params.codec();
         let config = webrtc::peer_connection::configuration::RTCConfiguration {
             ice_servers: vec![webrtc::ice_transport::ice_server::RTCIceServer {
                 urls: vec!["stun:stun.l.google.com:19302".to_owned()],

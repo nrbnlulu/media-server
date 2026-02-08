@@ -220,7 +220,6 @@ pub trait RtpVideoPublisher: RtpConsumer { ... } // Combined trait
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BIND_ADDRESS` | `0.0.0.0:8009` | HTTP server bind address |
-| `WSC_HOLEPUNCH_PORT` | `5000` | UDP hole-punch port |
 
 ### Stream Configuration
 
@@ -309,23 +308,7 @@ cargo run --release -- --port 8009
 
 Use the debug WebRTC client at `/debug/webrtc-client` for testing streams.
 
-## Status
+## Agentic guidelines
 
-**Implemented:**
-- RTSP stream ingestion with auto-reconnect
-- WebRTC streaming to clients
-- WSC-RTP custom low-latency protocol
-- Live recording to MP4
-- DVR playback with seeking
-- H.264 and H.265 support
-- Multi-consumer support
-- API with Swagger documentation
-- Graceful shutdown
+- all plan files u write whould be stored under <project_root>/PLANS/<your_plan_name>.md
 
-**In Progress:**
-- Playback speed control
-
-**Planned:**
-- H.265 automatic transcoding to VP9
-- VOD (long-term archival)
-- GOP caching for RTSP optimization

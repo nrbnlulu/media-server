@@ -1,6 +1,6 @@
 use crate::{
     app::{ClientSessionId, VideoSourceId},
-    common::{rtp::RtpPacket, FFmpegVideoMetadata, VideoCodec},
+    common::{FFmpegVideoMetadata, VideoCodec, rtp::RtpPacket},
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,8 @@ pub trait RtpConsumer: Send + Sync {
     /// Called for each RTP frame. The frame's payload is shared (Arc) across consumers.
     /// Implementations should serialize with `frame.to_bytes()` or access header/payload separately.
     async fn on_new_packet(&self, frame: Arc<RtpPacket>);
+    /// Called when codec parameters are available or updated.
+    fn update_params(&self, _params: &CodecParameters) {}
     async fn finalize(&self) -> anyhow::Result<()> {
         Ok(())
     }

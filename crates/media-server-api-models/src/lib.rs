@@ -95,6 +95,37 @@ pub struct ListWebRtcSessionsResponse {
     pub sessions: Vec<WebRtcSessionResponse>,
 }
 
+/// Query parameters for WSC-RTP WebSocket endpoint
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WscRtpQuery {
+    /// Skip UDP negotiation and use WebSocket for RTP delivery from the start
+    #[serde(default)]
+    pub force_websocket_transport: bool,
+}
+
+pub mod wsc_rtp {
+    /// Header for UDP hole-punch packets sent by the client
+    pub const HOLEPUNCH_HEADER: &str = "ws-rtp";
+
+    /// Header for dummy packets sent by the server to confirm UDP connectivity
+    pub const DUMMY_HEADER: &str = "ws-rtp-dummy";
+
+    /// Header for ack packets sent by the client to confirm UDP receipt
+    pub const ACK_HEADER: &str = "ws-rtp-ack";
+
+    /// Number of dummy UDP packets to send while waiting for client ack
+    pub const DUMMY_PACKET_COUNT: u32 = 5;
+
+    /// Interval between dummy packets in milliseconds
+    pub const DUMMY_PACKET_INTERVAL_MS: u64 = 100;
+
+    /// Port range start for UDP holepunch listeners
+    pub const PORT_RANGE_START: u16 = 30000;
+
+    /// Port range end for UDP holepunch listeners
+    pub const PORT_RANGE_END: u16 = 40000;
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WscRtpClientMessage {
@@ -112,19 +143,18 @@ pub enum SessionMode {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WscRtpServerMessage {
     Init {
-        token: String,
+        session_id: String,
         /// The port allocated for this session's UDP hole punch listener (30000-40000 range)
         holepunch_port: u16,
     },
     Sdp {
         sdp: String,
     },
-    StreamState {
-        state: String,
-    },
     SessionMode(SessionMode),
     Error {
         message: String,
     },
+    /// Sent when UDP transport fails and RTP packets will now be delivered as binary WebSocket frames.
+    FallingBackRtpToWs,
     Pong,
 }

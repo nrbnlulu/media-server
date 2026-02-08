@@ -1,7 +1,7 @@
 [package]
 name = "media-server"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 tokio = { version = "1.35", features = ["full"] }
@@ -13,9 +13,9 @@ tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 ffmpeg = { git = "https://github.com/nrbnlulu/rffmpeg", branch = "main",  package = "rffmpeg" }
 rand = "0.8"
 
-gstreamer = "0.22"
-gstreamer-app = "0.22"
-gstreamer-video = "0.22"
+gstreamer = "0.24.4"
+gstreamer-app = "0.24.4"
+gstreamer-video = "0.24.4"
 
 webrtc = "0.9"
 
@@ -41,8 +41,7 @@ dashmap = "5.5"
 url = { version = "2.5", features = ["serde"] }
 
 base64 = "0.21"
-sdp = "0.6.2"
-image = "0.24"
+sdp = "0.17.1"
 sha2 = "0.10"
 async-stream = "0.3.6"
 media-server-api-models = { workspace = true }

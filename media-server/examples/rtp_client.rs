@@ -19,12 +19,12 @@
 use media_server_api_models::{WscRtpClientMessage, WscRtpServerMessage};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{connect, Message, WebSocket};
+use tungstenite::{Message, WebSocket, connect};
 use url::Url;
 
 fn print_help() {
@@ -139,9 +139,8 @@ fn main() -> anyhow::Result<()> {
                 let server_msg: WscRtpServerMessage = serde_json::from_slice(&payload)?;
                 match server_msg {
                     WscRtpServerMessage::Init {
-                        token: init_token,
-                        server_port: init_port,
-                        udp_holepunch_required,
+                        session_id: init_token,
+                        holepunch_port: init_port,
                     } => {
                         println!(
                             "Received Init: token={}, port={}, holepunch_required={}",
@@ -168,9 +167,6 @@ fn main() -> anyhow::Result<()> {
                     WscRtpServerMessage::Sdp { sdp } => {
                         println!("Received SDP ({} bytes)", sdp.len());
                         sdp_body = Some(sdp);
-                    }
-                    WscRtpServerMessage::StreamState { state } => {
-                        println!("Stream state: {}", state);
                     }
                     WscRtpServerMessage::SessionMode(mode) => {
                         println!("Session mode: {:?}", mode);
@@ -266,9 +262,6 @@ fn main() -> anyhow::Result<()> {
                                     // SDP updated (e.g., codec params changed)
                                     println!("SDP updated ({} bytes)", sdp.len());
                                     std::fs::write(&sdp_file, sdp.as_bytes())?;
-                                }
-                                WscRtpServerMessage::StreamState { state } => {
-                                    println!("Stream state changed: {}", state);
                                 }
                                 WscRtpServerMessage::Error { message } => {
                                     eprintln!("Server error: {}", message);

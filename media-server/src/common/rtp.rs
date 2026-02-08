@@ -4,12 +4,12 @@ use crate::common::traits::{FfmpegConsumer, RtpConsumer};
 use crate::common::{FFmpegVideoMetadata, TimeBase, VideoCodec};
 use anyhow::{anyhow, bail};
 use axum::async_trait;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures::future::join_all;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, Ordering};
 
 pub use rtp::{RtpHeader, RtpPacket};
 
@@ -57,8 +57,12 @@ impl RtpPacketizer {
     }
 
     pub fn add_consumer(&self, consumer: Arc<dyn RtpConsumer>) {
+        let params = self.get_codec_params();
         let mut consumers_lock = self.consumers.lock();
         if !consumers_lock.contains(&consumer) {
+            if let Some(ref params) = params {
+                consumer.update_params(params);
+            }
             consumers_lock.push(consumer);
         }
     }
@@ -279,15 +283,15 @@ impl FfmpegConsumer for RtpPacketizer {
         }
         .ok_or_else(|| anyhow!("failed to parse extradata"))?;
 
-        let mut codec_params = CodecParameters::default();
+        let mut codec_params = CodecParameters::new(&metadata.codec);
 
         // Set the NAL length size if it's AVCC
         if let nal_utils::FramingFormat::Avcc { length_size } = parsed_extradata.framing_format {
-            codec_params.nal_length_size = Some(length_size);
+            codec_params.set_nal_length_size(length_size);
         }
 
         for nal in parsed_extradata.nals.iter() {
-            codec_params.update_from_nal(&metadata.codec, nal);
+            codec_params.update_from_nal(nal);
         }
 
         let stream_state = SrcStreamState {
@@ -304,6 +308,13 @@ impl FfmpegConsumer for RtpPacketizer {
 
         self.stream_metadata.lock().replace(stream_state);
         self.is_initialized.store(true, Ordering::SeqCst);
+
+        if let Some(params) = self.get_codec_params() {
+            let consumers = self.consumers.lock().clone();
+            for consumer in &consumers {
+                consumer.update_params(&params);
+            }
+        }
 
         Ok(())
     }
@@ -351,7 +362,7 @@ impl FfmpegConsumer for RtpPacketizer {
 
                 for nal in &nal_units_ {
                     // Update params in-band (e.g., resolution change)
-                    config.codec_params.update_from_nal(&config.codec, nal);
+                    config.codec_params.update_from_nal(nal);
                 }
                 nal_units = Some(nal_units_);
             }
@@ -560,44 +571,91 @@ impl RtpConsumer for StitchingConsumer {
         self.inner.on_new_packet(Arc::new(stitched)).await;
     }
 
+    fn update_params(&self, params: &CodecParameters) {
+        self.inner.update_params(params);
+    }
+
     async fn finalize(&self) -> anyhow::Result<()> {
         self.inner.finalize().await
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct CodecParameters {
-    /// Video Parameter Set, unique to h265, some metadata stuff.
-    pub vps: Option<Vec<u8>>,
-    /// Sequence Parameter Set, framerate, color format, res.
-    pub sps: Option<Vec<u8>>,
-    /// Picture Parameter Set, can be changed mid-stream, contains some metadata for the codec.
-    pub pps: Option<Vec<u8>>,
-    pub nal_length_size: Option<usize>,
+#[derive(Debug, Clone, PartialEq)]
+pub enum CodecParameters {
+    H264 {
+        /// Sequence Parameter Set, framerate, color format, res.
+        sps: Option<Vec<u8>>,
+        /// Picture Parameter Set, can be changed mid-stream, contains some metadata for the codec.
+        pps: Option<Vec<u8>>,
+        nal_length_size: Option<usize>,
+    },
+    H265 {
+        /// Video Parameter Set, unique to h265, some metadata stuff.
+        vps: Option<Vec<u8>>,
+        /// Sequence Parameter Set, framerate, color format, res.
+        sps: Option<Vec<u8>>,
+        /// Picture Parameter Set, can be changed mid-stream, contains some metadata for the codec.
+        pps: Option<Vec<u8>>,
+        nal_length_size: Option<usize>,
+    },
 }
 
 impl CodecParameters {
-    pub fn update_from_nal(&mut self, codec: &VideoCodec, nal: &[u8]) {
+    pub fn new(codec: &VideoCodec) -> Self {
+        match codec {
+            VideoCodec::H264 => CodecParameters::H264 {
+                sps: None,
+                pps: None,
+                nal_length_size: None,
+            },
+            VideoCodec::H265 => CodecParameters::H265 {
+                vps: None,
+                sps: None,
+                pps: None,
+                nal_length_size: None,
+            },
+        }
+    }
+
+    pub fn codec(&self) -> VideoCodec {
+        match self {
+            CodecParameters::H264 { .. } => VideoCodec::H264,
+            CodecParameters::H265 { .. } => VideoCodec::H265,
+        }
+    }
+
+    pub fn set_nal_length_size(&mut self, size: usize) {
+        match self {
+            CodecParameters::H264 {
+                nal_length_size, ..
+            } => *nal_length_size = Some(size),
+            CodecParameters::H265 {
+                nal_length_size, ..
+            } => *nal_length_size = Some(size),
+        }
+    }
+
+    pub fn update_from_nal(&mut self, nal: &[u8]) {
         if nal.is_empty() {
             return;
         }
 
-        match codec {
-            VideoCodec::H264 => {
+        match self {
+            CodecParameters::H264 { sps, pps, .. } => {
                 if let Some(nal_type) = nal_utils::get_h264_nal_type(nal) {
                     match nal_type {
-                        H264NalType::Sps => self.sps = Some(nal.to_vec()),
-                        H264NalType::Pps => self.pps = Some(nal.to_vec()),
+                        H264NalType::Sps => *sps = Some(nal.to_vec()),
+                        H264NalType::Pps => *pps = Some(nal.to_vec()),
                         _ => {}
                     }
                 }
             }
-            VideoCodec::H265 => {
+            CodecParameters::H265 { vps, sps, pps, .. } => {
                 if let Some(nal_type) = nal_utils::get_h265_nal_type(nal) {
                     match nal_type {
-                        H265NalType::Vps => self.vps = Some(nal.to_vec()),
-                        H265NalType::Sps => self.sps = Some(nal.to_vec()),
-                        H265NalType::Pps => self.pps = Some(nal.to_vec()),
+                        H265NalType::Vps => *vps = Some(nal.to_vec()),
+                        H265NalType::Sps => *sps = Some(nal.to_vec()),
+                        H265NalType::Pps => *pps = Some(nal.to_vec()),
                         _ => {}
                     }
                 }
@@ -605,57 +663,61 @@ impl CodecParameters {
         }
     }
 
-    pub fn update_from_extradata(&mut self, codec: &VideoCodec, extradata: &[u8]) {
+    pub fn update_from_extradata(&mut self, extradata: &[u8]) {
         if extradata.is_empty() {
             return;
         }
 
-        if let Some(parsed) = match codec {
-            VideoCodec::H264 => nal_utils::parse_h264_extradata(extradata),
-            VideoCodec::H265 => nal_utils::parse_h265_extradata(extradata),
-        } {
-            self.nal_length_size = match parsed.framing_format {
-                nal_utils::FramingFormat::AnnexB => None,
-                nal_utils::FramingFormat::Avcc { length_size } => Some(length_size),
+        let parsed = match self {
+            CodecParameters::H264 { .. } => nal_utils::parse_h264_extradata(extradata),
+            CodecParameters::H265 { .. } => nal_utils::parse_h265_extradata(extradata),
+        };
+
+        if let Some(parsed) = parsed {
+            match parsed.framing_format {
+                nal_utils::FramingFormat::AnnexB => {}
+                nal_utils::FramingFormat::Avcc { length_size } => {
+                    self.set_nal_length_size(length_size);
+                }
             };
             for nal in parsed.nals {
-                self.update_from_nal(codec, &nal);
+                self.update_from_nal(&nal);
             }
             return;
         }
 
         if nal_utils::is_annex_b(extradata) {
             for nal in nal_utils::parse_annex_b(extradata) {
-                self.update_from_nal(codec, &nal);
+                self.update_from_nal(&nal);
             }
         }
     }
 
-    pub fn fmtp(&self, codec: &VideoCodec) -> String {
-        match codec {
-            VideoCodec::H264 => {
+    pub fn fmtp(&self) -> String {
+        match self {
+            CodecParameters::H264 { sps, pps, .. } => {
                 let mut parts = vec!["packetization-mode=1".to_string()];
-                if let (Some(sps), Some(pps)) = (&self.sps, &self.pps) {
+                if let (Some(sps), Some(pps)) = (sps, pps) {
                     let sps_b64 = BASE64_STANDARD.encode(sps);
                     let pps_b64 = BASE64_STANDARD.encode(pps);
                     parts.push(format!("sprop-parameter-sets={sps_b64},{pps_b64}"));
                 }
                 parts.join(";")
             }
-            VideoCodec::H265 => {
+            CodecParameters::H265 { vps, sps, pps, .. } => {
                 // In HEVC over RTP, the Decoding Order Number (DON)
                 // is used to manage packets that arrive out of order or streams that use complex interleaving.
                 // This stands for "Stream Property Max DON Difference."
                 // It defines the maximum absolute difference between the DON
                 // of any two NAL units that occur in the same transmission order.
                 let mut parts = vec!["sprop-max-don-diff=0".to_string()];
-                if let Some(vps) = &self.vps {
+                if let Some(vps) = vps {
                     parts.push(format!("sprop-vps={}", BASE64_STANDARD.encode(vps)));
                 }
-                if let Some(sps) = &self.sps {
+                if let Some(sps) = sps {
                     parts.push(format!("sprop-sps={}", BASE64_STANDARD.encode(sps)));
                 }
-                if let Some(pps) = &self.pps {
+                if let Some(pps) = pps {
                     parts.push(format!("sprop-pps={}", BASE64_STANDARD.encode(pps)));
                 }
                 parts.join(";")
@@ -712,12 +774,17 @@ mod tests {
             0x04, 0x68, 0xce, 0x3c, 0x80,
         ];
 
-        let mut params = CodecParameters::default();
-        params.update_from_extradata(&VideoCodec::H264, &extradata);
+        let mut params = CodecParameters::new(&VideoCodec::H264);
+        params.update_from_extradata(&extradata);
 
-        assert_eq!(params.nal_length_size, Some(4));
-        assert_eq!(params.sps, Some(sps));
-        assert_eq!(params.pps, Some(pps));
+        assert_eq!(
+            params,
+            CodecParameters::H264 {
+                sps: Some(sps),
+                pps: Some(pps),
+                nal_length_size: Some(4),
+            }
+        );
     }
 
     #[test]
@@ -735,13 +802,18 @@ mod tests {
         push_h265_array(&mut extradata, 33, &sps);
         push_h265_array(&mut extradata, 34, &pps);
 
-        let mut params = CodecParameters::default();
-        params.update_from_extradata(&VideoCodec::H265, &extradata);
+        let mut params = CodecParameters::new(&VideoCodec::H265);
+        params.update_from_extradata(&extradata);
 
-        assert_eq!(params.nal_length_size, Some(4));
-        assert_eq!(params.vps, Some(vps));
-        assert_eq!(params.sps, Some(sps));
-        assert_eq!(params.pps, Some(pps));
+        assert_eq!(
+            params,
+            CodecParameters::H265 {
+                vps: Some(vps),
+                sps: Some(sps),
+                pps: Some(pps),
+                nal_length_size: Some(4),
+            }
+        );
     }
 
     fn push_h265_array(buf: &mut Vec<u8>, nal_type: u8, nal: &[u8]) {
