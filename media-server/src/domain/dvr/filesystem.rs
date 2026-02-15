@@ -1,13 +1,10 @@
-use anyhow::{bail, Result};
-use ffmpeg;
+use anyhow::Result;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::PathBuf;
 
 use media_server_api_models::UnixTimestamp;
 
 use crate::app::VideoSourceId;
-use crate::common::traits::VideoSource;
 
 const DVR_BASE_DIR: &str = "dvr";
 

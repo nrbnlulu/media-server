@@ -1,8 +1,10 @@
+use crate::domain::{StreamConfig, StreamState};
 use crate::{
     app::{ClientSessionId, VideoSourceId},
     common::{FFmpegVideoMetadata, VideoCodec, rtp::RtpPacket},
 };
 use async_trait::async_trait;
+use media_server_api_models::VideoSourceInput;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -12,15 +14,15 @@ pub struct Resolution {
     pub width: u32,
     pub height: u32,
 }
-use crate::domain::{StreamConfig, StreamState};
 
 /// Trait for video sources (RTSP, DVR, file playback, etc.)
 #[async_trait]
 pub trait VideoSource: Send + Sync {
-    async fn execute(&self);
+    async fn execute(self: Arc<Self>);
     async fn codec(&self) -> Option<VideoCodec>;
     async fn stop(&self) -> anyhow::Result<()>;
-    fn url(&self) -> &url::Url;
+    fn inputs(&self) -> &[VideoSourceInput];
+    fn active_input(&self) -> Option<VideoSourceInput>;
     fn source_id(&self) -> &VideoSourceId;
     async fn state(&self) -> StreamState;
     fn config(&self) -> &StreamConfig;

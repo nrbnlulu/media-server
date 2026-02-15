@@ -2,9 +2,9 @@ pub mod handlers;
 pub mod models;
 
 use axum::{
+    Router,
     extract::DefaultBodyLimit,
     routing::{delete, get, post},
-    Router,
 };
 use std::sync::Arc;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -33,6 +33,7 @@ use crate::app::GlobalState;
     ),
     components(
         schemas(
+            models::VideoSourceInput,
             models::CreateStreamRequest,
             models::CreateStreamResponse,
             models::StreamResponse,

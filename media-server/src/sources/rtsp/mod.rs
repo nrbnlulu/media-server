@@ -1,13 +1,17 @@
 use crate::app::VideoSourceId;
-use crate::common::traits::{FfmpegConsumer, VideoSource};
 use crate::common::TimeBase;
+use crate::common::traits::{FfmpegConsumer, VideoSource};
 use crate::common::{FFmpegVideoMetadata, VideoCodec};
 use crate::domain::{StreamConfig, StreamState};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use axum::async_trait;
+use ffmpeg;
 use futures::future::join_all;
-use std::sync::atomic::{AtomicBool, Ordering};
+use media_server_api_models::VideoSourceInput;
+use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use std::{thread, time};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::{broadcast, mpsc};
@@ -29,8 +33,9 @@ pub struct RtspClient {
     config: StreamConfig,
     state: Arc<TokioMutex<StreamState>>,
     codec: Arc<TokioMutex<Option<VideoCodec>>>,
+    active_video_input: Mutex<Option<VideoSourceInput>>,
     state_tx: broadcast::Sender<StreamState>,
-    shutdown: Arc<AtomicBool>,
+    shutdown_sig: Arc<AtomicBool>,
     consumers: TokioMutex<Vec<Arc<dyn FfmpegConsumer>>>,
 }
 
@@ -40,14 +45,15 @@ impl RtspClient {
         state_tx: broadcast::Sender<StreamState>,
         consumers: Vec<Arc<dyn FfmpegConsumer>>,
     ) -> Result<Self> {
-        Self::validate_rtsp_url(config.rtsp_url.as_str())?;
+        validate_rtsp_inputs(&config.rtsp_inputs)?;
         Ok(Self {
             config,
             state: Arc::new(TokioMutex::new(StreamState::Stopped)),
+            active_video_input: Mutex::new(None),
             codec: Arc::new(TokioMutex::new(None)),
             state_tx,
             consumers: TokioMutex::new(consumers),
-            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_sig: Arc::new(AtomicBool::new(false)),
         })
     }
     pub fn source_id(&self) -> &VideoSourceId {
@@ -74,7 +80,7 @@ impl RtspClient {
     }
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.shutdown_sig.store(true, Ordering::SeqCst);
         for consumer in self.consumers.lock().await.drain(..) {
             if let Err(e) = consumer.finalize().await {
                 log::error!("Failed to finalize consumer: {}", e);
@@ -83,35 +89,22 @@ impl RtspClient {
         Ok(())
     }
 
-    pub async fn execute(&self) {
-        // Use capacity > 1 to avoid blocking when state changes rapidly (up->down->up)
+    async fn _execute(self: Arc<Self>) {
         let (live_stream_state_tx, mut live_stream_state_rx) = mpsc::channel::<LiveStreamState>(4);
         let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel::<ffmpeg::Packet>(30);
 
-        let rtsp_url = self.build_rtsp_url();
         let session_id = self.config.source_id.clone();
         let session_id_for_loop = session_id.clone();
-        let shutdown_sig = Arc::clone(&self.shutdown);
-        let restart_delay =
-            std::time::Duration::from_secs(self.config.restart_interval_secs.unwrap_or(5));
-
         let (metadata_tx, mut metadata_rx) = tokio::sync::mpsc::channel(1);
         let packet_tx_clone = packet_tx.clone();
 
+        let self_clone = Arc::clone(&self);
         // Spawn the primary FFmpeg pipeline
         tokio::task::spawn_blocking(move || {
-            run_live_ffmpeg_pipeline(
-                rtsp_url,
-                session_id,
-                shutdown_sig,
-                live_stream_state_tx,
-                packet_tx_clone,
-                metadata_tx,
-                restart_delay,
-            );
+            self_clone.run_live_ffmpeg_pipeline(live_stream_state_tx, packet_tx_clone, metadata_tx);
         });
-        let session_id = session_id_for_loop;
 
+        let session_id = session_id_for_loop;
         let mut fallback_is_running = false;
         let fallback_terminate_sig = Arc::new(AtomicBool::new(true));
         let mut last_dts = 0i64;
@@ -127,12 +120,13 @@ impl RtspClient {
                     match new_live_state {
                         LiveStreamState::Online => {
                             log::info!("Live stream restored for {}, stopping fallback", session_id);
+                            // Reset consecutive failures when we get a successful connection
                             fallback_terminate_sig.store(true, Ordering::SeqCst);
                             fallback_is_running = false;
                         },
                         LiveStreamState::Offline => {
-                            log::info!("Live stream down for {}, checking fallback state", &session_id);
-                            if !fallback_is_running {
+                             log::info!("Live stream down for {}, checking fallback state", &session_id);
+                             if !fallback_is_running {
                                 if let (Some(codec), Some(timebase)) = (current_codec, live_timebase) {
                                     log::info!("Starting fallback pipeline for {} with codec {:?}", &session_id, codec);
 
@@ -231,187 +225,205 @@ impl RtspClient {
         }
     }
 
-    pub fn validate_rtsp_url(rtsp_url: &str) -> Result<()> {
-        let url = rtsp_url
-            .parse::<url::Url>()
-            .map_err(|e| anyhow::anyhow!("Invalid RTSP URL '{}': {}", rtsp_url, e))?;
-
-        if url.scheme() != "rtsp" && url.scheme() != "rtsps" {
-            anyhow::bail!(
-                "Invalid URL scheme '{}'. Must be rtsp:// or rtsps://",
-                url.scheme()
-            );
-        }
-
-        Ok(())
-    }
-
-    fn build_rtsp_url(&self) -> String {
-        let mut url = self.config.rtsp_url.clone();
+    fn attach_credentials_on_url(&self, url: &mut url::Url) {
         if let (Some(username), Some(password)) = (&self.config.username, &self.config.password) {
             let _ = url.set_username(username);
             let _ = url.set_password(Some(password));
         }
-        url.to_string()
     }
-}
 
-fn run_live_ffmpeg_pipeline(
-    rtsp_url: String,
-    session_id: VideoSourceId,
-    shutdown_sig: Arc<AtomicBool>,
-    state_tx: mpsc::Sender<LiveStreamState>,
-    packet_tx: mpsc::Sender<ffmpeg::Packet>,
-    metadata_tx: mpsc::Sender<FFmpegVideoMetadata>,
-    restart_delay: time::Duration,
-) {
-    use ffmpeg;
+    fn run_live_ffmpeg_pipeline(
+        &self,
+        state_tx: mpsc::Sender<LiveStreamState>,
+        packet_tx: mpsc::Sender<ffmpeg::Packet>,
+        metadata_tx: mpsc::Sender<FFmpegVideoMetadata>,
+    ) {
+        let mut restart_count = 0u64;
+        fn real_impl(
+            self_: &RtspClient,
+            stream_input: &VideoSourceInput,
+            state_tx: &mpsc::Sender<LiveStreamState>,
+            packet_tx: &mpsc::Sender<ffmpeg::Packet>,
+            metadata_tx: &mpsc::Sender<FFmpegVideoMetadata>,
+        ) -> anyhow::Result<()> {
+            let url = &stream_input.url;
+            let mut opts = ffmpeg::Dictionary::new();
+            let source_id = self_.source_id();
+            let shutdown_sig = &self_.shutdown_sig;
+            opts.set("rtsp_transport", "tcp");
+            opts.set("stimeout", "1000000"); // Socket timeout (1 second in microseconds)
+            opts.set("timeout", "1000000"); // I/O timeout (1 second)
+            opts.set("rw_timeout", "1000000"); // Read/write timeout (1 second)
+            opts.set("max_delay", "500000"); // Max demux delay (0.5 seconds)
+            opts.set("reorder_queue_size", "0"); // Disable reorder queue for lower latency
+            opts.set("analyzeduration", "1000000");
+            opts.set("probesize", "1000000");
+            opts.set("fflags", "nobuffer+discardcorrupt");
+            opts.set("flags", "low_delay");
+            opts.set("err_detect", "explode"); // Exit on errors instead of retrying
 
-    // Track restart count for debugging memory leaks
-    let mut restart_count = 0u64;
+            log::info!("Opening RTSP stream: {}", url);
+            let mut ictx = ffmpeg::format::input_with_dictionary(url.as_str(), opts)?;
 
-    fn real_impl(
-        url: &str,
-        session_id: &VideoSourceId,
-        shutdown_sig: &Arc<AtomicBool>,
-        state_tx: &mpsc::Sender<LiveStreamState>,
-        packet_tx: &mpsc::Sender<ffmpeg::Packet>,
-        metadata_tx: &mpsc::Sender<FFmpegVideoMetadata>,
-    ) -> anyhow::Result<()> {
-        let mut opts = ffmpeg::Dictionary::new();
-        opts.set("rtsp_transport", "tcp");
-        opts.set("stimeout", "1000000"); // Socket timeout (1 second in microseconds)
-        opts.set("timeout", "1000000"); // I/O timeout (1 second)
-        opts.set("rw_timeout", "1000000"); // Read/write timeout (1 second)
-        opts.set("max_delay", "500000"); // Max demux delay (0.5 seconds)
-        opts.set("reorder_queue_size", "0"); // Disable reorder queue for lower latency
-        opts.set("analyzeduration", "1000000");
-        opts.set("probesize", "1000000");
-        opts.set("fflags", "nobuffer+discardcorrupt");
-        opts.set("flags", "low_delay");
-        opts.set("err_detect", "explode"); // Exit on errors instead of retrying
+            let video_stream = ictx
+                .streams()
+                .best(ffmpeg::media::Type::Video)
+                .ok_or_else(|| anyhow::anyhow!("No video stream found"))?;
 
-        log::info!("Opening RTSP stream: {}", url);
-        let mut ictx = ffmpeg::format::input_with_dictionary(url, opts)?;
+            let video_stream_index = video_stream.index();
+            let codec_id = video_stream.parameters().id();
 
-        let video_stream = ictx
-            .streams()
-            .best(ffmpeg::media::Type::Video)
-            .ok_or_else(|| anyhow::anyhow!("No video stream found"))?;
+            let detected_codec = match codec_id {
+                ffmpeg::codec::Id::H264 => VideoCodec::H264,
+                ffmpeg::codec::Id::HEVC => VideoCodec::H265,
+                other => bail!("Unsupported codec: {:?}", other),
+            };
 
-        let video_stream_index = video_stream.index();
-        let codec_id = video_stream.parameters().id();
-
-        let detected_codec = match codec_id {
-            ffmpeg::codec::Id::H264 => VideoCodec::H264,
-            ffmpeg::codec::Id::HEVC => VideoCodec::H265,
-            other => bail!("Unsupported codec: {:?}", other),
-        };
-
-        log::info!(
-            "Detected codec: {:?} for stream {}",
-            detected_codec,
-            session_id
-        );
-        let parameters = video_stream.parameters();
-        let extradata = extract_extradata(&parameters);
-        let timebase = TimeBase::from_ffmpeg(video_stream.time_base())?;
-        let video_metadata = FFmpegVideoMetadata {
-            codec: detected_codec,
-            extradata: extradata,
-            parameters: parameters,
-            timebase,
-        };
-        // Try to send metadata - it's ok if the receiver already has it (channel full)
-        if let Err(e) = metadata_tx.try_send(video_metadata) {
-            log::error!(
-                "Failed to send video metadata for stream {}: {}",
-                session_id,
-                e
+            log::info!(
+                "Detected codec: {:?} for stream {}",
+                detected_codec,
+                source_id
             );
-            bail!("Failed to send video metadata");
+            let parameters = video_stream.parameters();
+            let extradata = extract_extradata(&parameters);
+            let timebase = TimeBase::from_ffmpeg(video_stream.time_base())?;
+            let video_metadata = FFmpegVideoMetadata {
+                codec: detected_codec,
+                extradata: extradata,
+                parameters: parameters,
+                timebase,
+            };
+            // Try to send metadata - it's ok if the receiver already has it (channel full)
+            if let Err(e) = metadata_tx.try_send(video_metadata) {
+                log::error!(
+                    "Failed to send video metadata for stream {}: {}",
+                    source_id,
+                    e
+                );
+                bail!("Failed to send video metadata");
+            }
+
+            log::info!("RTSP stream opened for stream {}", source_id);
+
+            let mut should_emit_state_online = true;
+            loop {
+                if shutdown_sig.load(Ordering::SeqCst) {
+                    log::info!("Shutdown signal received for stream {}", source_id);
+                    break;
+                }
+
+                match ictx.next_packet() {
+                    Ok(packet) => {
+                        if should_emit_state_online {
+                            should_emit_state_online = false;
+                            if let Err(err) = state_tx.blocking_send(LiveStreamState::Online) {
+                                log::error!("Failed to send online state: {}", err);
+                            }
+                            self_.set_active_video_input(stream_input.clone());
+                        }
+                        if packet.stream() != video_stream_index || packet.is_corrupt() {
+                            continue;
+                        }
+
+                        if let Err(e) = packet_tx.blocking_send(packet) {
+                            log::error!("Failed to send packet: {}", e);
+                            break;
+                        }
+                    }
+                    Err(ffmpeg::Error::Eof) => {
+                        log::info!("EOF reached for stream {}", source_id);
+                        bail!("EOF reached");
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to read packet for stream {}: {}", source_id, e);
+                        bail!("Failed to read packet");
+                    }
+                }
+            }
+
+            log::info!("RTSP packet loop exited for stream {}", self_.source_id());
+            Ok(())
         }
 
-        log::info!("RTSP stream opened for stream {}", session_id);
+        let mut current_stream_input_index = 0;
+        let sorted_sources = self.config.rtsp_inputs.iter().map(|u| {
+            let mut new = u.clone();
+            self.attach_credentials_on_url(&mut new.url);
+        });
+        let shutdown_sig = &self.shutdown_sig;
+        let restart_delay = Duration::from_secs(self.config.restart_interval_secs.unwrap_or(3));
+        let source_id = self.source_id();
+        let mut inputs: Vec<VideoSourceInput> = self
+            .config
+            .rtsp_inputs
+            .clone()
+            .into_iter()
+            .map(|mut i| {
+                self.attach_credentials_on_url(&mut i.url);
+                i
+            })
+            .collect();
+        inputs.sort_by(|a, b| a.priority.cmp(&b.priority));
+        let inputs = inputs;
 
-        let mut packet_count = 0u64;
-        let mut should_emit_state_online = true;
         loop {
             if shutdown_sig.load(Ordering::SeqCst) {
-                log::info!("Shutdown signal received for stream {}", session_id);
+                log::info!("Shutdown signal received for stream {}", source_id);
                 break;
             }
 
-            match ictx.next_packet() {
-                Ok(packet) => {
-                    if should_emit_state_online {
-                        should_emit_state_online = false;
-                        if let Err(err) = state_tx.blocking_send(LiveStreamState::Online) {
-                            log::error!("Failed to send online state: {}", err);
-                        }
+            let input;
+            let active_video_input = self.active_input();
+            if let Some(active_input) = active_video_input {
+                input = active_input;
+            } else {
+                input = match inputs.get(current_stream_input_index) {
+                    Some(input) => input.clone(),
+                    None => {
+                        current_stream_input_index = 0;
+                        inputs[0].clone()
                     }
-                    if packet.stream() != video_stream_index || packet.is_corrupt() {
-                        continue;
-                    }
+                };
+            }
 
-                    packet_count += 1;
-                    if let Err(e) = packet_tx.blocking_send(packet) {
-                        log::error!("Failed to send packet: {}", e);
-                        break;
+            current_stream_input_index += 1;
+            match real_impl(self, &input, &state_tx, &packet_tx, &metadata_tx) {
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("RTSP stream for {} failed due to: {}", source_id, e);
+                    if let Err(e) = state_tx.try_send(LiveStreamState::Offline) {
+                        log::error!("Failed to send state update: {}", e);
                     }
                 }
-                Err(ffmpeg::Error::Eof) => {
-                    log::info!("EOF reached for stream {}", session_id);
-                    bail!("EOF reached");
-                }
-                Err(e) => {
-                    log::warn!("Failed to read packet for stream {}: {}", session_id, e);
-                    bail!("Failed to read packet");
-                }
+            };
+
+            if self.active_input().is_none() {
+                thread::sleep(restart_delay);
             }
         }
-
-        log::info!(
-            "RTSP packet loop exited for stream {} after {} packets",
-            session_id,
-            packet_count
-        );
-        Ok(())
     }
 
-    loop {
-        if shutdown_sig.load(Ordering::SeqCst) {
-            log::info!("Shutdown signal received for stream {}", session_id);
-            break;
-        }
+    fn set_active_video_input(&self, source: VideoSourceInput) {
+        let mut guard = self.active_video_input.lock();
+        *guard = Some(source);
+    }
+}
 
-        restart_count += 1;
-        if restart_count > 1 {
-            log::info!(
-                "[MEMORY_DEBUG] Stream {} restart #{} - monitor RSS to detect FFmpeg context leaks",
-                session_id,
-                restart_count
+pub fn validate_rtsp_inputs(rtsp_inputs: &[VideoSourceInput]) -> Result<()> {
+    if rtsp_inputs.is_empty() {
+        anyhow::bail!("At least one RTSP input must be provided");
+    }
+
+    for input in rtsp_inputs {
+        if input.url.scheme() != "rtsp" && input.url.scheme() != "rtsps" {
+            anyhow::bail!(
+                "Invalid URL scheme '{}'. Must be rtsp:// or rtsps://",
+                input.url.scheme()
             );
         }
-
-        match real_impl(
-            &rtsp_url,
-            &session_id,
-            &shutdown_sig,
-            &state_tx,
-            &packet_tx,
-            &metadata_tx,
-        ) {
-            Ok(_) => {}
-            Err(e) => {
-                log::warn!("RTSP stream for {} failed due to: {}", session_id, e);
-                if let Err(e) = state_tx.try_send(LiveStreamState::Offline) {
-                    log::error!("Failed to send state update: {}", e);
-                }
-            }
-        };
-        thread::sleep(restart_delay);
     }
+
+    Ok(())
 }
 
 /// Convert a timestamp from one timebase to another.
@@ -593,8 +605,8 @@ fn extract_extradata(params: &ffmpeg::codec::Parameters) -> Option<Vec<u8>> {
 
 #[async_trait]
 impl VideoSource for RtspClient {
-    async fn execute(&self) {
-        self.execute().await
+    async fn execute(self: Arc<Self>) {
+        self._execute().await
     }
 
     async fn codec(&self) -> Option<VideoCodec> {
@@ -605,8 +617,12 @@ impl VideoSource for RtspClient {
         self.shutdown().await
     }
 
-    fn url(&self) -> &url::Url {
-        &self.config.rtsp_url
+    fn inputs(&self) -> &[VideoSourceInput] {
+        &self.config.rtsp_inputs
+    }
+
+    fn active_input(&self) -> Option<VideoSourceInput> {
+        self.active_video_input.lock().clone()
     }
 
     fn source_id(&self) -> &VideoSourceId {

@@ -1,8 +1,8 @@
 use crate::api::{GlobalState, models::*};
 use crate::app::{ClientSessionId, VideoSourceId};
-use crate::common::traits::RtpConsumer;
 use crate::domain::StreamConfig;
 use crate::publishers::wsc_rtp::handle_incoming_wsc_rtp_websocket;
+use crate::sources::rtsp::validate_rtsp_inputs;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::{
     Json,
@@ -69,17 +69,16 @@ pub async fn create_stream(
 ) -> Result<(StatusCode, Json<CreateStreamResponse>), ApiError> {
     let source_id = req.source_id.clone();
 
-    let rtsp_url = req
-        .rtsp_url
-        .parse::<url::Url>()
-        .map_err(|e| ApiError::BadRequest(format!("Invalid RTSP URL: {}", e)))?;
+    // The rtsp_inputs from the request are already the correct type
+    // Validate the inputs
+    validate_rtsp_inputs(&req.rtsp_inputs)
+        .map_err(|e| ApiError::BadRequest(format!("Invalid RTSP input: {}", e)))?;
 
-    crate::sources::rtsp::RtspClient::validate_rtsp_url(rtsp_url.as_str())
-        .map_err(|e| ApiError::BadRequest(format!("Invalid RTSP URL: {}", e)))?;
+    let rtsp_inputs = req.rtsp_inputs.clone();
 
     let config = StreamConfig {
         source_id: req.source_id.clone(),
-        rtsp_url,
+        rtsp_inputs,
         username: req.username,
         password: req.password,
         should_record: req.should_record,
@@ -95,13 +94,13 @@ pub async fn create_stream(
         }
     })?;
 
-    log::info!("Created stream {}: {}", source_id, req.rtsp_url);
+    log::info!("Created stream {}: {:?}", source_id, req.rtsp_inputs);
 
     Ok((
         StatusCode::CREATED,
         Json(CreateStreamResponse {
             source_id,
-            rtsp_url: req.rtsp_url,
+            rtsp_inputs: req.rtsp_inputs,
             should_record: req.should_record,
             restart_interval_secs: req.restart_interval_secs,
         }),
@@ -122,7 +121,7 @@ pub async fn list_streams(State(state): State<Arc<GlobalState>>) -> Json<ListStr
         .into_iter()
         .map(|s| StreamResponse {
             source_id: s.source_id,
-            rtsp_url: s.rtsp_url,
+            rtsp_inputs: s.rtsp_inputs,
             state: format!("{:?}", s.state),
             should_record: s.should_record,
             restart_interval_secs: s.restart_interval_secs,
@@ -155,7 +154,7 @@ pub async fn get_stream(
 
     Ok(Json(StreamResponse {
         source_id: info.source_id,
-        rtsp_url: info.rtsp_url,
+        rtsp_inputs: info.rtsp_inputs,
         state: format!("{:?}", info.state),
         should_record: info.should_record,
         restart_interval_secs: info.restart_interval_secs,
@@ -207,8 +206,29 @@ pub async fn wsc_rtp(
         }
     };
 
-   ws.on_upgrade(move |socket| {
-        handle_incoming_wsc_rtp_websocket(socket, publisher, query.force_websocket_transport)
+    // Get the source inputs to pass to the WebSocket handler
+    let source_inputs = match state.get_stream(&source_id).await {
+        Ok(stream_info) => stream_info.rtsp_inputs,
+        Err(_) => Vec::new(), // If we can't get the stream info, pass an empty vector
+    };
+
+    // Get the source for this stream to pass to the WebSocket handler
+    let source_result = state.get_source(&source_id).await;
+    let source = match source_result {
+        Ok(src) => src,
+        Err(_) => {
+            // If we can't get the source, return a 404 error response
+            return (StatusCode::NOT_FOUND, "Stream not found").into_response();
+        }
+    };
+
+    ws.on_upgrade(move |socket| {
+        handle_incoming_wsc_rtp_websocket(
+            socket,
+            publisher,
+            source,
+            query.force_websocket_transport,
+        )
     })
 }
 
