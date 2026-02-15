@@ -7,6 +7,7 @@ pub type UnixTimestamp = u64;
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct VideoSourceInput {
     pub label: String,
+    #[schema(value_type = String, format = "uri")]
     pub url: url::Url,
     /// Priority of the input source. Lower values have higher priority.
     pub priority: u32,
