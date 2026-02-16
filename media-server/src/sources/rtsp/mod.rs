@@ -255,7 +255,7 @@ impl RtspClient {
             opts.set("timeout", "1000000"); // I/O timeout (1 second)
             opts.set("rw_timeout", "1000000"); // Read/write timeout (1 second)
             opts.set("max_delay", "500000"); // Max demux delay (0.5 seconds)
-            opts.set("reorder_queue_size", "0"); // Disable reorder queue for lower latency
+            opts.set("reorder_queue_size", "500"); // Small reorder queue for packet reordering
             opts.set("analyzeduration", "1000000");
             opts.set("probesize", "1000000");
             opts.set("fflags", "nobuffer+discardcorrupt");
