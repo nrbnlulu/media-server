@@ -1,9 +1,9 @@
 use crate::app::VideoSourceId;
+use crate::common::VideoCodec;
 use crate::common::nal_utils::{self, FramingFormat};
 use crate::common::traits::FfmpegConsumer;
-use crate::common::{TimeBase, VideoCodec};
 use crate::domain::dvr::filesystem;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use axum::async_trait;
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -13,6 +13,7 @@ use parking_lot::Mutex;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 struct RecordingState {
     framing_format: FramingFormat,
@@ -24,7 +25,9 @@ struct RecordingState {
     waiting_for_keyframe: bool,
     header_buffer: Vec<Vec<u8>>,
     stream_started: bool,
-    timebase: TimeBase,
+    /// Wall-clock instant when the recording started, used to compute
+    /// wall-clock-relative PTS/DTS so playback duration matches real time.
+    recording_start_instant: Instant,
 }
 
 impl RecordingState {
@@ -33,7 +36,6 @@ impl RecordingState {
         codec: &VideoCodec,
         start_time: UnixTimestamp,
         framing_format: FramingFormat,
-        timebase: TimeBase,
     ) -> Result<Self> {
         let pipeline = gst::Pipeline::new();
 
@@ -109,7 +111,7 @@ impl RecordingState {
             header_buffer: Vec::new(),
             stream_started: false,
             framing_format,
-            timebase,
+            recording_start_instant: Instant::now(),
         })
     }
 
@@ -170,36 +172,16 @@ impl RecordingState {
         Ok(())
     }
 
-    fn push_buffer_to_appsrc(
-        &self,
-        data: &[u8],
-        pts: i64,
-        dts: i64,
-        timebase: &TimeBase,
-        is_keyframe: bool,
-    ) -> Result<()> {
-        let pts_ns = if pts >= 0 {
-            let numerator = (pts as u64)
-                .saturating_mul(timebase.num as u64)
-                .saturating_mul(1_000_000_000);
-            numerator / (timebase.den as u64)
-        } else {
-            0
-        };
-        let dts_ns = if dts >= 0 {
-            let numerator = (dts as u64)
-                .saturating_mul(timebase.num as u64)
-                .saturating_mul(1_000_000_000);
-            numerator / (timebase.den as u64)
-        } else {
-            pts_ns
-        };
+    fn push_buffer_to_appsrc(&self, data: &[u8], is_keyframe: bool) -> Result<()> {
+        // Use wall-clock elapsed time as PTS/DTS so that playback duration
+        // matches real time even when camera frames arrive in bursts.
+        let elapsed_ns = self.recording_start_instant.elapsed().as_nanos() as u64;
 
         let mut buffer = gst::Buffer::from_slice(data.to_vec());
         {
             let buffer_ref = buffer.get_mut().unwrap();
-            buffer_ref.set_pts(gst::ClockTime::from_nseconds(pts_ns));
-            buffer_ref.set_dts(gst::ClockTime::from_nseconds(dts_ns));
+            buffer_ref.set_pts(gst::ClockTime::from_nseconds(elapsed_ns));
+            buffer_ref.set_dts(gst::ClockTime::from_nseconds(elapsed_ns));
 
             if !is_keyframe {
                 buffer_ref.set_flags(gst::BufferFlags::DELTA_UNIT);
@@ -213,14 +195,7 @@ impl RecordingState {
         }
     }
 
-    fn write_nal_data(
-        &mut self,
-        nal_units: &[Vec<u8>],
-        pts: i64,
-        dts: i64,
-        timebase: &TimeBase,
-        is_key_frame: bool,
-    ) -> Result<()> {
+    fn write_nal_data(&mut self, nal_units: &[Vec<u8>], is_key_frame: bool) -> Result<()> {
         if nal_units.is_empty() {
             return Ok(());
         }
@@ -273,7 +248,7 @@ impl RecordingState {
                 combined.extend_from_slice(&nal_utils::build_annex_b(nal_units));
                 combined
             };
-            self.push_buffer_to_appsrc(&combined_bytes, pts, dts, timebase, true)?;
+            self.push_buffer_to_appsrc(&combined_bytes, true)?;
 
             self.waiting_for_keyframe = false;
             self.header_buffer.clear();
@@ -281,7 +256,7 @@ impl RecordingState {
         }
 
         let packet_bytes = nal_utils::build_annex_b(nal_units);
-        self.push_buffer_to_appsrc(&packet_bytes, pts, dts, timebase, is_key_frame)?;
+        self.push_buffer_to_appsrc(&packet_bytes, is_key_frame)?;
 
         Ok(())
     }
@@ -300,12 +275,7 @@ impl DvrRecorder {
         })
     }
 
-    fn initialize_imp(
-        &self,
-        codec: VideoCodec,
-        extradata: Option<&Vec<u8>>,
-        timebase: TimeBase,
-    ) -> Result<PathBuf> {
+    fn initialize_imp(&self, codec: VideoCodec, extradata: Option<&Vec<u8>>) -> Result<PathBuf> {
         let mut state_guard = self.recording_state.lock();
         if let Some(mut state) = state_guard.take() {
             log::info!("already initialized; restarting...");
@@ -353,19 +323,14 @@ impl DvrRecorder {
             (FramingFormat::Avcc { length_size: 4 }, Vec::new())
         };
 
-        log::info!(
-            "DVR recorder using framing format: {:?}, time_base: {:?}",
-            framing_format,
-            timebase
-        );
+        log::info!("DVR recorder using framing format: {:?}", framing_format,);
 
         let start_time = crate::utils::get_current_unix_timestamp();
         let dir = filesystem::ensure_stream_dvr_dir(&self.stream_id)?;
         let filename = filesystem::generate_active_recording_filename(start_time);
         let path = dir.join(filename);
 
-        let mut new_state =
-            RecordingState::new(&path, &codec, start_time, framing_format, timebase)?;
+        let mut new_state = RecordingState::new(&path, &codec, start_time, framing_format)?;
 
         // Pre-populate header buffer with SPS/PPS from extradata
         if !extradata_nals.is_empty() {
@@ -454,11 +419,7 @@ impl Drop for DvrRecorder {
 #[async_trait]
 impl FfmpegConsumer for DvrRecorder {
     fn initialize(&self, metadata: &crate::common::FFmpegVideoMetadata) -> anyhow::Result<()> {
-        self.initialize_imp(
-            metadata.codec,
-            metadata.extradata.as_ref(),
-            metadata.timebase.clone(),
-        )?;
+        self.initialize_imp(metadata.codec, metadata.extradata.as_ref())?;
         Ok(())
     }
 
@@ -469,13 +430,7 @@ impl FfmpegConsumer for DvrRecorder {
             if let Some(data) = packet.data() {
                 let is_key = packet.is_key();
                 let nal_units = state.parse_nal_units(data);
-                let pts = packet.pts().unwrap_or(0);
-                let dts = packet.dts().unwrap_or(pts);
-                let duration = packet.duration();
-                // Use stored timebase from stream metadata, not packet.time_base()
-                // which often returns 0/1 for packets
-                let timebase = state.timebase.clone();
-                state.write_nal_data(&nal_units, pts, dts, &timebase, is_key)?;
+                state.write_nal_data(&nal_units, is_key)?;
             }
         }
 
