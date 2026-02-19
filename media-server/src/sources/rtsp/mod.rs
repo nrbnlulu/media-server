@@ -238,7 +238,6 @@ impl RtspClient {
         packet_tx: mpsc::Sender<ffmpeg::Packet>,
         metadata_tx: mpsc::Sender<FFmpegVideoMetadata>,
     ) {
-        let mut restart_count = 0u64;
         fn real_impl(
             self_: &RtspClient,
             stream_input: &VideoSourceInput,
@@ -346,10 +345,6 @@ impl RtspClient {
         }
 
         let mut current_stream_input_index = 0;
-        let sorted_sources = self.config.rtsp_inputs.iter().map(|u| {
-            let mut new = u.clone();
-            self.attach_credentials_on_url(&mut new.url);
-        });
         let shutdown_sig = &self.shutdown_sig;
         let restart_delay = Duration::from_secs(self.config.restart_interval_secs.unwrap_or(3));
         let source_id = self.source_id();
@@ -365,6 +360,7 @@ impl RtspClient {
             .collect();
         inputs.sort_by(|a, b| a.priority.cmp(&b.priority));
         let inputs = inputs;
+        let mut have_tested_all_inputs = false;
 
         loop {
             if shutdown_sig.load(Ordering::SeqCst) {
@@ -380,6 +376,7 @@ impl RtspClient {
                 input = match inputs.get(current_stream_input_index) {
                     Some(input) => input.clone(),
                     None => {
+                        have_tested_all_inputs = true;
                         current_stream_input_index = 0;
                         inputs[0].clone()
                     }
@@ -396,8 +393,11 @@ impl RtspClient {
                     }
                 }
             };
-
-            if self.active_input().is_none() {
+            
+            // this will allow us to use restart delay only if we have already tested all inputs
+            // otherwise if we prioritize a stream that is not available, the next one that should work
+            // would only be tested after the restart delay
+            if have_tested_all_inputs  || self.active_input().is_some() {
                 thread::sleep(restart_delay);
             }
         }
@@ -495,7 +495,6 @@ fn run_fallback_pipeline(
     let mut cumulative_offset = ctx.ts_offset;
     let mut last_converted_dts = ctx.ts_offset;
 
-    let mut packet_count = 0u64;
     loop {
         // Reset playback timing for each loop iteration
         let start_time = time::Instant::now();
@@ -505,10 +504,47 @@ fn run_fallback_pipeline(
                 log::info!("Fallback terminated for {} (terminate signal)", session_id);
                 return;
             }
-            let mut packet = ffmpeg::Packet::empty();
 
             match ictx.next_packet() {
-                Ok(_) => {}
+                Ok(mut packet) => {
+                    if packet.stream() != stream_index {
+                        continue;
+                    }
+
+                    // Throttle: Wait until it's time to send this packet (real-time playback)
+                    // Use original file timestamps for timing calculation
+                    if let Some(dts) = packet.dts() {
+                        let actual_ts = (dts as f64 * f64::from(file_timebase.numerator()))
+                            / f64::from(file_timebase.denominator());
+                        let elapsed = start_time.elapsed().as_secs_f64();
+                        if actual_ts > elapsed {
+                            thread::sleep(time::Duration::from_secs_f64(actual_ts - elapsed));
+                        }
+                    }
+
+                    // Convert timestamps from file timebase to live stream timebase
+                    let orig_dts = packet.dts().unwrap_or(0);
+                    let orig_pts = packet.pts().unwrap_or(orig_dts);
+
+                    let converted_dts =
+                        rescale_ts(orig_dts, file_timebase, ctx.live_timebase) + cumulative_offset;
+                    let converted_pts =
+                        rescale_ts(orig_pts, file_timebase, ctx.live_timebase) + cumulative_offset;
+                    let converted_duration =
+                        rescale_ts(packet.duration(), file_timebase, ctx.live_timebase);
+
+                    packet.set_dts(Some(converted_dts));
+                    packet.set_pts(Some(converted_pts));
+                    packet.set_duration(converted_duration);
+
+                    last_converted_dts = converted_dts;
+
+                    log::info!("sending fallback frame");
+                    if packet_tx.blocking_send(packet).is_err() {
+                        log::info!("Fallback terminated for {} (channel closed)", session_id);
+                        return;
+                    }
+                }
                 Err(ffmpeg::Error::Eof) => {
                     // End of file - update cumulative offset before seeking back
                     cumulative_offset = last_converted_dts + 1; // +1 to ensure continuity
@@ -529,56 +565,8 @@ fn run_fallback_pipeline(
                 }
             }
 
-            if packet.stream() != stream_index {
-                continue;
-            }
-
-            // Throttle: Wait until it's time to send this packet (real-time playback)
-            // Use original file timestamps for timing calculation
-            if let Some(dts) = packet.dts() {
-                let actual_ts = (dts as f64 * f64::from(file_timebase.numerator()))
-                    / f64::from(file_timebase.denominator());
-                let elapsed = start_time.elapsed().as_secs_f64();
-                if actual_ts > elapsed {
-                    thread::sleep(time::Duration::from_secs_f64(actual_ts - elapsed));
-                }
-            }
-
-            // Convert timestamps from file timebase to live stream timebase
-            let orig_dts = packet.dts().unwrap_or(0);
-            let orig_pts = packet.pts().unwrap_or(orig_dts);
-
-            let converted_dts =
-                rescale_ts(orig_dts, file_timebase, ctx.live_timebase) + cumulative_offset;
-            let converted_pts =
-                rescale_ts(orig_pts, file_timebase, ctx.live_timebase) + cumulative_offset;
-            let converted_duration =
-                rescale_ts(packet.duration(), file_timebase, ctx.live_timebase);
-
-            packet.set_dts(Some(converted_dts));
-            packet.set_pts(Some(converted_pts));
-            packet.set_duration(converted_duration);
-
-            last_converted_dts = converted_dts;
-
-            if packet_count == 0 {
-                log::info!(
-                    "Fallback sending first packet for {}: orig_dts={}, converted_dts={}, orig_duration={}, converted_duration={}",
-                    session_id,
-                    orig_dts,
-                    converted_dts,
-                    packet.duration(),
-                    converted_duration
-                );
-            }
             if terminate_sig.load(Ordering::SeqCst) {
                 log::info!("Fallback terminated for {} (terminate signal)", session_id);
-                return;
-            }
-
-            packet_count += 1;
-            if packet_tx.blocking_send(packet).is_err() {
-                log::info!("Fallback terminated for {} (channel closed)", session_id);
                 return;
             }
         }

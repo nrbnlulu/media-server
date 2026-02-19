@@ -16,6 +16,18 @@ fn init() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     ffmpeg::init()?;
     gstreamer::init()?;
+
+    // Verify fallback placeholder files exist
+    let placeholder_files = ["assets/placeholder_h264.mp4", "assets/placeholder_h265.mp4"];
+    for file_path in &placeholder_files {
+        if !std::path::Path::new(file_path).exists() {
+            anyhow::bail!(
+                "Fallback placeholder file not found: {}. This file is required for RTSP fallback streaming.",
+                file_path
+            );
+        }
+    }
+
     Ok(())
 }
 
