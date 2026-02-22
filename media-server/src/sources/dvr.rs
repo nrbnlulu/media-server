@@ -1,10 +1,10 @@
 use crate::app::VideoSourceId;
+use crate::common::VideoCodec;
 use crate::common::nal_utils;
 use crate::common::rtp::RtpPacketizer;
 use crate::common::traits::RtpConsumer;
-use crate::common::VideoCodec;
 use crate::domain::dvr::filesystem::{self, FindNextRecRes, RecordingMetadata};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use chrono::Duration;
 use futures::StreamExt;
 use gstreamer as gst;
@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::mpsc;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread;
 use tokio::sync::broadcast::Sender;

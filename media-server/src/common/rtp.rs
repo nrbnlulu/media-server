@@ -1,4 +1,3 @@
-use crate::app::ClientSessionId;
 use crate::common::nal_utils::{self, H264NalType, H265NalType};
 use crate::common::traits::{FfmpegConsumer, RtpConsumer};
 use crate::common::{FFmpegVideoMetadata, TimeBase, VideoCodec};
@@ -7,6 +6,7 @@ use axum::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures::future::join_all;
+use media_server_api_models::ClientSessionId;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, Ordering};

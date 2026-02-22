@@ -393,11 +393,11 @@ impl RtspClient {
                     }
                 }
             };
-            
+
             // this will allow us to use restart delay only if we have already tested all inputs
             // otherwise if we prioritize a stream that is not available, the next one that should work
             // would only be tested after the restart delay
-            if have_tested_all_inputs  || self.active_input().is_some() {
+            if have_tested_all_inputs || self.active_input().is_some() {
                 thread::sleep(restart_delay);
             }
         }

@@ -10,8 +10,8 @@ use crate::sources::rtsp::RtspClient;
 use anyhow::{Result, anyhow, bail};
 use dashmap::DashMap;
 use gstreamer::glib::clone::Downgrade;
-use media_server_api_models::CreateWebRtcSessionRequest;
 use media_server_api_models::UnixTimestamp;
+use media_server_api_models::{ClientSessionId, CreateWebRtcSessionRequest};
 use serde::Deserialize;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -25,7 +25,6 @@ struct SourceWrapper {
     recorder: Option<Arc<DvrRecorder>>,
 }
 
-pub type ClientSessionId = Uuid;
 pub type VideoSourceId = String;
 pub type SharedGlobalState = Arc<GlobalState>;
 pub type WeakGlobalState = Weak<GlobalState>;
@@ -426,18 +425,8 @@ impl GlobalState {
         bail!("Session not found");
     }
 
-    pub async fn seek_webrtc_session(
-        &self,
-        _source_id: VideoSourceId,
-        session_id: ClientSessionId,
-        timestamp: UnixTimestamp,
-    ) -> Result<()> {
-        self.seek_session(&session_id, timestamp).await
-    }
-
     pub async fn get_session_mode(
         &self,
-        _source_id: VideoSourceId,
         session_id: ClientSessionId,
     ) -> Result<media_server_api_models::SessionModeResponse> {
         let session_state = self.get_client_session_state(&session_id).await?;
@@ -458,12 +447,7 @@ impl GlobalState {
         }
     }
 
-    pub async fn set_session_speed(
-        &self,
-        _source_id: VideoSourceId,
-        session_id: ClientSessionId,
-        speed: f64,
-    ) -> Result<()> {
+    pub async fn set_session_speed(&self, session_id: ClientSessionId, speed: f64) -> Result<()> {
         if let Some(ref session) = self.client_sessions.get(&session_id) {
             let state_guard = session.state.lock().await;
             if let ClientSessionState::Dvr(ref player, _) = *state_guard {

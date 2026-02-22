@@ -749,7 +749,7 @@
                     statusPollInterval = null;
                 }
                 if (currentSession.sessionId) {
-                    const endpoint = `/streams/${currentSession.streamId}/webrtc/${currentSession.sessionId}`;
+                    const endpoint = `/client-session-control/${currentSession.sessionId}`;
                     await api(endpoint, "DELETE").catch(() => {});
                 }
             }
@@ -1014,9 +1014,8 @@
             async function goLive() {
                 if (!currentSession.sessionId) return;
                 try {
-                    // Use the /live endpoint to switch mode without creating new session
                     const result = await api(
-                        `/streams/${currentSession.streamId}/webrtc/${currentSession.sessionId}/live`,
+                        `/client-session-control/${currentSession.sessionId}/live`,
                         "POST",
                     );
                     currentSession.isLive = true;
@@ -1046,13 +1045,10 @@
                 if (!currentSession.sessionId) return;
 
                 try {
-                    // Always use the seek endpoint - backend handles switching from live to DVR
                     const result = await api(
-                        `/streams/${currentSession.streamId}/webrtc/${currentSession.sessionId}/seek`,
+                        `/client-session-control/${currentSession.sessionId}/seek`,
                         "POST",
-                        {
-                            timestamp: timestampMs,
-                        },
+                        { timestamp: timestampMs },
                     );
 
                     // Update from server response
@@ -1112,11 +1108,9 @@
 
                 try {
                     const result = await api(
-                        `/streams/${currentSession.streamId}/webrtc/${currentSession.sessionId}/speed`,
+                        `/client-session-control/${currentSession.sessionId}/speed`,
                         "POST",
-                        {
-                            speed: speed,
-                        },
+                        { speed },
                     );
 
                     currentSession.currentSpeed = result.speed;
@@ -1136,7 +1130,7 @@
                     if (currentSession.sessionId) {
                         try {
                             const status = await api(
-                                `/streams/${currentSession.streamId}/webrtc/${currentSession.sessionId}/mode`,
+                                `/client-session-control/${currentSession.sessionId}/mode`,
                             );
                             if (status) {
                                 currentSession.isLive = status.is_live;

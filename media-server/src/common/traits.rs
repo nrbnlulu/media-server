@@ -1,10 +1,10 @@
 use crate::domain::{StreamConfig, StreamState};
 use crate::{
-    app::{ClientSessionId, VideoSourceId},
+    app::VideoSourceId,
     common::{FFmpegVideoMetadata, VideoCodec, rtp::RtpPacket},
 };
 use async_trait::async_trait;
-use media_server_api_models::VideoSourceInput;
+use media_server_api_models::{ClientSessionId, VideoSourceInput};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;

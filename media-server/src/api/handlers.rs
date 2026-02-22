@@ -1,5 +1,5 @@
 use crate::api::{GlobalState, models::*};
-use crate::app::{ClientSessionId, VideoSourceId};
+use crate::app::VideoSourceId;
 use crate::domain::StreamConfig;
 use crate::publishers::wsc_rtp::handle_incoming_wsc_rtp_websocket;
 use crate::sources::rtsp::validate_rtsp_inputs;
@@ -206,12 +206,6 @@ pub async fn wsc_rtp(
         }
     };
 
-    // Get the source inputs to pass to the WebSocket handler
-    let source_inputs = match state.get_stream(&source_id).await {
-        Ok(stream_info) => stream_info.rtsp_inputs,
-        Err(_) => Vec::new(), // If we can't get the stream info, pass an empty vector
-    };
-
     // Get the source for this stream to pass to the WebSocket handler
     let source_result = state.get_source(&source_id).await;
     let source = match source_result {
@@ -278,15 +272,15 @@ pub async fn create_webrtc_session(
 
 #[utoipa::path(
     delete,
-    path = "/streams/{source_id}/webrtc/{session_id}",
+    path = "/client-session-control/{session_id}",
     params(
-        ("session_id" = Uuid, Path, description = "WebRTC session unique identifier")
+        ("session_id" = Uuid, Path, description = "Session unique identifier")
     ),
     responses(
-        (status = 204, description = "WebRTC session deleted successfully"),
-        (status = 404, description = "Stream or session not found", body = ErrorResponse)
+        (status = 204, description = "Session deleted successfully"),
+        (status = 404, description = "Session not found", body = ErrorResponse)
     ),
-    tag = "WebRTC"
+    tag = "client-session-control"
 )]
 pub async fn delete_webrtc_session(
     State(state): State<Arc<GlobalState>>,
@@ -297,7 +291,7 @@ pub async fn delete_webrtc_session(
         .await
         .map_err(|e: anyhow::Error| ApiError::NotFound(e.to_string()))?;
 
-    log::info!("Deleted WebRTC session {session_id}",);
+    log::info!("Deleted session {session_id}");
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -406,27 +400,26 @@ pub async fn webrtc_client() -> Html<&'static str> {
 
 #[utoipa::path(
     post,
-    path = "/streams/{source_id}/webrtc/{session_id}/seek",
+    path = "/client-session-control/{session_id}/seek",
     params(
-        ("source_id" = String, Path, description = "Stream unique identifier"),
-        ("session_id" = Uuid, Path, description = "WebRTC session unique identifier")
+        ("session_id" = Uuid, Path, description = "Session unique identifier")
     ),
     request_body = SeekRequest,
     responses(
         (status = 200, description = "Seek successful", body = SessionModeResponse),
-        (status = 404, description = "Stream or session not found", body = ErrorResponse),
+        (status = 404, description = "Session not found", body = ErrorResponse),
         (status = 400, description = "No recording available for timestamp", body = ErrorResponse)
     ),
-    tag = "WebRTC"
+    tag = "client-session-control"
 )]
-pub async fn seek_session(
+pub async fn client_session_seek_session(
     State(state): State<Arc<GlobalState>>,
-    Path((source_id, session_id)): Path<(VideoSourceId, Uuid)>,
+    Path(session_id): Path<Uuid>,
     Json(req): Json<SeekRequest>,
 ) -> Result<Json<SessionModeResponse>, ApiError> {
-    log::debug!("seeking session {session_id} of stream {source_id} to {req:?}");
+    log::debug!("seeking session {session_id} to {req:?}");
     state
-        .seek_webrtc_session(source_id.clone(), session_id, req.timestamp)
+        .seek_session(&session_id, req.timestamp)
         .await
         .map_err(|e| {
             log::error!(
@@ -439,7 +432,7 @@ pub async fn seek_session(
         })?;
 
     let mode = state
-        .get_session_mode(source_id, session_id)
+        .get_session_mode(session_id)
         .await
         .map_err(|e| ApiError::NotFound(e.to_string()))?;
 
@@ -454,26 +447,25 @@ pub async fn seek_session(
 
 #[utoipa::path(
     post,
-    path = "/streams/{source_id}/webrtc/{session_id}/speed",
+    path = "/client-session-control/{session_id}/speed",
     params(
-        ("source_id" = String, Path, description = "Stream unique identifier"),
-        ("session_id" = Uuid, Path, description = "WebRTC session unique identifier")
+        ("session_id" = Uuid, Path, description = "Session unique identifier")
     ),
     request_body = SpeedRequest,
     responses(
         (status = 200, description = "Speed changed successfully", body = SessionModeResponse),
-        (status = 404, description = "Stream or session not found", body = ErrorResponse),
+        (status = 404, description = "Session not found", body = ErrorResponse),
         (status = 400, description = "Speed control only available in DVR mode", body = ErrorResponse)
     ),
-    tag = "WebRTC"
+    tag = "client-session-control"
 )]
 pub async fn set_session_speed(
     State(state): State<Arc<GlobalState>>,
-    Path((source_id, session_id)): Path<(VideoSourceId, Uuid)>,
+    Path(session_id): Path<Uuid>,
     Json(req): Json<SpeedRequest>,
 ) -> Result<Json<SessionModeResponse>, ApiError> {
     state
-        .set_session_speed(source_id.clone(), session_id, req.speed)
+        .set_session_speed(session_id, req.speed)
         .await
         .map_err(|e| {
             log::error!("Failed to set speed for session {}: {}", session_id, e);
@@ -481,7 +473,7 @@ pub async fn set_session_speed(
         })?;
 
     let mode = state
-        .get_session_mode(source_id, session_id)
+        .get_session_mode(session_id)
         .await
         .map_err(|e| ApiError::NotFound(e.to_string()))?;
 
@@ -492,62 +484,56 @@ pub async fn set_session_speed(
 
 #[utoipa::path(
     post,
-    path = "/streams/{source_id}/webrtc/{session_id}/live",
+    path = "/client-session-control/{session_id}/live",
     params(
-        ("source_id" = String, Path, description = "Stream unique identifier"),
-        ("session_id" = Uuid, Path, description = "WebRTC session unique identifier")
+        ("session_id" = Uuid, Path, description = "Session unique identifier")
     ),
     responses(
         (status = 200, description = "Switched to live mode", body = SessionModeResponse),
-        (status = 404, description = "Stream or session not found", body = ErrorResponse)
+        (status = 404, description = "Session not found", body = ErrorResponse)
     ),
-    tag = "WebRTC"
+    tag = "client-session-control"
 )]
 pub async fn switch_session_to_live(
     State(state): State<Arc<GlobalState>>,
-    Path((source_id, client_session_id)): Path<(VideoSourceId, Uuid)>,
+    Path(session_id): Path<Uuid>,
 ) -> Result<Json<SessionModeResponse>, ApiError> {
     state
-        .switch_session_to_live(&client_session_id)
+        .switch_session_to_live(&session_id)
         .await
         .map_err(|e| {
-            log::error!(
-                "Failed to switch session {} to live: {}",
-                client_session_id,
-                e
-            );
+            log::error!("Failed to switch session {} to live: {}", session_id, e);
             ApiError::BadRequest(e.to_string())
         })?;
 
     let mode = state
-        .get_session_mode(source_id, client_session_id)
+        .get_session_mode(session_id)
         .await
         .map_err(|e| ApiError::NotFound(e.to_string()))?;
 
-    log::info!("Session {} switched to live mode", client_session_id);
+    log::info!("Session {} switched to live mode", session_id);
 
     Ok(Json(mode))
 }
 
 #[utoipa::path(
     get,
-    path = "/streams/{source_id}/webrtc/{session_id}/mode",
+    path = "/client-session-control/{session_id}/mode",
     params(
-        ("source_id" = String, Path, description = "Stream unique identifier"),
-        ("session_id" = Uuid, Path, description = "WebRTC session unique identifier")
+        ("session_id" = Uuid, Path, description = "Session unique identifier")
     ),
     responses(
         (status = 200, description = "Current session mode", body = SessionModeResponse),
-        (status = 404, description = "Stream or session not found", body = ErrorResponse)
+        (status = 404, description = "Session not found", body = ErrorResponse)
     ),
-    tag = "WebRTC"
+    tag = "client-session-control"
 )]
 pub async fn get_session_mode(
     State(state): State<Arc<GlobalState>>,
-    Path((source_id, session_id)): Path<(VideoSourceId, Uuid)>,
+    Path(session_id): Path<Uuid>,
 ) -> Result<Json<SessionModeResponse>, ApiError> {
     let mode = state
-        .get_session_mode(source_id, session_id)
+        .get_session_mode(session_id)
         .await
         .map_err(|e| ApiError::NotFound(e.to_string()))?;
 

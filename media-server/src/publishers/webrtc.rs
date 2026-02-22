@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use media_server_api_models::CreateWebRtcSessionRequest;
+use media_server_api_models::{ClientSessionId, CreateWebRtcSessionRequest};
 use std::sync::Arc;
 use uuid::Uuid;
 use webrtc::{
@@ -15,7 +15,7 @@ use webrtc::{
 };
 
 use crate::{
-    app::{ClientSessionId, VideoSourceId, WeakGlobalState},
+    app::{VideoSourceId, WeakGlobalState},
     common::{
         rtp::{CodecParameters, RtpPacket},
         traits::{RtpConsumer, RtpVideoPublisher},
