@@ -4,7 +4,7 @@ use crate::{
     common::{FFmpegVideoMetadata, VideoCodec, rtp::RtpPacket},
 };
 use async_trait::async_trait;
-use media_server_api_models::{ClientSessionId, VideoSourceInput};
+use media_server_api_models::{ClientSessionId, SessionMode, VideoSourceInput};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -49,8 +49,10 @@ pub trait RtpConsumer: Send + Sync {
     }
 }
 
+#[async_trait]
 pub trait RtpVideoPublisher: RtpConsumer {
     fn source_id(&self) -> &VideoSourceId;
+    async fn on_session_mode_change(&self, mode: SessionMode);
 }
 
 impl PartialEq for dyn RtpConsumer {

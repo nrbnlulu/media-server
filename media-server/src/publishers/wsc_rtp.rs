@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket};
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
-use media_server_api_models::{ClientSessionId, VideoSourceInput, wsc_rtp as proto};
+use media_server_api_models::{ClientSessionId, SessionMode, wsc_rtp as proto};
 use media_server_api_models::{WscRtpClientMessage, WscRtpServerMessage};
 use parking_lot::Mutex;
 use std::net::SocketAddr;
@@ -100,6 +100,8 @@ pub struct WscRtpPublisher {
     rtp_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
     /// Channel used to deliver SDP updates when codec parameters change.
     sdp_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
+    /// Channel used to deliver session mode changes to the WebSocket main loop.
+    control_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<SessionMode>>>,
     /// Cached current SDP so it's available even if update_params was called before the channel was set up.
     current_sdp: Mutex<Option<String>>,
     holepunch_port: Mutex<Option<u16>>,
@@ -113,6 +115,7 @@ impl WscRtpPublisher {
             video_source_id,
             rtp_tx: Mutex::new(None),
             sdp_tx: Mutex::new(None),
+            control_tx: Mutex::new(None),
             current_sdp: Mutex::new(None),
             holepunch_port: Mutex::new(None),
             dead: std::sync::atomic::AtomicBool::new(false),
@@ -215,6 +218,7 @@ impl WscRtpPublisher {
         self.dead.store(true, Ordering::Relaxed);
         *self.rtp_tx.lock() = None;
         *self.sdp_tx.lock() = None;
+        *self.control_tx.lock() = None;
     }
 }
 
@@ -298,9 +302,21 @@ impl RtpConsumer for WscRtpPublisher {
     }
 }
 
+#[async_trait]
 impl RtpVideoPublisher for WscRtpPublisher {
     fn source_id(&self) -> &VideoSourceId {
         &self.video_source_id
+    }
+
+    async fn on_session_mode_change(&self, mode: SessionMode) {
+        if let Some(tx) = self.control_tx.lock().as_ref() {
+            if tx.send(mode).is_err() {
+                log::warn!(
+                    "Session {}: failed to send mode change, channel closed",
+                    self.id
+                );
+            }
+        }
     }
 }
 
@@ -472,6 +488,10 @@ pub async fn handle_incoming_wsc_rtp_websocket(
     let (rtp_tx, mut rtp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     *publisher.rtp_tx.lock() = Some(rtp_tx);
 
+    // Create the control channel for session mode changes.
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<SessionMode>();
+    *publisher.control_tx.lock() = Some(control_tx);
+
     if udp_sock.is_some() {
         log::info!(
             "Session {}: started on port {} via UDP",
@@ -512,6 +532,10 @@ pub async fn handle_incoming_wsc_rtp_websocket(
                         last_sdp = Some(sdp);
                     }
                 }
+            }
+            Some(mode) = control_rx.recv() => {
+                log::info!("Session {}: sending session mode change: {:?}", session_id, mode);
+                let _ = send_wsc_rtp_message(&mut sender, WscRtpServerMessage::SessionMode(mode)).await;
             }
             res = receiver.next() => {
                 let msg = match res {

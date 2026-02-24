@@ -193,8 +193,13 @@ impl RtpConsumer for WebRtcSession {
     }
 }
 
+#[async_trait]
 impl RtpVideoPublisher for WebRtcSession {
     fn source_id(&self) -> &VideoSourceId {
         &self.source_id
+    }
+
+    async fn on_session_mode_change(&self, _mode: media_server_api_models::SessionMode) {
+        // WebRTC sessions use REST APIs for mode changes, no action needed
     }
 }
