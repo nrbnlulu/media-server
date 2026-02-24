@@ -81,6 +81,12 @@ impl RtpPacket {
     pub fn len(&self) -> usize {
         12 + self.payload.len()
     }
+
+    /// Check if packet is empty
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

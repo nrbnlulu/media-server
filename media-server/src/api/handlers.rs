@@ -18,7 +18,6 @@ use uuid::Uuid;
 pub enum ApiError {
     NotFound(String),
     BadRequest(String),
-    Internal(String),
 }
 
 impl IntoResponse for ApiError {
@@ -26,7 +25,6 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 
         let error_response = ErrorResponse {
@@ -85,14 +83,10 @@ pub async fn create_stream(
         restart_interval_secs: req.restart_interval_secs,
     };
 
-    state.create_rtsp_stream(config).await.map_err(|e| {
-        let error_msg = e.to_string();
-        if error_msg.contains("already exists") {
-            ApiError::BadRequest(error_msg)
-        } else {
-            ApiError::BadRequest(error_msg)
-        }
-    })?;
+    state
+        .create_rtsp_stream(config)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     log::info!("Created stream {}: {:?}", source_id, req.rtsp_inputs);
 

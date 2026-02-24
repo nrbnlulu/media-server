@@ -35,8 +35,10 @@ pub fn build_unicast_sdp(
         std::net::IpAddr::V6(_) => ("IP6", std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
     };
     let client_port = addr.port();
-    let mut session = SessionDescription::default();
-    session.version = 0;
+    let mut session = SessionDescription {
+        version: 0,
+        ..Default::default()
+    };
     let session_id_hash = source_id
         .bytes()
         .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));

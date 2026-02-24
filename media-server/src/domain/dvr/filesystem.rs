@@ -161,7 +161,7 @@ pub fn find_recording_for_timestamp(
     None
 }
 
-fn probe_mp4_duration_ms(path: &PathBuf) -> Option<u64> {
+fn probe_mp4_duration_ms(path: &std::path::Path) -> Option<u64> {
     let ictx = ffmpeg::format::input(path.to_str()?).ok()?;
     let video_stream = ictx.streams().best(ffmpeg::media::Type::Video)?;
     let time_base = video_stream.time_base();

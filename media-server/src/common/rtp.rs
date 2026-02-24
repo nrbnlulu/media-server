@@ -402,7 +402,7 @@ impl FfmpegConsumer for RtpPacketizer {
                 let _ = c.finalize().await;
             });
         }
-        while let Some(_) = task_set.join_next().await {}
+        while task_set.join_next().await.is_some() {}
         Ok(())
     }
 }
@@ -450,12 +450,7 @@ impl RtpStitcher {
         // of discontinuity likely indicates a source switch
         if self.has_received_packet.load(Ordering::Relaxed) {
             let last_input = self.last_input_ts.load(Ordering::Relaxed);
-            let delta = if orig_ts >= last_input {
-                orig_ts - last_input
-            } else {
-                // Handle wraparound or backwards jump
-                last_input - orig_ts
-            };
+            let delta = orig_ts.abs_diff(last_input);
 
             // If delta > 1 second of RTP time, assume source switch
             const SOURCE_SWITCH_THRESHOLD: u32 = 90000; // 1 second at 90kHz
@@ -735,7 +730,7 @@ mod tests {
         let packetizer = RtpPacketizer::new(12345, 96);
         let nal = vec![0x67, 0x42, 0x00, 0x1e];
 
-        let frames = packetizer.packetize(&[nal.clone()], 0, &VideoCodec::H264);
+        let frames = packetizer.packetize(std::slice::from_ref(&nal), 0, &VideoCodec::H264);
         assert_eq!(frames.len(), 1);
 
         // Payload should match the NAL unit

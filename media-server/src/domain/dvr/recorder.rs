@@ -32,7 +32,7 @@ struct RecordingState {
 
 impl RecordingState {
     fn new(
-        path: &PathBuf,
+        path: &std::path::Path,
         codec: &VideoCodec,
         start_time: UnixTimestamp,
         framing_format: FramingFormat,
@@ -103,7 +103,7 @@ impl RecordingState {
 
         Ok(Self {
             pipeline,
-            file_path: path.clone(),
+            file_path: path.to_path_buf(),
             codec: *codec,
             waiting_for_keyframe: true,
             start_time,

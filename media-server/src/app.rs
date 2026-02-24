@@ -41,6 +41,7 @@ pub enum ClientSessionState {
     Dvr(Arc<DvrPlayer>, Option<Arc<tokio::task::JoinHandle<()>>>),
 }
 
+#[allow(dead_code)]
 struct ClientSession {
     id: ClientSessionId,
     source_id: VideoSourceId,

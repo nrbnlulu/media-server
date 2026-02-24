@@ -17,6 +17,7 @@ use std::sync::Arc;
 struct CurrentPipelineState {
     pipeline: gst::Pipeline,
     bus: gst::Bus,
+    #[allow(dead_code)]
     speed: f64,
     recording_metadata: RecordingMetadata,
     initial_time: UnixTimestamp,
@@ -55,16 +56,21 @@ impl CurrentPipelineState {
     }
 }
 
+#[allow(dead_code)]
 enum DvrPlayerState {
     Scheduled(Duration),
     Playing(CurrentPipelineState),
 }
 
 pub struct DvrPlayer {
+    #[allow(dead_code)]
     codec: VideoCodec,
     state: Arc<tokio::sync::Mutex<CurrentPipelineState>>,
+    #[allow(dead_code)]
     source_id: VideoSourceId,
+    #[allow(dead_code)]
     consumer: Arc<dyn RtpConsumer>,
+    #[allow(dead_code)]
     reset_state_chan: (
         tokio::sync::mpsc::Sender<()>,
         tokio::sync::mpsc::Receiver<()>,
