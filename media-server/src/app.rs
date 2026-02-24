@@ -14,9 +14,7 @@ use media_server_api_models::UnixTimestamp;
 use media_server_api_models::{ClientSessionId, CreateWebRtcSessionRequest};
 use serde::Deserialize;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 use tokio::sync::broadcast;
-use uuid::Uuid;
 
 struct SourceWrapper {
     source: Arc<dyn VideoSource>,
@@ -120,9 +118,6 @@ impl ClientSession {
                 let join_handle = tokio::spawn(async move {
                     player_clone.play().await;
                 });
-                // wait for the player to start.
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                player.seek_to_timestamp(timestamp, 1.0).await?;
                 *state_guard = ClientSessionState::Dvr(player.clone(), Some(Arc::new(join_handle)));
             }
         };

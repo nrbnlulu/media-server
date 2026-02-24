@@ -539,7 +539,6 @@ fn run_fallback_pipeline(
 
                     last_converted_dts = converted_dts;
 
-                    log::info!("sending fallback frame");
                     if packet_tx.blocking_send(packet).is_err() {
                         log::info!("Fallback terminated for {} (channel closed)", session_id);
                         return;
