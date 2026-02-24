@@ -26,7 +26,7 @@ pub struct RecordingMetadata {
 
 impl RecordingMetadata {
     pub fn contains(&self, epoch: u64) -> bool {
-        self.start_time <= epoch && self.end_time.map_or(true, |end| epoch <= end)
+        self.start_time <= epoch && self.end_time.is_none_or(|end| epoch <= end)
     }
 }
 
@@ -79,29 +79,29 @@ pub fn list_recordings_for_stream_id(stream_id: &VideoSourceId) -> Result<Vec<Re
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             let parts: Vec<&str> = stem.split('_').collect();
 
-            if parts.len() == 2 {
-                if let Ok(start_time) = parts[0].parse::<u64>() {
-                    let mut end_time = if parts[1] == "latest" {
-                        None
-                    } else {
-                        parts[1].parse::<u64>().ok()
-                    };
-                    // FIXME: in cases where the video stream was off when trying to record
-                    // gstreamer would just writeout a no-data fmp4 file that contains only metadata
-                    // check that file size is greater than 663 (default metadata)
-                    let file_size = fs::metadata(&path)?.len();
-                    if file_size > 663 {
-                        if end_time.is_none() {
-                            if let Some(duration_ms) = probe_mp4_duration_ms(&path) {
-                                end_time = Some(start_time.saturating_add(duration_ms));
-                            }
-                        }
-                        recordings.push(RecordingMetadata {
-                            path,
-                            start_time,
-                            end_time,
-                        });
+            if parts.len() == 2
+                && let Ok(start_time) = parts[0].parse::<u64>()
+            {
+                let mut end_time = if parts[1] == "latest" {
+                    None
+                } else {
+                    parts[1].parse::<u64>().ok()
+                };
+                // FIXME: in cases where the video stream was off when trying to record
+                // gstreamer would just writeout a no-data fmp4 file that contains only metadata
+                // check that file size is greater than 663 (default metadata)
+                let file_size = fs::metadata(&path)?.len();
+                if file_size > 663 {
+                    if end_time.is_none()
+                        && let Some(duration_ms) = probe_mp4_duration_ms(&path)
+                    {
+                        end_time = Some(start_time.saturating_add(duration_ms));
                     }
+                    recordings.push(RecordingMetadata {
+                        path,
+                        start_time,
+                        end_time,
+                    });
                 }
             }
         }

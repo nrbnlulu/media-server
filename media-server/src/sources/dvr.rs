@@ -11,17 +11,8 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::{self as gst_app, AppSinkCallbacks};
 use media_server_api_models::UnixTimestamp;
-use parking_lot::Mutex;
-use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::mpsc;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-use std::thread;
-use tokio::sync::broadcast::Sender;
-use tokio::sync::{broadcast, watch};
+use std::sync::Arc;
 
 struct CurrentPipelineState {
     pipeline: gst::Pipeline,
@@ -108,22 +99,21 @@ impl DvrPlayer {
     pub async fn current_timestamp(&self) -> UnixTimestamp {
         let state_guard = self.state.lock().await;
         let start_time = state_guard.recording_metadata.start_time;
-        if let Some(clock_time) = state_guard.pipeline.current_clock_time() {
-            if let Some(base_time) = state_guard.pipeline.base_time() {
-                let running_time = clock_time.saturating_sub(base_time);
-                return start_time + running_time.nseconds();
-            }
+        if let Some(clock_time) = state_guard.pipeline.current_clock_time()
+            && let Some(base_time) = state_guard.pipeline.base_time()
+        {
+            let running_time = clock_time.saturating_sub(base_time);
+            return start_time + running_time.nseconds();
         }
         start_time
     }
 
     pub async fn current_time_ms(&self) -> Option<u64> {
         let state_guard = self.state.lock().await;
-        if let Some(pos) = state_guard.pipeline.query_position::<gst::ClockTime>() {
-            Some(pos.mseconds())
-        } else {
-            None
-        }
+        state_guard
+            .pipeline
+            .query_position::<gst::ClockTime>()
+            .map(|pos| pos.mseconds())
     }
 
     pub fn speed(&self) -> f64 {
@@ -173,20 +163,17 @@ impl DvrPlayer {
                 // wait for EOS task
                 state.bus.clone()
             };
-            let join_handle = tokio::spawn(async move {
+
+            tokio::spawn(async move {
                 let mut bus_stream = bus.stream();
                 while let Some(msg) = bus_stream.next().await {
-                    match msg.view() {
-                        gst::MessageView::Eos(_) => {
-                            // check the TODO.md
-                            log::warn!("EOS is not expected");
-                            break;
-                        }
-                        _ => (),
+                    if let gst::MessageView::Eos(_) = msg.view() {
+                        // check the TODO.md
+                        log::warn!("EOS is not expected");
+                        break;
                     }
                 }
-            });
-            join_handle
+            })
         };
         let _ = join_handle.await;
     }
@@ -203,10 +190,10 @@ impl DvrPlayer {
             if timestamp < state_guard.recording_metadata.start_time {
                 return Err(SeekError::SeekBeforeStart);
             }
-            if let Some(end_time) = state_guard.recording_metadata.end_time {
-                if timestamp > end_time {
-                    return Err(SeekError::SeekAfterEnd);
-                }
+            if let Some(end_time) = state_guard.recording_metadata.end_time
+                && timestamp > end_time
+            {
+                return Err(SeekError::SeekAfterEnd);
             }
             let offset_ms = timestamp.saturating_sub(state_guard.recording_metadata.start_time);
             let start = gst::ClockTime::from_mseconds(offset_ms);
@@ -215,7 +202,7 @@ impl DvrPlayer {
                 .pipeline
                 .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, start)
                 .map_err(|e| anyhow::anyhow!(format!("Seek failed: {}", e)))
-                .map_err(|e| SeekError::GstError(e))?;
+                .map_err(SeekError::GstError)?;
         }
         Ok(())
     }
@@ -223,7 +210,7 @@ impl DvrPlayer {
 
 fn create_pipeline(
     recording: &RecordingMetadata,
-    initial_time: UnixTimestamp,
+    _initial_time: UnixTimestamp,
     // FIXME: we know that based on the current source (rtsp) codec
     // FIXME: thus if it changed somehow mid stream we're doomed.
     src_codec: &VideoCodec,
@@ -280,7 +267,7 @@ fn create_pipeline(
     src.set_property("location", path_str);
 
     // Note: No RTP payloader - we output raw H264/H265 and packetize ourselves
-    pipeline.add_many(&[
+    pipeline.add_many([
         &src,
         &demux,
         &queue,
@@ -310,12 +297,11 @@ fn create_pipeline(
         if sink_pad.is_linked() {
             return;
         }
-        if let Some(caps) = src_pad.current_caps() {
-            if let Some(structure) = caps.structure(0) {
-                if !structure.name().starts_with("video/") {
-                    return;
-                }
-            }
+        if let Some(caps) = src_pad.current_caps()
+            && let Some(structure) = caps.structure(0)
+            && !structure.name().starts_with("video/")
+        {
+            return;
         }
         let _ = src_pad.link(&sink_pad);
     });
@@ -348,9 +334,9 @@ fn create_pipeline(
     // Create RTP packetizer for DVR playback
     // Use random SSRC and payload type 96 (dynamic, same as live stream)
     let rtp_packetizer = RtpPacketizer::new(rand::random::<u32>(), 96);
-    let codec_clone = src_codec.clone();
+    let codec_clone = *src_codec;
 
-    let sender_handle = tokio::spawn(async move {
+    let _sender_handle = tokio::spawn(async move {
         let mut frame_count = 0u64;
         while let Some((raw_data, pts)) = packet_rx.recv().await {
             // Convert PTS from nanoseconds to RTP timestamp (90kHz clock)
@@ -387,7 +373,7 @@ fn create_pipeline(
             }
 
             frame_count += 1;
-            if frame_count <= 5 || frame_count % 100 == 0 {
+            if frame_count <= 5 || frame_count.is_multiple_of(100) {
                 log::trace!(
                     "DVR frame {}: raw_size={}, pts={:?}, rtp_ts={}, nal_count={}",
                     frame_count,

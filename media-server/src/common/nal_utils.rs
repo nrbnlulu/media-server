@@ -171,7 +171,7 @@ pub enum H265NalType {
 
 impl H265NalType {
     /// Extracts NAL type from the first two bytes of a NAL unit.
-    pub fn from_header(byte1: u8, byte2: u8) -> Option<Self> {
+    pub fn from_header(byte1: u8, _byte2: u8) -> Option<Self> {
         let nal_type = (byte1 >> 1) & 0x3F;
         match nal_type {
             0 => Some(Self::TrailN),
@@ -563,7 +563,7 @@ pub fn parse_h265_extradata(extradata: &[u8]) -> Option<ParsedExtraData> {
                 return None;
             }
 
-            if matches!(nal_type, 32 | 33 | 34) {
+            if matches!(nal_type, 32..=34) {
                 nals.push(extradata[offset..offset + len].to_vec());
             }
             offset += len;

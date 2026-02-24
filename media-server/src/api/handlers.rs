@@ -189,7 +189,7 @@ pub async fn delete_stream(
 
 pub async fn wsc_rtp(
     State(state): State<Arc<GlobalState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(_addr): ConnectInfo<SocketAddr>,
     Path(source_id): Path<VideoSourceId>,
     Query(query): Query<WscRtpQuery>,
     ws: WebSocketUpgrade,

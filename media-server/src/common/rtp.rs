@@ -295,7 +295,7 @@ impl FfmpegConsumer for RtpPacketizer {
         }
 
         let stream_state = SrcStreamState {
-            codec: metadata.codec.clone(),
+            codec: metadata.codec,
             parsed_extradata,
             codec_params,
             timebase: metadata.timebase.clone(),
@@ -367,28 +367,28 @@ impl FfmpegConsumer for RtpPacketizer {
                 nal_units = Some(nal_units_);
             }
 
-            (config.codec.clone(), nal_units)
+            (config.codec, nal_units)
         };
 
-        if let Some(nal_units) = nal_units {
-            if !nal_units.is_empty() {
-                let rtp_frames = self.packetize(&nal_units, timestamp, &codec);
-                let consumers = self.consumers.lock().clone();
+        if let Some(nal_units) = nal_units
+            && !nal_units.is_empty()
+        {
+            let rtp_frames = self.packetize(&nal_units, timestamp, &codec);
+            let consumers = self.consumers.lock().clone();
 
-                if consumers.is_empty() {
-                    return Ok(());
-                }
+            if consumers.is_empty() {
+                return Ok(());
+            }
 
-                // Send frames directly to consumers without spawning tasks
-                // This reduces overhead significantly for real-time streaming
-                for frame in rtp_frames {
-                    let arc_frame = Arc::new(frame);
-                    let mut tasks = Vec::new();
-                    for consumer in &consumers {
-                        tasks.push(consumer.on_new_packet(arc_frame.clone()));
-                    }
-                    join_all(tasks).await;
+            // Send frames directly to consumers without spawning tasks
+            // This reduces overhead significantly for real-time streaming
+            for frame in rtp_frames {
+                let arc_frame = Arc::new(frame);
+                let mut tasks = Vec::new();
+                for consumer in &consumers {
+                    tasks.push(consumer.on_new_packet(arc_frame.clone()));
                 }
+                join_all(tasks).await;
             }
         }
         Ok(())

@@ -285,10 +285,10 @@ impl RtpConsumer for WscRtpPublisher {
             return;
         }
         let tx = self.rtp_tx.lock().clone();
-        if let Some(tx) = tx {
-            if tx.send(packet.to_bytes()).is_err() {
-                log::warn!("Session {}: RTP channel closed", self.id);
-            }
+        if let Some(tx) = tx
+            && tx.send(packet.to_bytes()).is_err()
+        {
+            log::warn!("Session {}: RTP channel closed", self.id);
         }
     }
 
@@ -309,13 +309,13 @@ impl RtpVideoPublisher for WscRtpPublisher {
     }
 
     async fn on_session_mode_change(&self, mode: SessionMode) {
-        if let Some(tx) = self.control_tx.lock().as_ref() {
-            if tx.send(mode).is_err() {
-                log::warn!(
-                    "Session {}: failed to send mode change, channel closed",
-                    self.id
-                );
-            }
+        if let Some(tx) = self.control_tx.lock().as_ref()
+            && tx.send(mode).is_err()
+        {
+            log::warn!(
+                "Session {}: failed to send mode change, channel closed",
+                self.id
+            );
         }
     }
 }
@@ -411,14 +411,14 @@ pub async fn handle_incoming_wsc_rtp_websocket(
         publisher.bind_holepunch_port().await
     };
 
-    if let Err(ref err) = udp_port_result {
-        if !force_websocket_transport {
-            log::warn!(
-                "Session {}: failed to allocate holepunch port ({}), will use WebSocket transport",
-                session_id,
-                err
-            );
-        }
+    if let Err(ref err) = udp_port_result
+        && !force_websocket_transport
+    {
+        log::warn!(
+            "Session {}: failed to allocate holepunch port ({}), will use WebSocket transport",
+            session_id,
+            err
+        );
     }
 
     let holepunch_port = udp_port_result.as_ref().map(|(p, _)| *p).unwrap_or(0);
@@ -519,10 +519,8 @@ pub async fn handle_incoming_wsc_rtp_websocket(
                     if let Err(err) = sock.send(&rtp_bytes).await {
                         log::error!("Session {}: error sending RTP packet: {}", session_id, err);
                     }
-                } else {
-                    if let Err(err) = sender.send(Message::Binary(rtp_bytes.into())).await {
-                        log::error!("Session {}: error sending RTP packet: {}", session_id, err);
-                    }
+                } else if let Err(err) = sender.send(Message::Binary(rtp_bytes)).await {
+                    log::error!("Session {}: error sending RTP packet: {}", session_id, err);
                 };
             }
             Some(sdp) = sdp_rx.recv() => {

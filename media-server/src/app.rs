@@ -121,7 +121,7 @@ impl ClientSession {
                 let player = DvrPlayer::new(
                     self.source_id.clone(),
                     timestamp,
-                    codec.clone(),
+                    *codec,
                     self.stitching_consumer.clone(),
                 )?;
                 let player = Arc::new(player);
@@ -219,7 +219,6 @@ impl GlobalState {
         let rtsp_client_clone = rtsp_client.clone();
         let handle = tokio::spawn(async move {
             rtsp_client_clone.execute().await;
-            ()
         });
 
         self.sources.insert(
@@ -261,7 +260,7 @@ impl GlobalState {
 
         Ok(StreamInfo {
             source_id: source_id.clone(),
-            rtsp_inputs: source.source.inputs().iter().cloned().collect(),
+            rtsp_inputs: source.source.inputs().to_vec(),
             state,
             should_record: source.source.config().should_record,
             restart_interval_secs: source.source.config().restart_interval_secs,
@@ -327,17 +326,12 @@ impl GlobalState {
                 )
                 .await?;
 
-            let session_id = session.id().clone();
-            let client_session = ClientSession::new_live(
-                session_id.clone(),
-                source_id,
-                session.clone(),
-                packetizer.clone(),
-            );
+            let session_id = *session.id();
+            let client_session =
+                ClientSession::new_live(session_id, source_id, session.clone(), packetizer.clone());
             // Add the stitching consumer to packetizer (not the raw session)
             packetizer.add_consumer(client_session.stitching_consumer.clone());
-            self.client_sessions
-                .insert(session_id.clone(), client_session);
+            self.client_sessions.insert(session_id, client_session);
             Ok((session_id, answer_sdp))
         } else {
             bail!("Stream not found")
@@ -429,7 +423,7 @@ impl GlobalState {
     ) -> Result<()> {
         if let Some(ref session) = self.client_sessions.get(session_id) {
             if let Some(source) = self.sources.get(session.source_id()).as_ref() {
-                let codec = source.value().source.codec().await.clone().ok_or(anyhow!(
+                let codec = source.value().source.codec().await.ok_or(anyhow!(
                     "source is not ready, no codec...\n try again later"
                 ))?;
                 return session.seek(timestamp, &codec).await;
@@ -483,7 +477,7 @@ impl GlobalState {
                 let state = entry.value().state.lock().await;
                 let is_live = matches!(*state, ClientSessionState::Live);
                 sessions.push(media_server_api_models::WebRtcSessionResponse {
-                    session_id: entry.key().clone(),
+                    session_id: *entry.key(),
                     source_id: source_id.clone(),
                     is_live,
                 });

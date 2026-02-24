@@ -77,7 +77,7 @@ pub fn convert_h265_to_annex_b(data: Vec<u8>) -> Result<Vec<u8>> {
 }
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
 static PLACEHOLDER_FRAMES: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
 static PLACEHOLDER_FRAME_INDEX: AtomicUsize = AtomicUsize::new(0);
@@ -87,22 +87,25 @@ fn log_nal_units(data: &[u8]) {
     let mut nal_types = Vec::new();
 
     while i < data.len().saturating_sub(4) {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
-            if i + 4 < data.len() {
-                let nal_header = data[i + 4];
-                let nal_type = nal_header & 0x1F;
-                let nal_name = match nal_type {
-                    1 => "Non-IDR",
-                    5 => "IDR",
-                    6 => "SEI",
-                    7 => "SPS",
-                    8 => "PPS",
-                    9 => "AUD",
-                    _ => "Other",
-                };
-                nal_types.push(format!("{}({})", nal_name, nal_type));
-                i += 4;
-            }
+        if data[i] == 0
+            && data[i + 1] == 0
+            && data[i + 2] == 0
+            && data[i + 3] == 1
+            && i + 4 < data.len()
+        {
+            let nal_header = data[i + 4];
+            let nal_type = nal_header & 0x1F;
+            let nal_name = match nal_type {
+                1 => "Non-IDR",
+                5 => "IDR",
+                6 => "SEI",
+                7 => "SPS",
+                8 => "PPS",
+                9 => "AUD",
+                _ => "Other",
+            };
+            nal_types.push(format!("{}({})", nal_name, nal_type));
+            i += 4;
         }
         i += 1;
     }
