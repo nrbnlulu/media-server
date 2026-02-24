@@ -7,11 +7,8 @@ This is a **high-performance realtime media streaming server** written in Rust, 
 ## Goals & Purpose
 
 - **Ingest** video from RTSP sources (IP cameras, RTSP servers)
-- **Stream** to multiple clients simultaneously via WebRTC
-- **Provide** alternative low-latency RTP streaming via WSC-RTP (WebSocket-Connected RTP)
-- **Record** streams to disk for DVR/playback functionality
-- **Enable** live-rewind capability (seek in recorded video while maintaining live mode)
-- **Handle** camera disconnections and automatic reconnection with fallback mechanisms
+- **Publish** to multiple clients simultaneously via WebRTC/WSC-RTP (websocket controlled RTP)
+- **DVR** record source streams for instant rewind.
 
 ## Architecture
 
@@ -30,10 +27,22 @@ RtspClient (Source)
     |-- DvrRecorder (records to disk)
             |
             v
-        MP4 Files
+        fragmanted MP4 Files
             |
             v
-        DvrPlayer (for playback/seeking)
+        DvrPlayer (for dvr/seeking)
+___
+┌───────────────────────────┐                                            
+│           source X        │                                            
+└───────────────────────────┘     ┌─────────────┐    ┌──────────────┐    
+│           ┌───────►DVR    │     │ live / dvr  │    │  consumer 2  │    
+│           │               ├─────►   switch    ┼────►    wsc-rtp   │    
+│           │               │     └─────────────┘    └──────────────┘    
+│   RTSP────►               │                                            
+│           │               │     ┌─────────────┐    ┌──────────────┐    
+│           │               │     │ live / dvr  │    │  consumer 1  │    
+│           └───────►LIVE   ├─────►   switch    ┼────►    webrtc    │    
+└───────────────────────────┘     └─────────────┘    └──────────────┘    
 ```
 
 ### Core Components
@@ -42,7 +51,7 @@ RtspClient (Source)
 
 | Component | File | Description |
 |-----------|------|-------------|
-| **RtspClient** | `rtsp/mod.rs` | Ingests RTSP streams using FFmpeg, implements `VideoSource` trait, auto-reconnects on failure |
+| **RtspClient** | `rtsp/mod.rs` | Ingests RTSP streams using FFmpeg, implements `VideoSource` trait, auto-reconnects on failure, supports multiple labeled RTSP URLs for fallback |
 | **DvrPlayer** | `dvr.rs` | Replays recorded video files using GStreamer pipelines, supports seeking |
 
 #### Publishers (`media-server/src/publishers/`)
@@ -50,7 +59,7 @@ RtspClient (Source)
 | Component | File | Description |
 |-----------|------|-------------|
 | **WebRtcSession** | `webrtc.rs` | WebRTC peer connection management using `webrtc-rs`, ICE/STUN handling |
-| **WscRtpPublisher** | `wsc_rtp.rs` | Custom low-latency RTP over UDP with WebSocket signaling, UDP hole-punching |
+| **WscRtpPublisher** | `wsc_rtp.rs` | Custom low-latency RTP over UDP with WebSocket signaling, UDP hole-punching and fallback to websocket rtp transport if udp not working|
 
 #### Common Infrastructure (`media-server/src/common/`)
 
@@ -72,7 +81,7 @@ RtspClient (Source)
 | Component | Description |
 |-----------|-------------|
 | **GlobalState** | Central manager holding all active sources and sessions |
-| **ClientSession** | Per-client session state, handles mode switching (Live/DVR) |
+| **ClientSession** | Per-client session state, handles mode switching (Live/DVR), both WebRTC and WSC-RTP are wrapped inside a client sessions|
 
 ### Key Traits
 
@@ -82,6 +91,9 @@ pub trait FfmpegConsumer: Send + Sync { ... }   // RTP packetizer, recorder
 pub trait RtpConsumer: Send + Sync { ... }      // WebRTC, WSC-RTP
 pub trait RtpVideoPublisher: RtpConsumer { ... } // Combined trait
 ```
+
+The `VideoSource` trait now includes:
+- `fn inputs(&self) -> &[VideoSourceInputInternal];` - Returns a slice of labeled RTSP inputs for the source (supporting fallback)
 
 ## Features
 
@@ -109,10 +121,17 @@ pub trait RtpVideoPublisher: RtpConsumer { ... } // Combined trait
 | H.265 Transcoding | Planned | Automatic transcoding to VP9 |
 | VOD Archival | Planned | Long-term storage (days/weeks/months) |
 
+### Security Considerations
+
+**Path Traversal Prevention:**
+- `source_id` values from API requests can contain any characters
+- Filesystem paths are derived using SHA256 hash of `source_id` (see `derive_safe_fs_name()` in `domain/dvr/filesystem.rs`)
+- This prevents path traversal attacks while maintaining 1:1 mapping between `source_id` and filesystem directories
+
 ### API Endpoints
 
 **Stream Management:**
-- `POST /streams` - Create stream from RTSP URL
+- `POST /streams` - Create stream from RTSP inputs (supports multiple labeled URLs for fallback)
 - `GET /streams` - List all streams
 - `GET /streams/{source_id}` - Get stream details
 - `DELETE /streams/{source_id}` - Stop and delete stream
@@ -155,7 +174,7 @@ pub trait RtpVideoPublisher: RtpConsumer { ... } // Combined trait
 | **Serialization** | serde 1.0, serde_json 1.0 |
 | **Concurrency** | dashmap 5.5, parking_lot 0.12.5, futures 0.3 |
 | **API Docs** | utoipa 4.2, utoipa-swagger-ui 6.0 |
-| **Utilities** | anyhow, thiserror, log, env_logger, uuid, chrono |
+| **Utilities** | anyhow, thiserror, log, env_logger, uuid, chrono, sha2, hex |
 
 ### External Protocols
 
@@ -224,13 +243,26 @@ pub trait RtpVideoPublisher: RtpConsumer { ... } // Combined trait
 ### Stream Configuration
 
 ```rust
+pub struct VideoSourceInput {
+    pub label: String,
+    pub url: String,
+}
+
 pub struct StreamConfig {
     pub source_id: u64,
-    pub rtsp_url: url::Url,
+    pub rtsp_inputs: Vec<VideoSourceInputInternal>,
     pub username: Option<String>,
     pub password: Option<String>,
     pub should_record: bool,
     pub restart_interval_secs: Option<u64>,
+}
+```
+
+The `VideoSourceInputInternal` struct is used internally and contains:
+```rust
+pub struct VideoSourceInputInternal {
+    pub label: String,
+    pub url: url::Url,
 }
 ```
 
@@ -311,4 +343,5 @@ Use the debug WebRTC client at `/debug/webrtc-client` for testing streams.
 ## Agentic guidelines
 
 - all plan files u write whould be stored under <project_root>/PLANS/<your_plan_name>.md
+- if you changed something that requies an update to this file (AGENTS.md), you should do so.
 

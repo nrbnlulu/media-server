@@ -261,22 +261,48 @@
                 <div
                     class="p-4 border-b border-[#333333] flex justify-between items-center"
                 >
-                    <div class="flex items-center gap-3">
-                        <h3 id="modal-title" class="font-bold">
-                            Stream Viewer
-                        </h3>
+                    <div class="flex flex-col gap-2">
+                        <div class="flex items-center gap-3">
+                            <h3 id="modal-title" class="font-bold">
+                                Stream Viewer
+                            </h3>
+                            <div
+                                id="mode-indicator"
+                                class="hidden items-center gap-2 px-3 py-1 rounded-full bg-[#212121]"
+                            >
+                                <span
+                                    id="mode-dot"
+                                    class="w-2 h-2 rounded-full"
+                                ></span>
+                                <span
+                                    id="mode-text"
+                                    class="text-xs font-bold uppercase"
+                                ></span>
+                            </div>
+                        </div>
                         <div
-                            id="mode-indicator"
-                            class="hidden items-center gap-2 px-3 py-1 rounded-full bg-[#212121]"
+                            id="active-stream-info"
+                            class="hidden text-xs text-[#8a8a8d] space-y-1"
                         >
-                            <span
-                                id="mode-dot"
-                                class="w-2 h-2 rounded-full"
-                            ></span>
-                            <span
-                                id="mode-text"
-                                class="text-xs font-bold uppercase"
-                            ></span>
+                            <div class="flex items-center gap-2">
+                                <span class="font-semibold text-[#bebebe]"
+                                    >Source:</span
+                                >
+                                <span
+                                    id="active-stream-label"
+                                    class="font-mono"
+                                ></span>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <span class="font-semibold text-[#bebebe]"
+                                    >URL:</span
+                                >
+                                <span
+                                    id="active-stream-url"
+                                    class="font-mono truncate"
+                                    title=""
+                                ></span>
+                            </div>
                         </div>
                     </div>
                     <button
@@ -467,33 +493,41 @@
             // Feature detection for WebRTC APIs with Firefox compatibility
             const detectWebRTC = () => {
                 // Check for RTCPeerConnection with vendor prefixes for older browsers
-                const RTCPeerConnection = window.RTCPeerConnection ||
-                                         window.webkitRTCPeerConnection ||
-                                         window.mozRTCPeerConnection;
+                const RTCPeerConnection =
+                    window.RTCPeerConnection ||
+                    window.webkitRTCPeerConnection ||
+                    window.mozRTCPeerConnection;
 
                 // Check for RTCSessionDescription with vendor prefixes
-                const RTCSessionDescription = window.RTCSessionDescription ||
-                                             window.webkitRTCSessionDescription ||
-                                             window.mozRTCSessionDescription;
+                const RTCSessionDescription =
+                    window.RTCSessionDescription ||
+                    window.webkitRTCSessionDescription ||
+                    window.mozRTCSessionDescription;
 
                 // Check for RTCIceCandidate with vendor prefixes
-                const RTCIceCandidate = window.RTCIceCandidate ||
-                                       window.webkitRTCIceCandidate ||
-                                       window.mozRTCIceCandidate;
+                const RTCIceCandidate =
+                    window.RTCIceCandidate ||
+                    window.webkitRTCIceCandidate ||
+                    window.mozRTCIceCandidate;
 
                 return {
                     RTCPeerConnection,
                     RTCSessionDescription,
                     RTCIceCandidate,
-                    isSupported: !!RTCPeerConnection && !!RTCSessionDescription && !!RTCIceCandidate
+                    isSupported:
+                        !!RTCPeerConnection &&
+                        !!RTCSessionDescription &&
+                        !!RTCIceCandidate,
                 };
             };
 
             // Check WebRTC support on page load
-            window.addEventListener('load', () => {
+            window.addEventListener("load", () => {
                 const webrtcSupport = detectWebRTC();
                 if (!webrtcSupport.isSupported) {
-                    alert('WebRTC is not supported in your browser. Please try using a modern browser like Chrome, Firefox, or Edge.');
+                    alert(
+                        "WebRTC is not supported in your browser. Please try using a modern browser like Chrome, Firefox, or Edge.",
+                    );
                 }
             });
 
@@ -590,17 +624,47 @@
                         return;
                     }
                     grid.innerHTML = data.streams
-                        .map(
-                            (stream) => `
+                        .map((stream) => {
+                            const inputsList =
+                                stream.rtsp_inputs &&
+                                stream.rtsp_inputs.length > 0
+                                    ? stream.rtsp_inputs
+                                          .map((input) => {
+                                              // For now, we'll consider the first input as active
+                                              // In the future, you could add an active_input field to the API
+                                              const isActive =
+                                                  stream.rtsp_inputs.indexOf(
+                                                      input,
+                                                  ) === 0;
+                                              const labelColor = isActive
+                                                  ? "text-[#129B70]"
+                                                  : "text-[#8a8a8d]";
+                                              const bgColor = isActive
+                                                  ? "bg-[#129B70]/10"
+                                                  : "bg-[#212121]";
+                                              return `
+                                            <div class="flex items-center gap-2 text-xs ${bgColor} rounded px-2 py-1">
+                                                <span class="${labelColor} font-semibold">${input.label || "Unlabeled"}</span>
+                                                <span class="text-[#666666]">•</span>
+                                                <span class="text-[#8a8a8d] font-mono text-[10px] truncate" title="${input.url}">${input.url}</span>
+                                            </div>
+                                        `;
+                                          })
+                                          .join("")
+                                    : '<span class="text-[#8a8a8d] text-xs">No inputs</span>';
+
+                            return `
                     <div class="bg-[#121212] border border-[#333333] rounded-xl overflow-hidden hover:border-[#8a8a8d] transition-all">
-                        <div class="p-4 flex justify-between items-start border-b border-[#333333]">
-                            <div class="truncate mr-4">
-                                <div class="font-bold truncate" title="${stream.rtsp_url}">${stream.rtsp_url}</div>
+                        <div class="p-4 border-b border-[#333333]">
+                            <div class="flex justify-between items-start mb-2">
                                 <div class="text-[10px] text-[#8a8a8d] font-mono">${stream.source_id}</div>
+                                <span class="status-pill ${stream.state === "Running" ? "bg-[#129B70]/10 text-[#129B70]" : "bg-[#F59E0B]/10 text-[#F59E0B]"}">
+                                    ${stream.state}
+                                </span>
                             </div>
-                            <span class="status-pill ${stream.state === "Running" ? "bg-[#129B70]/10 text-[#129B70]" : "bg-[#F59E0B]/10 text-[#F59E0B]"}">
-                                ${stream.state}
-                            </span>
+                            <div class="space-y-1">
+                                ${inputsList}
+                            </div>
                         </div>
                         <div class="p-4 flex gap-2">
                             <button onclick="startViewing('${stream.source_id}')" class="flex-1 bg-[#F59E0B] hover:bg-[#D97706] py-2 rounded-lg text-sm font-semibold text-[#121212]">
@@ -611,8 +675,8 @@
                             </button>
                         </div>
                     </div>
-                `,
-                        )
+                `;
+                        })
                         .join("");
                 } catch (e) {
                     document.getElementById("streams-grid").innerHTML =
@@ -685,7 +749,7 @@
                     statusPollInterval = null;
                 }
                 if (currentSession.sessionId) {
-                    const endpoint = `/streams/${currentSession.streamId}/webrtc/${currentSession.sessionId}`;
+                    const endpoint = `/client-session-control/${currentSession.sessionId}`;
                     await api(endpoint, "DELETE").catch(() => {});
                 }
             }
@@ -704,7 +768,9 @@
                 // Check WebRTC support before proceeding
                 const webrtcSupport = detectWebRTC();
                 if (!webrtcSupport.isSupported) {
-                    throw new Error('WebRTC is not supported in your browser. Please try using a modern browser like Chrome, Firefox, or Edge.');
+                    throw new Error(
+                        "WebRTC is not supported in your browser. Please try using a modern browser like Chrome, Firefox, or Edge.",
+                    );
                 }
 
                 try {
@@ -816,9 +882,12 @@
                     );
 
                     // Check if we're in Firefox and provide specific guidance
-                    const isFirefox = typeof InstallTrigger !== 'undefined';
+                    const isFirefox = typeof InstallTrigger !== "undefined";
                     if (isFirefox) {
-                        showToast("Failed to start stream. Firefox may require additional configuration for WebRTC.", "error");
+                        showToast(
+                            "Failed to start stream. Firefox may require additional configuration for WebRTC.",
+                            "error",
+                        );
                     } else {
                         showToast("Failed to start stream", "error");
                     }
@@ -860,7 +929,7 @@
                     .classList.remove("hidden");
                 document.getElementById("mode-indicator").classList.add("flex");
 
-                // Fetch stream info to get recording_start_time
+                // Fetch stream info to get recording_start_time and display active source
                 try {
                     const streamInfo = await api(`/streams/${streamId}`);
                     if (streamInfo && streamInfo.recording_start_time) {
@@ -870,9 +939,35 @@
                     } else {
                         currentSession.recordingStartTimeMs = null;
                     }
+
+                    // Display active stream info (first input or label/url if available)
+                    if (
+                        streamInfo &&
+                        streamInfo.rtsp_inputs &&
+                        streamInfo.rtsp_inputs.length > 0
+                    ) {
+                        const activeInput = streamInfo.rtsp_inputs[0]; // For now, show first input
+                        document.getElementById(
+                            "active-stream-label",
+                        ).innerText = activeInput.label || "N/A";
+                        document.getElementById("active-stream-url").innerText =
+                            activeInput.url;
+                        document.getElementById("active-stream-url").title =
+                            activeInput.url;
+                        document
+                            .getElementById("active-stream-info")
+                            .classList.remove("hidden");
+                    } else {
+                        document
+                            .getElementById("active-stream-info")
+                            .classList.add("hidden");
+                    }
                 } catch (e) {
                     console.warn("Failed to fetch stream info:", e);
                     currentSession.recordingStartTimeMs = null;
+                    document
+                        .getElementById("active-stream-info")
+                        .classList.add("hidden");
                 }
 
                 startLiveSession(streamId);
@@ -882,6 +977,9 @@
                 closeActiveSession().catch(() => {});
                 document.getElementById("player-modal").classList.add("hidden");
                 document.getElementById("remote-video").srcObject = null;
+                document
+                    .getElementById("active-stream-info")
+                    .classList.add("hidden");
                 currentSession = {
                     streamId: null,
                     sessionId: null,
@@ -916,9 +1014,8 @@
             async function goLive() {
                 if (!currentSession.sessionId) return;
                 try {
-                    // Use the /live endpoint to switch mode without creating new session
                     const result = await api(
-                        `/streams/${currentSession.streamId}/webrtc/${currentSession.sessionId}/live`,
+                        `/client-session-control/${currentSession.sessionId}/live`,
                         "POST",
                     );
                     currentSession.isLive = true;
@@ -948,13 +1045,10 @@
                 if (!currentSession.sessionId) return;
 
                 try {
-                    // Always use the seek endpoint - backend handles switching from live to DVR
                     const result = await api(
-                        `/streams/${currentSession.streamId}/webrtc/${currentSession.sessionId}/seek`,
+                        `/client-session-control/${currentSession.sessionId}/seek`,
                         "POST",
-                        {
-                            timestamp: timestampMs,
-                        },
+                        { timestamp: timestampMs },
                     );
 
                     // Update from server response
@@ -1014,11 +1108,9 @@
 
                 try {
                     const result = await api(
-                        `/streams/${currentSession.streamId}/webrtc/${currentSession.sessionId}/speed`,
+                        `/client-session-control/${currentSession.sessionId}/speed`,
                         "POST",
-                        {
-                            speed: speed,
-                        },
+                        { speed },
                     );
 
                     currentSession.currentSpeed = result.speed;
@@ -1038,7 +1130,7 @@
                     if (currentSession.sessionId) {
                         try {
                             const status = await api(
-                                `/streams/${currentSession.streamId}/webrtc/${currentSession.sessionId}/mode`,
+                                `/client-session-control/${currentSession.sessionId}/mode`,
                             );
                             if (status) {
                                 currentSession.isLive = status.is_live;
@@ -1249,8 +1341,8 @@
             }
 
             // Wait for DOM to be loaded and check WebRTC support
-            if (document.readyState === 'loading') {
-                document.addEventListener('DOMContentLoaded', () => {
+            if (document.readyState === "loading") {
+                document.addEventListener("DOMContentLoaded", () => {
                     const webrtcSupport = detectWebRTC();
                     if (webrtcSupport.isSupported) {
                         initializeApp();

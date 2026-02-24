@@ -1,15 +1,21 @@
-use anyhow::{bail, Result};
-use ffmpeg;
+use anyhow::Result;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::PathBuf;
 
 use media_server_api_models::UnixTimestamp;
 
 use crate::app::VideoSourceId;
-use crate::common::traits::VideoSource;
 
 const DVR_BASE_DIR: &str = "dvr";
+
+/// Derives a filesystem-safe identifier from source_id using SHA256 hash.
+/// This allows any characters in source_id while preventing path traversal attacks.
+/// Returns lowercase hex string (64 chars) which is safe on all filesystems.
+fn derive_safe_fs_name(source_id: &VideoSourceId) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(source_id.as_bytes());
+    hex::encode(hash)
+}
 
 #[derive(Debug, Clone)]
 pub struct RecordingMetadata {
@@ -23,8 +29,10 @@ impl RecordingMetadata {
         self.start_time <= epoch && self.end_time.map_or(true, |end| epoch <= end)
     }
 }
+
 pub fn get_stream_dvr_dir(stream_id: &VideoSourceId) -> PathBuf {
-    PathBuf::from(DVR_BASE_DIR).join(stream_id.to_string())
+    let safe_name = derive_safe_fs_name(stream_id);
+    PathBuf::from(DVR_BASE_DIR).join(safe_name)
 }
 
 pub fn ensure_stream_dvr_dir(stream_id: &VideoSourceId) -> Result<PathBuf> {

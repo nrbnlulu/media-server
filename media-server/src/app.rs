@@ -1,26 +1,20 @@
 use crate::common::VideoCodec;
-use crate::common::rtp::{RtpPacket, RtpPacketizer, StitchingConsumer};
+use crate::common::rtp::{RtpPacketizer, StitchingConsumer};
 use crate::common::traits::{RtpConsumer, RtpVideoPublisher, VideoSource};
 use crate::domain::dvr::{filesystem, recorder::DvrRecorder};
 use crate::domain::{StreamConfig, StreamInfo, StreamState};
-use crate::publishers::webrtc::{WebRtcSession, WebrtcManager};
+use crate::publishers::webrtc::WebrtcManager;
 use crate::publishers::wsc_rtp::WscRtpPublisher;
 use crate::sources::dvr::DvrPlayer;
 use crate::sources::rtsp::RtspClient;
 use anyhow::{Result, anyhow, bail};
 use dashmap::DashMap;
-use futures::TryFutureExt;
 use gstreamer::glib::clone::Downgrade;
-use media_server_api_models::CreateWebRtcSessionRequest;
 use media_server_api_models::UnixTimestamp;
-use parking_lot::Mutex;
+use media_server_api_models::{ClientSessionId, CreateWebRtcSessionRequest};
 use serde::Deserialize;
-use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
-use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
-use uuid::Uuid;
 
 struct SourceWrapper {
     source: Arc<dyn VideoSource>,
@@ -29,7 +23,6 @@ struct SourceWrapper {
     recorder: Option<Arc<DvrRecorder>>,
 }
 
-pub type ClientSessionId = Uuid;
 pub type VideoSourceId = String;
 pub type SharedGlobalState = Arc<GlobalState>;
 pub type WeakGlobalState = Weak<GlobalState>;
@@ -47,6 +40,7 @@ pub enum ClientSessionState {
     Live,
     Dvr(Arc<DvrPlayer>, Option<Arc<tokio::task::JoinHandle<()>>>),
 }
+
 struct ClientSession {
     id: ClientSessionId,
     source_id: VideoSourceId,
@@ -124,9 +118,6 @@ impl ClientSession {
                 let join_handle = tokio::spawn(async move {
                     player_clone.play().await;
                 });
-                // wait for the player to start.
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                player.seek_to_timestamp(timestamp, 1.0).await?;
                 *state_guard = ClientSessionState::Dvr(player.clone(), Some(Arc::new(join_handle)));
             }
         };
@@ -170,12 +161,17 @@ impl GlobalState {
         }
 
         for entry in self.sources.iter() {
-            if entry.value().source.url() == &config.rtsp_url {
-                bail!(
-                    "RTSP URL {} already exists with source id {}",
-                    config.rtsp_url,
-                    entry.value().source.source_id()
-                );
+            let existing_inputs = entry.value().source.inputs();
+            for existing_input in existing_inputs {
+                for new_input in &config.rtsp_inputs {
+                    if existing_input.url == new_input.url {
+                        bail!(
+                            "RTSP URL {} already exists with source id {}",
+                            existing_input.url,
+                            entry.value().source.source_id()
+                        );
+                    }
+                }
             }
         }
         let (state_tx, _) = broadcast::channel(100);
@@ -246,7 +242,7 @@ impl GlobalState {
 
         Ok(StreamInfo {
             source_id: source_id.clone(),
-            rtsp_url: source.source.url().to_string(),
+            rtsp_inputs: source.source.inputs().iter().cloned().collect(),
             state,
             should_record: source.source.config().should_record,
             restart_interval_secs: source.source.config().restart_interval_secs,
@@ -262,6 +258,15 @@ impl GlobalState {
             }
         }
         streams
+    }
+
+    pub async fn get_source(&self, source_id: &VideoSourceId) -> Result<Arc<dyn VideoSource>> {
+        let source = self
+            .sources
+            .get(source_id)
+            .ok_or_else(|| anyhow!("Stream {} not found", source_id))?;
+
+        Ok(source.source.clone())
     }
 
     pub async fn subscribe_stream_state(
@@ -330,6 +335,8 @@ impl GlobalState {
     ) -> Result<Arc<WscRtpPublisher>> {
         if let Some(source) = self.sources.get(&source_id).as_ref() {
             let packetizer = &source.rtp_packetizer;
+
+            // Get the source inputs to pass to the publisher
             let publisher = Arc::new(WscRtpPublisher::new(source_id.clone()));
             let client_id = *publisher.id();
 
@@ -413,18 +420,8 @@ impl GlobalState {
         bail!("Session not found");
     }
 
-    pub async fn seek_webrtc_session(
-        &self,
-        _source_id: VideoSourceId,
-        session_id: ClientSessionId,
-        timestamp: UnixTimestamp,
-    ) -> Result<()> {
-        self.seek_session(&session_id, timestamp).await
-    }
-
     pub async fn get_session_mode(
         &self,
-        _source_id: VideoSourceId,
         session_id: ClientSessionId,
     ) -> Result<media_server_api_models::SessionModeResponse> {
         let session_state = self.get_client_session_state(&session_id).await?;
@@ -445,12 +442,7 @@ impl GlobalState {
         }
     }
 
-    pub async fn set_session_speed(
-        &self,
-        _source_id: VideoSourceId,
-        session_id: ClientSessionId,
-        speed: f64,
-    ) -> Result<()> {
+    pub async fn set_session_speed(&self, session_id: ClientSessionId, speed: f64) -> Result<()> {
         if let Some(ref session) = self.client_sessions.get(&session_id) {
             let state_guard = session.state.lock().await;
             if let ClientSessionState::Dvr(ref player, _) = *state_guard {

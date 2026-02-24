@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use media_server_api_models::UnixTimestamp;
 
 pub fn check_dependencies() -> Result<()> {
@@ -30,7 +30,10 @@ pub fn check_dependencies() -> Result<()> {
 
     for element_name in required_elements {
         if gstreamer::ElementFactory::find(element_name).is_none() {
-            bail!("Required GStreamer element '{}' not found. Please install the necessary GStreamer plugins.", element_name);
+            bail!(
+                "Required GStreamer element '{}' not found. Please install the necessary GStreamer plugins.",
+                element_name
+            );
         }
     }
 
@@ -73,8 +76,8 @@ pub fn convert_h265_to_annex_b(data: Vec<u8>) -> Result<Vec<u8>> {
     convert_h264_to_annex_b(data)
 }
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 static PLACEHOLDER_FRAMES: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
 static PLACEHOLDER_FRAME_INDEX: AtomicUsize = AtomicUsize::new(0);

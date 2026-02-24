@@ -1,13 +1,13 @@
-use crate::app::{ClientSessionId, VideoSourceId};
+use crate::app::VideoSourceId;
 use crate::common::VideoCodec;
 use crate::common::rtp::RtpPacket;
-use crate::common::traits::{RtpConsumer, RtpVideoPublisher};
+use crate::common::traits::{RtpConsumer, RtpVideoPublisher, VideoSource};
 use crate::utils::get_current_unix_timestamp;
 use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket};
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
-use media_server_api_models::wsc_rtp as proto;
+use media_server_api_models::{ClientSessionId, VideoSourceInput, wsc_rtp as proto};
 use media_server_api_models::{WscRtpClientMessage, WscRtpServerMessage};
 use parking_lot::Mutex;
 use std::net::SocketAddr;
@@ -367,6 +367,7 @@ async fn last_ping_checker(
 pub async fn handle_incoming_wsc_rtp_websocket(
     ws: WebSocket,
     publisher: Arc<WscRtpPublisher>,
+    source: Arc<dyn VideoSource>,
     force_websocket_transport: bool,
 ) {
     let session_id = *publisher.id();
@@ -406,11 +407,13 @@ pub async fn handle_incoming_wsc_rtp_websocket(
 
     let holepunch_port = udp_port_result.as_ref().map(|(p, _)| *p).unwrap_or(0);
 
+    let active_source = source.active_input();
     if send_wsc_rtp_message(
         &mut sender,
         WscRtpServerMessage::Init {
             session_id: session_id.to_string(),
             holepunch_port,
+            active_source,
         },
     )
     .await

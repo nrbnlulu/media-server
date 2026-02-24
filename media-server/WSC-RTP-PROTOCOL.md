@@ -75,14 +75,16 @@ Upon connection, the server sends an `init` message:
 ```json
 {
   "type": "init",
-  "token": "550e8400-e29b-41d4-a716-446655440000",
-  "holepunch_port": 35000
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "holepunch_port": 35000,
+  "active_source": { "label": "primary", "url": "rtsp://...", "priority": 0 }
 }
 ```
 
 **Fields:**
-- `token`: UUID session identifier (used for all subsequent operations)
+- `session_id`: UUID session identifier (used for all subsequent REST API calls and UDP hole-punch)
 - `holepunch_port`: UDP port allocated for this session's hole-punch listener
+- `active_source`: The currently active RTSP input source (`null` if stream not yet connected)
 
 ### 3. Transport Negotiation
 
@@ -93,19 +95,19 @@ The client should attempt UDP first. If UDP is unavailable, RTP packets will arr
 **Step 1:** Send a UDP packet to `{server_host}:{holepunch_port}`:
 
 ```
-ws-rtp {TOKEN}
+ws-rtp {session_id}
 ```
 
 **Step 2:** Server responds with dummy UDP packets to confirm connectivity:
 
 ```
-ws-rtp-dummy {TOKEN}
+ws-rtp-dummy {session_id}
 ```
 
 **Step 3:** Client sends an ack over UDP to confirm receipt:
 
 ```
-ws-rtp-ack {TOKEN}
+ws-rtp-ack {session_id}
 ```
 
 **Step 4:** Server confirms UDP and streams RTP packets over UDP.
@@ -161,25 +163,26 @@ States: `Active`, `Inactive`, `Connecting`, `Error`
 
 | Message | Sender | Transport | Format |
 |---------|--------|-----------|--------|
-| Hole-punch | Client→Server | UDP | `ws-rtp {token}` |
-| Dummy | Server→Client | UDP | `ws-rtp-dummy {token}` |
-| Ack | Client→Server | UDP | `ws-rtp-ack {token}` |
+| Hole-punch | Client→Server | UDP | `ws-rtp {session_id}` |
+| Dummy | Server→Client | UDP | `ws-rtp-dummy {session_id}` |
+| Ack | Client→Server | UDP | `ws-rtp-ack {session_id}` |
 
 ## Playback Control (REST API)
 
-All playback control is done via REST API. The session token from `init` is used as `session_id`.
+All playback control is done via REST API. The `session_id` from the `init` message is used as the path parameter.
 
 ### Base URL
 ```
-http://{server_host}:{port}/streams/{source_id}/wsc-rtp/{session_id}
+http://{server_host}:{port}/client-session-control/{session_id}
 ```
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/mode` | Get current playback mode |
-| POST | `/seek` | Seek to timestamp (ms) |
-| POST | `/live` | Switch to live mode |
-| POST | `/speed` | Set playback speed |
+| Method | Endpoint | Body | Description |
+|--------|----------|------|-------------|
+| GET | `/mode` | — | Get current playback mode |
+| POST | `/seek` | `{"timestamp": <ms>}` | Seek to timestamp (ms since epoch) |
+| POST | `/live` | — | Switch to live mode |
+| POST | `/speed` | `{"speed": <float>}` | Set playback speed (DVR only) |
+| DELETE | `` | — | Close and delete the session |
 
 ## WebSocket Message Reference
 
@@ -193,9 +196,10 @@ http://{server_host}:{port}/streams/{source_id}/wsc-rtp/{session_id}
 
 | Type | Description |
 |------|-------------|
-| `init` | Session init with token and holepunch port |
+| `init` | Session init with `session_id`, `holepunch_port`, and `active_source` |
 | `sdp` | SDP offer with codec parameters |
-| `stream_state` | Stream status update |
+| `session_mode` | Current playback mode (`live` or `dvr` with timestamp) |
+| `falling_back_rtp_to_ws` | UDP transport failed; RTP will now arrive as binary WebSocket frames |
 | `pong` | Response to ping |
 | `error` | Error message |
 
@@ -221,12 +225,12 @@ final ws = WebSocket.connect("ws://server:8080/streams/123/wsc-rtp");
 
 // 2. Receive init
 final init = await receiveJson(ws);
-final token = init['token'];
+final sessionId = init['session_id'];
 final holepunchPort = init['holepunch_port'];
 
 // 3. Try UDP
 final udp = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
-udp.send(utf8.encode('ws-rtp $token'), serverAddress, holepunchPort);
+udp.send(utf8.encode('ws-rtp $sessionId'), serverAddress, holepunchPort);
 
 // 4. Wait for SDP (arrives after transport is established)
 //    Meanwhile: if UDP dummy packets arrive, send ack
@@ -245,8 +249,8 @@ ws.listen((frame) {
 
 udp.listen((event) {
   final datagram = udp.receive();
-  if (datagram.data starts with 'ws-rtp-dummy $token') {
-    udp.send(utf8.encode('ws-rtp-ack $token'), serverAddress, holepunchPort);
+  if (datagram.data starts with 'ws-rtp-dummy $sessionId') {
+    udp.send(utf8.encode('ws-rtp-ack $sessionId'), serverAddress, holepunchPort);
   } else {
     // UDP RTP packet
     decoder.feedRtp(datagram.data);

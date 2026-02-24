@@ -1,10 +1,10 @@
 use crate::app::VideoSourceId;
+use crate::common::VideoCodec;
 use crate::common::nal_utils;
 use crate::common::rtp::RtpPacketizer;
 use crate::common::traits::RtpConsumer;
-use crate::common::VideoCodec;
 use crate::domain::dvr::filesystem::{self, FindNextRecRes, RecordingMetadata};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use chrono::Duration;
 use futures::StreamExt;
 use gstreamer as gst;
@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::mpsc;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread;
 use tokio::sync::broadcast::Sender;
@@ -28,6 +28,7 @@ struct CurrentPipelineState {
     bus: gst::Bus,
     speed: f64,
     recording_metadata: RecordingMetadata,
+    initial_time: UnixTimestamp,
 }
 
 impl CurrentPipelineState {
@@ -50,6 +51,15 @@ impl CurrentPipelineState {
         self.pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| anyhow!("failed to play pipeline {e}"))?;
+        let offset_ms = self
+            .initial_time
+            .saturating_sub(self.recording_metadata.start_time);
+        if offset_ms > 0 {
+            let seek_pos = gst::ClockTime::from_mseconds(offset_ms);
+            self.pipeline
+                .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, seek_pos)
+                .map_err(|e| anyhow!("initial seek failed: {e}"))?;
+        }
         Ok(())
     }
 }
@@ -144,6 +154,7 @@ impl DvrPlayer {
                     bus,
                     speed: 1.0,
                     recording_metadata: recording,
+                    initial_time: initial_start_time,
                 })
             }
             // FIXME: maybe we should wait until the recording is available?

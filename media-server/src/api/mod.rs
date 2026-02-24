@@ -2,9 +2,9 @@ pub mod handlers;
 pub mod models;
 
 use axum::{
+    Router,
     extract::DefaultBodyLimit,
     routing::{delete, get, post},
-    Router,
 };
 use std::sync::Arc;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -23,16 +23,17 @@ use crate::app::GlobalState;
         handlers::delete_stream,
         handlers::create_webrtc_session,
         handlers::create_dvr_webrtc_session,
-        handlers::delete_webrtc_session,
         handlers::list_webrtc_sessions,
         handlers::webrtc_client,
-        handlers::seek_session,
+        handlers::delete_webrtc_session,
+        handlers::client_session_seek_session,
         handlers::set_session_speed,
         handlers::switch_session_to_live,
         handlers::get_session_mode,
     ),
     components(
         schemas(
+            models::VideoSourceInput,
             models::CreateStreamRequest,
             models::CreateStreamResponse,
             models::StreamResponse,
@@ -53,6 +54,7 @@ use crate::app::GlobalState;
         (name = "Health", description = "Health check endpoints"),
         (name = "Streams", description = "RTSP stream management endpoints"),
         (name = "WebRTC", description = "WebRTC session management endpoints"),
+        (name = "client-session-control", description = "Session-agnostic playback control endpoints"),
         (name = "Debug", description = "Debug and testing utilities")
     ),
     info(
@@ -83,44 +85,28 @@ pub fn create_router(state: Arc<GlobalState>) -> Router {
             post(handlers::create_dvr_webrtc_session),
         )
         .route(
-            "/streams/:source_id/webrtc/:session_id",
-            delete(handlers::delete_webrtc_session),
-        )
-        .route(
             "/streams/:source_id/webrtc",
             get(handlers::list_webrtc_sessions),
         )
+        // Session-agnostic control endpoints
         .route(
-            "/streams/:source_id/webrtc/:session_id/seek",
-            post(handlers::seek_session),
+            "/client-session-control/:session_id",
+            delete(handlers::delete_webrtc_session),
         )
         .route(
-            "/streams/:source_id/webrtc/:session_id/speed",
+            "/client-session-control/:session_id/seek",
+            post(handlers::client_session_seek_session),
+        )
+        .route(
+            "/client-session-control/:session_id/speed",
             post(handlers::set_session_speed),
         )
         .route(
-            "/streams/:source_id/webrtc/:session_id/live",
+            "/client-session-control/:session_id/live",
             post(handlers::switch_session_to_live),
         )
         .route(
-            "/streams/:source_id/webrtc/:session_id/mode",
-            get(handlers::get_session_mode),
-        )
-        // WSC-RTP session control endpoints (same as WebRTC but for wsc-rtp sessions)
-        .route(
-            "/streams/:source_id/wsc-rtp/:session_id/seek",
-            post(handlers::seek_session),
-        )
-        .route(
-            "/streams/:source_id/wsc-rtp/:session_id/speed",
-            post(handlers::set_session_speed),
-        )
-        .route(
-            "/streams/:source_id/wsc-rtp/:session_id/live",
-            post(handlers::switch_session_to_live),
-        )
-        .route(
-            "/streams/:source_id/wsc-rtp/:session_id/mode",
+            "/client-session-control/:session_id/mode",
             get(handlers::get_session_mode),
         )
         .route("/debug/webrtc-client", get(handlers::webrtc_client))

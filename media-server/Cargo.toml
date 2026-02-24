@@ -43,6 +43,7 @@ url = { version = "2.5", features = ["serde"] }
 base64 = "0.21"
 sdp = "0.17.1"
 sha2 = "0.10"
+hex = "0.4"
 async-stream = "0.3.6"
 media-server-api-models = { workspace = true }
 parking_lot = "0.12.5"

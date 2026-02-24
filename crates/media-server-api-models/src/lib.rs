@@ -3,11 +3,21 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 pub type UnixTimestamp = u64;
+pub type ClientSessionId = Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct VideoSourceInput {
+    pub label: String,
+    #[schema(value_type = String, format = "uri")]
+    pub url: url::Url,
+    /// Priority of the input source. Lower values have higher priority.
+    pub priority: u32,
+}
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateStreamRequest {
     pub source_id: String,
-    pub rtsp_url: String,
+    pub rtsp_inputs: Vec<VideoSourceInput>,
     pub username: Option<String>,
     pub password: Option<String>,
     pub should_record: bool,
@@ -17,7 +27,7 @@ pub struct CreateStreamRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateStreamResponse {
     pub source_id: String,
-    pub rtsp_url: String,
+    pub rtsp_inputs: Vec<VideoSourceInput>,
     pub should_record: bool,
     pub restart_interval_secs: Option<u64>,
 }
@@ -25,7 +35,7 @@ pub struct CreateStreamResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct StreamResponse {
     pub source_id: String,
-    pub rtsp_url: String,
+    pub rtsp_inputs: Vec<VideoSourceInput>,
     pub state: String,
     pub should_record: bool,
     pub restart_interval_secs: Option<u64>,
@@ -146,6 +156,8 @@ pub enum WscRtpServerMessage {
         session_id: String,
         /// The port allocated for this session's UDP hole punch listener (30000-40000 range)
         holepunch_port: u16,
+        /// the elected stream source for this session
+        active_source: Option<VideoSourceInput>,
     },
     Sdp {
         sdp: String,
