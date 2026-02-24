@@ -1,0 +1,17 @@
+version: "3"
+
+tasks:
+    fmt:
+        desc: Format code using rustfmt
+        cmds:
+            - cargo fmt --all
+
+    lint:
+        desc: Run clippy linter
+        cmds:
+            - cargo clippy --workspace --all-targets -- -D warnings
+
+    fix:
+        desc: Auto-fix linting issues
+        cmds:
+            - cargo clippy --workspace --all-targets --fix --allow-dirty

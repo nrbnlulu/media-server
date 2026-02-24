@@ -121,6 +121,13 @@ The `VideoSource` trait now includes:
 | H.265 Transcoding | Planned | Automatic transcoding to VP9 |
 | VOD Archival | Planned | Long-term storage (days/weeks/months) |
 
+### Security Considerations
+
+**Path Traversal Prevention:**
+- `source_id` values from API requests can contain any characters
+- Filesystem paths are derived using SHA256 hash of `source_id` (see `derive_safe_fs_name()` in `domain/dvr/filesystem.rs`)
+- This prevents path traversal attacks while maintaining 1:1 mapping between `source_id` and filesystem directories
+
 ### API Endpoints
 
 **Stream Management:**
@@ -167,7 +174,7 @@ The `VideoSource` trait now includes:
 | **Serialization** | serde 1.0, serde_json 1.0 |
 | **Concurrency** | dashmap 5.5, parking_lot 0.12.5, futures 0.3 |
 | **API Docs** | utoipa 4.2, utoipa-swagger-ui 6.0 |
-| **Utilities** | anyhow, thiserror, log, env_logger, uuid, chrono |
+| **Utilities** | anyhow, thiserror, log, env_logger, uuid, chrono, sha2, hex |
 
 ### External Protocols
 
@@ -257,7 +264,6 @@ pub struct VideoSourceInputInternal {
     pub label: String,
     pub url: url::Url,
 }
-```
 ```
 
 ### CLI Options

@@ -381,9 +381,9 @@ impl RtspClient {
                         inputs[0].clone()
                     }
                 };
+                current_stream_input_index += 1;
             }
 
-            current_stream_input_index += 1;
             match real_impl(self, &input, &state_tx, &packet_tx, &metadata_tx) {
                 Ok(_) => {}
                 Err(e) => {
