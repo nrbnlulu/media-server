@@ -11,7 +11,7 @@ use anyhow::{Result, anyhow, bail};
 use dashmap::DashMap;
 use gstreamer::glib::clone::Downgrade;
 use media_server_api_models::UnixTimestamp;
-use media_server_api_models::{ClientSessionId, CreateWebRtcSessionRequest};
+use media_server_api_models::{ClientSessionId, CreateWebRtcSessionRequest, SessionMode};
 use serde::Deserialize;
 use std::sync::{Arc, Weak};
 use tokio::sync::broadcast;
@@ -44,6 +44,7 @@ pub enum ClientSessionState {
 struct ClientSession {
     id: ClientSessionId,
     source_id: VideoSourceId,
+    publisher: Arc<dyn RtpVideoPublisher>,
     live_packetizer: Arc<RtpPacketizer>,
     stitching_consumer: Arc<StitchingConsumer>,
     state: tokio::sync::Mutex<ClientSessionState>,
@@ -60,10 +61,11 @@ impl ClientSession {
         publisher: Arc<dyn RtpVideoPublisher>,
         live_packetizer: Arc<RtpPacketizer>,
     ) -> Self {
-        let stitching_consumer = Arc::new(StitchingConsumer::new(publisher));
+        let stitching_consumer = Arc::new(StitchingConsumer::new(publisher.clone()));
         Self {
             id,
             source_id,
+            publisher,
             stitching_consumer,
             live_packetizer,
             state: tokio::sync::Mutex::new(ClientSessionState::Live),
@@ -72,6 +74,7 @@ impl ClientSession {
 
     pub async fn switch_to_live(&self) {
         let mut state_guard = self.state.lock().await;
+        let mut notify_needed = false;
         match &*state_guard {
             ClientSessionState::Dvr(player, handle_opt) => {
                 if let Err(err) = player.terminate().await {
@@ -89,8 +92,17 @@ impl ClientSession {
                     .add_consumer(self.stitching_consumer.clone());
 
                 *state_guard = ClientSessionState::Live;
+                notify_needed = true;
             }
             ClientSessionState::Live => {}
+        }
+        drop(state_guard);
+
+        if notify_needed {
+            // Notify the client of the mode change
+            self.publisher
+                .on_session_mode_change(SessionMode::Live)
+                .await;
         }
     }
 
@@ -121,6 +133,13 @@ impl ClientSession {
                 *state_guard = ClientSessionState::Dvr(player.clone(), Some(Arc::new(join_handle)));
             }
         };
+        drop(state_guard);
+
+        // Notify the client of the mode change
+        self.publisher
+            .on_session_mode_change(SessionMode::Dvr { timestamp })
+            .await;
+
         Ok(())
     }
 }
