@@ -1,7 +1,7 @@
 //! WSC-RTP Client Example
 //!
 //! This example demonstrates how to connect to the media server using the
-//! WSC-RTP protocol and play the stream using ffplay.
+//! WSC-RTP protocol and play the stream using GStreamer.
 //!
 //! Usage:
 //!   cargo run --example rtp_client -- [OPTIONS]
@@ -10,15 +10,15 @@
 //!   --server <URL>       Server URL (default: http://127.0.0.1:8009)
 //!   --source-id <ID>     Stream source ID (default: 1)
 //!   --client-port <PORT> UDP port for receiving RTP (default: 5004)
-//!   --ffplay <PATH>      Path to ffplay binary (default: ffplay)
 //!   --help               Show this help message
 //!
 //! Example:
 //!   cargo run --example rtp_client -- --server http://localhost:8009 --source-id 1
 
+use gstreamer as gst;
+use gstreamer::prelude::*;
 use media_server_api_models::{WscRtpClientMessage, WscRtpServerMessage};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -38,7 +38,6 @@ OPTIONS:
     --server <URL>       Server URL (default: http://127.0.0.1:8009)
     --source-id <ID>     Stream source ID (default: 1)
     --client-port <PORT> UDP port for receiving RTP (default: 5004)
-    --ffplay <PATH>      Path to ffplay binary (default: ffplay)
     --help               Show this help message
 
 EXAMPLE:
@@ -48,10 +47,12 @@ EXAMPLE:
 }
 
 fn main() -> anyhow::Result<()> {
+    // Initialize GStreamer
+    gst::init().map_err(|e| anyhow::anyhow!("Failed to initialize GStreamer: {}", e))?;
+
     let mut server = "http://127.0.0.1:8009".to_string();
     let mut source_id: String = "1".to_string();
     let mut client_port: u16 = 5004;
-    let mut ffplay = "ffplay".to_string();
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -74,10 +75,6 @@ fn main() -> anyhow::Result<()> {
                     .parse::<u16>()
                     .map_err(|_| anyhow::anyhow!("Invalid --client-port value"))?;
                 client_port = parsed;
-                i += 1;
-            }
-            "--ffplay" if i + 1 < args.len() => {
-                ffplay = args[i + 1].clone();
                 i += 1;
             }
             arg => {
@@ -141,7 +138,9 @@ fn main() -> anyhow::Result<()> {
                     WscRtpServerMessage::Init {
                         session_id: init_token,
                         holepunch_port: init_port,
+                        active_source: _,
                     } => {
+                        let udp_holepunch_required = init_port != 0;
                         println!(
                             "Received Init: token={}, port={}, holepunch_required={}",
                             &init_token[..8],
@@ -177,6 +176,9 @@ fn main() -> anyhow::Result<()> {
                     WscRtpServerMessage::Pong => {
                         // Ignore pong responses
                     }
+                    WscRtpServerMessage::FallingBackRtpToWs => {
+                        // Ignore fallback notification
+                    }
                 }
             }
             Err(tungstenite::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -190,26 +192,22 @@ fn main() -> anyhow::Result<()> {
     }
 
     let sdp_body = sdp_body.ok_or_else(|| anyhow::anyhow!("Missing SDP body"))?;
-    let sdp_file = std::env::temp_dir().join(format!("stream_{}.sdp", source_id));
-    std::fs::write(&sdp_file, sdp_body.as_bytes())?;
-    println!("SDP written to {:?}", sdp_file);
 
-    // Phase 2: Start ffplay and maintain WebSocket connection
-    println!("Starting ffplay...");
-    let mut ffplay_process = Command::new(&ffplay)
-        .arg("-fflags")
-        .arg("nobuffer")
-        .arg("-flags")
-        .arg("low_delay")
-        .arg("-protocol_whitelist")
-        .arg("file,udp,rtp")
-        .arg("-i")
-        .arg(&sdp_file)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    // Parse SDP to extract codec information
+    let codec_info = parse_sdp_for_codec(&sdp_body)?;
+    println!("Detected codec: {:?}", codec_info);
 
-    // Keep the WebSocket connection alive while ffplay is running
+    // Build GStreamer pipeline based on codec
+    let pipeline = build_gstreamer_pipeline(client_port, &codec_info)?;
+    println!("GStreamer pipeline created");
+
+    // Start the pipeline
+    pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|e| anyhow::anyhow!("Failed to set pipeline to Playing: {:?}", e))?;
+    println!("GStreamer pipeline started - playing stream");
+
+    // Keep the WebSocket connection alive while playing
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
 
@@ -226,21 +224,6 @@ fn main() -> anyhow::Result<()> {
     let ping_interval = Duration::from_secs(3);
 
     while running.load(Ordering::SeqCst) {
-        // Check if ffplay is still running
-        match ffplay_process.try_wait() {
-            Ok(Some(status)) => {
-                println!("ffplay exited with status: {}", status);
-                break;
-            }
-            Ok(None) => {
-                // Still running
-            }
-            Err(e) => {
-                eprintln!("Error checking ffplay status: {}", e);
-                break;
-            }
-        }
-
         // Send periodic ping to keep connection alive
         if last_ping.elapsed() > ping_interval {
             let ping_msg = serde_json::to_string(&WscRtpClientMessage::Ping)?;
@@ -261,7 +244,7 @@ fn main() -> anyhow::Result<()> {
                                 WscRtpServerMessage::Sdp { sdp } => {
                                     // SDP updated (e.g., codec params changed)
                                     println!("SDP updated ({} bytes)", sdp.len());
-                                    std::fs::write(&sdp_file, sdp.as_bytes())?;
+                                    // Note: In a more sophisticated client, we could reconfigure the pipeline here
                                 }
                                 WscRtpServerMessage::Error { message } => {
                                     eprintln!("Server error: {}", message);
@@ -297,12 +280,10 @@ fn main() -> anyhow::Result<()> {
 
     // Cleanup
     println!("Stopping...");
-    let _ = ffplay_process.kill();
-    let _ = ffplay_process.wait();
+    pipeline
+        .set_state(gst::State::Null)
+        .map_err(|e| anyhow::anyhow!("Failed to set pipeline to Null: {:?}", e))?;
     let _ = socket.close(None);
-
-    // Clean up SDP file
-    let _ = std::fs::remove_file(&sdp_file);
 
     println!("Done");
     Ok(())
@@ -342,4 +323,116 @@ fn set_socket_nonblocking(
         }
     }
     Ok(())
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+enum CodecInfo {
+    H264 { payload_type: u8 },
+    H265 { payload_type: u8 },
+    Unknown,
+}
+
+fn parse_sdp_for_codec(sdp: &str) -> anyhow::Result<CodecInfo> {
+    for line in sdp.lines() {
+        if line.starts_with("a=rtpmap:") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let codec_part = parts[1];
+                let payload_type = parts[0]
+                    .trim_start_matches("a=rtpmap:")
+                    .parse::<u8>()
+                    .unwrap_or(96);
+
+                if codec_part.starts_with("H264") {
+                    return Ok(CodecInfo::H264 { payload_type });
+                } else if codec_part.starts_with("H265") || codec_part.starts_with("HEVC") {
+                    return Ok(CodecInfo::H265 { payload_type });
+                }
+            }
+        }
+    }
+    Ok(CodecInfo::Unknown)
+}
+
+fn build_gstreamer_pipeline(port: u16, codec_info: &CodecInfo) -> anyhow::Result<gst::Pipeline> {
+    let pipeline = gst::Pipeline::new();
+
+    // Create UDP source
+    let udp_src = gst::ElementFactory::make("udpsrc")
+        .property("port", port as u32)
+        .build()
+        .map_err(|_| anyhow::anyhow!("Failed to create udpsrc"))?;
+
+    udp_src.set_property("caps", gst::Caps::builder("application/x-rtp").build());
+
+    // Create codec-specific elements
+    let (depayloader, parser, decoder): (gst::Element, gst::Element, gst::Element) =
+        match codec_info {
+            CodecInfo::H264 { .. } => (
+                gst::ElementFactory::make("rtph264depay")
+                    .build()
+                    .map_err(|_| anyhow::anyhow!("Failed to create rtph264depay"))?,
+                gst::ElementFactory::make("h264parse")
+                    .build()
+                    .map_err(|_| anyhow::anyhow!("Failed to create h264parse"))?,
+                gst::ElementFactory::make("avdec_h264")
+                    .build()
+                    .map_err(|_| anyhow::anyhow!("Failed to create avdec_h264"))?,
+            ),
+            CodecInfo::H265 { .. } => (
+                gst::ElementFactory::make("rtph265depay")
+                    .build()
+                    .map_err(|_| anyhow::anyhow!("Failed to create rtph265depay"))?,
+                gst::ElementFactory::make("h265parse")
+                    .build()
+                    .map_err(|_| anyhow::anyhow!("Failed to create h265parse"))?,
+                gst::ElementFactory::make("avdec_h265")
+                    .build()
+                    .map_err(|_| anyhow::anyhow!("Failed to create avdec_h265"))?,
+            ),
+            CodecInfo::Unknown => {
+                return Err(anyhow::anyhow!(
+                    "Unknown codec in SDP, cannot build pipeline"
+                ));
+            }
+        };
+
+    // Add all elements to pipeline
+    pipeline
+        .add_many([&udp_src, &depayloader, &parser, &decoder])
+        .map_err(|e| anyhow::anyhow!("Failed to add elements: {:?}", e))?;
+
+    // Link elements
+    udp_src
+        .link(&depayloader)
+        .map_err(|e| anyhow::anyhow!("Failed to link udpsrc to depayloader: {:?}", e))?;
+    depayloader
+        .link(&parser)
+        .map_err(|e| anyhow::anyhow!("Failed to link depayloader to parser: {:?}", e))?;
+    parser
+        .link(&decoder)
+        .map_err(|e| anyhow::anyhow!("Failed to link parser to decoder: {:?}", e))?;
+
+    // Add video converter and sink
+    let videoconvert = gst::ElementFactory::make("videoconvert")
+        .build()
+        .map_err(|_| anyhow::anyhow!("Failed to create videoconvert"))?;
+
+    let autovideosink = gst::ElementFactory::make("autovideosink")
+        .build()
+        .map_err(|_| anyhow::anyhow!("Failed to create autovideosink"))?;
+
+    pipeline
+        .add_many([&videoconvert, &autovideosink])
+        .map_err(|e| anyhow::anyhow!("Failed to add elements: {:?}", e))?;
+
+    decoder
+        .link(&videoconvert)
+        .map_err(|e| anyhow::anyhow!("Failed to link decoder to videoconvert: {:?}", e))?;
+    videoconvert
+        .link(&autovideosink)
+        .map_err(|e| anyhow::anyhow!("Failed to link videoconvert to autovideosink: {:?}", e))?;
+
+    Ok(pipeline)
 }

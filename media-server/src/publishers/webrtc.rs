@@ -1,5 +1,4 @@
-use anyhow::{Result, bail};
-use std::sync::atomic::{AtomicU64, Ordering};
+use anyhow::bail;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -63,8 +62,8 @@ impl WebrtcManager {
             ..Default::default()
         };
         let session_id = uuid::Uuid::new_v4();
-        let session_id_clone = session_id.clone();
-        let mut conn = self.api.new_peer_connection(config).await?;
+        let session_id_clone = session_id;
+        let conn = self.api.new_peer_connection(config).await?;
         conn.on_peer_connection_state_change(Box::new(move |state| {
             let app_state_clone = app_state.clone();
             Box::pin(async move {

@@ -51,10 +51,11 @@ async fn main() -> Result<()> {
     let mut port = 8009;
     let args: Vec<String> = std::env::args().collect();
     for i in 0..args.len() {
-        if args[i] == "--port" && i + 1 < args.len() {
-            if let Ok(p) = args[i + 1].parse::<u16>() {
-                port = p;
-            }
+        if args[i] == "--port"
+            && i + 1 < args.len()
+            && let Ok(p) = args[i + 1].parse::<u16>()
+        {
+            port = p;
         }
     }
 

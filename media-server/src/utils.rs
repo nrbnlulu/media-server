@@ -41,6 +41,7 @@ pub fn check_dependencies() -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn convert_h264_to_annex_b(data: Vec<u8>) -> Result<Vec<u8>> {
     let mut result = data;
     let mut i = 0;
@@ -72,37 +73,44 @@ pub fn convert_h264_to_annex_b(data: Vec<u8>) -> Result<Vec<u8>> {
     Ok(result)
 }
 
+#[allow(dead_code)]
 pub fn convert_h265_to_annex_b(data: Vec<u8>) -> Result<Vec<u8>> {
     convert_h264_to_annex_b(data)
 }
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
+#[allow(dead_code)]
 static PLACEHOLDER_FRAMES: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+#[allow(dead_code)]
 static PLACEHOLDER_FRAME_INDEX: AtomicUsize = AtomicUsize::new(0);
 
+#[allow(dead_code)]
 fn log_nal_units(data: &[u8]) {
     let mut i = 0;
     let mut nal_types = Vec::new();
 
     while i < data.len().saturating_sub(4) {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
-            if i + 4 < data.len() {
-                let nal_header = data[i + 4];
-                let nal_type = nal_header & 0x1F;
-                let nal_name = match nal_type {
-                    1 => "Non-IDR",
-                    5 => "IDR",
-                    6 => "SEI",
-                    7 => "SPS",
-                    8 => "PPS",
-                    9 => "AUD",
-                    _ => "Other",
-                };
-                nal_types.push(format!("{}({})", nal_name, nal_type));
-                i += 4;
-            }
+        if data[i] == 0
+            && data[i + 1] == 0
+            && data[i + 2] == 0
+            && data[i + 3] == 1
+            && i + 4 < data.len()
+        {
+            let nal_header = data[i + 4];
+            let nal_type = nal_header & 0x1F;
+            let nal_name = match nal_type {
+                1 => "Non-IDR",
+                5 => "IDR",
+                6 => "SEI",
+                7 => "SPS",
+                8 => "PPS",
+                9 => "AUD",
+                _ => "Other",
+            };
+            nal_types.push(format!("{}({})", nal_name, nal_type));
+            i += 4;
         }
         i += 1;
     }
@@ -114,6 +122,7 @@ fn log_nal_units(data: &[u8]) {
     );
 }
 
+#[allow(dead_code)]
 fn extract_all_h264_frames_from_mp4(mp4_data: &[u8]) -> Result<Vec<Vec<u8>>> {
     use gstreamer::prelude::*;
     use gstreamer_app as gst_app;
@@ -152,18 +161,11 @@ fn extract_all_h264_frames_from_mp4(mp4_data: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut frames = Vec::new();
     let timeout = gstreamer::ClockTime::from_mseconds(100);
 
-    loop {
-        match appsink.try_pull_sample(timeout) {
-            Some(sample) => {
-                let buffer = sample.buffer().unwrap();
-                let map = buffer.map_readable()?;
-                let h264_data = map.as_slice().to_vec();
-                frames.push(h264_data);
-            }
-            None => {
-                break;
-            }
-        }
+    while let Some(sample) = appsink.try_pull_sample(timeout) {
+        let buffer = sample.buffer().unwrap();
+        let map = buffer.map_readable()?;
+        let h264_data = map.as_slice().to_vec();
+        frames.push(h264_data);
     }
 
     let _ = pipeline.set_state(gstreamer::State::Null);
@@ -189,6 +191,7 @@ pub fn get_current_unix_timestamp() -> UnixTimestamp {
         .as_millis() as UnixTimestamp
 }
 
+#[allow(dead_code)]
 pub fn unix_epoch_to_system_time(epoch: u64) -> std::time::SystemTime {
     std::time::UNIX_EPOCH + std::time::Duration::from_micros(epoch)
 }
@@ -198,6 +201,7 @@ use std::fmt::Write;
 
 pub const DVR_DIRECTORY: &str = "dvr";
 
+#[allow(dead_code)]
 pub fn get_stream_hash(rtsp_url: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(rtsp_url.as_bytes());
@@ -210,6 +214,7 @@ pub fn get_stream_hash(rtsp_url: &str) -> String {
     hash_string
 }
 
+#[allow(dead_code)]
 pub fn get_dvr_path(source_id: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(DVR_DIRECTORY).join(format!("{}.mp4", source_id))
 }

@@ -177,7 +177,7 @@ impl RtspClient {
                         }
                     }
 
-                    *self.codec.lock().await = Some(metadata.codec.clone());
+                    *self.codec.lock().await = Some(metadata.codec);
                     self.set_state(StreamState::Running).await;
                 }
 
@@ -288,8 +288,8 @@ impl RtspClient {
             let timebase = TimeBase::from_ffmpeg(video_stream.time_base())?;
             let video_metadata = FFmpegVideoMetadata {
                 codec: detected_codec,
-                extradata: extradata,
-                parameters: parameters,
+                extradata,
+                parameters,
                 timebase,
             };
             // Try to send metadata - it's ok if the receiver already has it (channel full)
@@ -597,7 +597,7 @@ impl VideoSource for RtspClient {
     }
 
     async fn codec(&self) -> Option<VideoCodec> {
-        self.codec.lock().await.clone()
+        *self.codec.lock().await
     }
 
     async fn stop(&self) -> anyhow::Result<()> {

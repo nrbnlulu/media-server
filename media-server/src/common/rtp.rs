@@ -295,7 +295,7 @@ impl FfmpegConsumer for RtpPacketizer {
         }
 
         let stream_state = SrcStreamState {
-            codec: metadata.codec.clone(),
+            codec: metadata.codec,
             parsed_extradata,
             codec_params,
             timebase: metadata.timebase.clone(),
@@ -367,28 +367,28 @@ impl FfmpegConsumer for RtpPacketizer {
                 nal_units = Some(nal_units_);
             }
 
-            (config.codec.clone(), nal_units)
+            (config.codec, nal_units)
         };
 
-        if let Some(nal_units) = nal_units {
-            if !nal_units.is_empty() {
-                let rtp_frames = self.packetize(&nal_units, timestamp, &codec);
-                let consumers = self.consumers.lock().clone();
+        if let Some(nal_units) = nal_units
+            && !nal_units.is_empty()
+        {
+            let rtp_frames = self.packetize(&nal_units, timestamp, &codec);
+            let consumers = self.consumers.lock().clone();
 
-                if consumers.is_empty() {
-                    return Ok(());
-                }
+            if consumers.is_empty() {
+                return Ok(());
+            }
 
-                // Send frames directly to consumers without spawning tasks
-                // This reduces overhead significantly for real-time streaming
-                for frame in rtp_frames {
-                    let arc_frame = Arc::new(frame);
-                    let mut tasks = Vec::new();
-                    for consumer in &consumers {
-                        tasks.push(consumer.on_new_packet(arc_frame.clone()));
-                    }
-                    join_all(tasks).await;
+            // Send frames directly to consumers without spawning tasks
+            // This reduces overhead significantly for real-time streaming
+            for frame in rtp_frames {
+                let arc_frame = Arc::new(frame);
+                let mut tasks = Vec::new();
+                for consumer in &consumers {
+                    tasks.push(consumer.on_new_packet(arc_frame.clone()));
                 }
+                join_all(tasks).await;
             }
         }
         Ok(())
@@ -402,7 +402,7 @@ impl FfmpegConsumer for RtpPacketizer {
                 let _ = c.finalize().await;
             });
         }
-        while let Some(_) = task_set.join_next().await {}
+        while task_set.join_next().await.is_some() {}
         Ok(())
     }
 }
@@ -450,12 +450,7 @@ impl RtpStitcher {
         // of discontinuity likely indicates a source switch
         if self.has_received_packet.load(Ordering::Relaxed) {
             let last_input = self.last_input_ts.load(Ordering::Relaxed);
-            let delta = if orig_ts >= last_input {
-                orig_ts - last_input
-            } else {
-                // Handle wraparound or backwards jump
-                last_input - orig_ts
-            };
+            let delta = orig_ts.abs_diff(last_input);
 
             // If delta > 1 second of RTP time, assume source switch
             const SOURCE_SWITCH_THRESHOLD: u32 = 90000; // 1 second at 90kHz
@@ -735,7 +730,7 @@ mod tests {
         let packetizer = RtpPacketizer::new(12345, 96);
         let nal = vec![0x67, 0x42, 0x00, 0x1e];
 
-        let frames = packetizer.packetize(&[nal.clone()], 0, &VideoCodec::H264);
+        let frames = packetizer.packetize(std::slice::from_ref(&nal), 0, &VideoCodec::H264);
         assert_eq!(frames.len(), 1);
 
         // Payload should match the NAL unit

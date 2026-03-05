@@ -32,7 +32,7 @@ struct RecordingState {
 
 impl RecordingState {
     fn new(
-        path: &PathBuf,
+        path: &std::path::Path,
         codec: &VideoCodec,
         start_time: UnixTimestamp,
         framing_format: FramingFormat,
@@ -83,7 +83,7 @@ impl RecordingState {
         sink.set_property("location", path.to_str().unwrap());
         sink.set_property("sync", false);
 
-        pipeline.add_many(&[&appsrc, &parser, &mux, &sink])?;
+        pipeline.add_many([&appsrc, &parser, &mux, &sink])?;
         appsrc
             .link(&parser)
             .map_err(|_| anyhow::anyhow!("Failed to link appsrc to parser"))?;
@@ -103,8 +103,8 @@ impl RecordingState {
 
         Ok(Self {
             pipeline,
-            file_path: path.clone(),
-            codec: codec.clone(),
+            file_path: path.to_path_buf(),
+            codec: *codec,
             waiting_for_keyframe: true,
             start_time,
             appsrc: appsrc_typed,
@@ -426,12 +426,12 @@ impl FfmpegConsumer for DvrRecorder {
     async fn on_new_packet(&self, packet: Arc<ffmpeg::Packet>) -> Result<()> {
         let mut state_guard = self.recording_state.lock();
 
-        if let Some(state) = state_guard.as_mut() {
-            if let Some(data) = packet.data() {
-                let is_key = packet.is_key();
-                let nal_units = state.parse_nal_units(data);
-                state.write_nal_data(&nal_units, is_key)?;
-            }
+        if let Some(state) = state_guard.as_mut()
+            && let Some(data) = packet.data()
+        {
+            let is_key = packet.is_key();
+            let nal_units = state.parse_nal_units(data);
+            state.write_nal_data(&nal_units, is_key)?;
         }
 
         Ok(())

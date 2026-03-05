@@ -41,6 +41,7 @@ pub enum ClientSessionState {
     Dvr(Arc<DvrPlayer>, Option<Arc<tokio::task::JoinHandle<()>>>),
 }
 
+#[allow(dead_code)]
 struct ClientSession {
     id: ClientSessionId,
     source_id: VideoSourceId,
@@ -108,39 +109,76 @@ impl ClientSession {
 
     pub async fn seek(&self, timestamp: UnixTimestamp, codec: &VideoCodec) -> Result<()> {
         let mut state_guard = self.state.lock().await;
-        // first check that we're on dvr mode otherwise disable the live packetizer
         match *state_guard {
             ClientSessionState::Dvr(ref player, _) => {
+                // Validate timestamp against current recording bounds before seeking
+                let metadata = player.recording_metadata().await;
+                if timestamp < metadata.start_time {
+                    bail!("seek before start");
+                }
+                if let Some(end_time) = metadata.end_time && timestamp > end_time {
+                        bail!("seek after end");
+                }
                 player.seek_to_timestamp(timestamp, 1.0).await?;
+                Ok(())
             }
             ClientSessionState::Live => {
-                // Remove from live packetizer - we'll feed from DVR instead
-                self.live_packetizer
-                    .remove_consumer(self.stitching_consumer.as_ref());
+                // Validate timestamp before switching mode — don't enter DVR if no recording exists
+                if filesystem::find_recording_for_timestamp(&self.source_id, timestamp).is_none() {
+                    bail!("No recording found for timestamp {}", timestamp);
+                }
                 // Create DVR player that feeds into the same stitching consumer
                 let player = DvrPlayer::new(
                     self.source_id.clone(),
                     timestamp,
-                    codec.clone(),
+                    *codec,
                     self.stitching_consumer.clone(),
                 )?;
                 let player = Arc::new(player);
-                *state_guard = ClientSessionState::Dvr(player.clone(), None);
+
+                // Remove from live packetizer FIRST to prevent live packet leaking during DVR startup
+                self.live_packetizer
+                    .remove_consumer(self.stitching_consumer.as_ref());
+
                 let player_clone = player.clone();
-                let join_handle = tokio::spawn(async move {
-                    player_clone.play().await;
-                });
-                *state_guard = ClientSessionState::Dvr(player.clone(), Some(Arc::new(join_handle)));
+                match player.play().await {
+                    Ok(join_handle) => {
+                        *state_guard =
+                            ClientSessionState::Dvr(player.clone(), Some(Arc::new(join_handle)));
+
+                        // Notify the client of the mode change
+                        self.publisher
+                            .on_session_mode_change(SessionMode::Dvr { timestamp })
+                            .await;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = player_clone.terminate().await;
+                        // Re-add so live stream is restored
+                        self.live_packetizer
+                            .add_consumer(self.stitching_consumer.clone());
+                        Err(e)
+                    }
+                }
             }
-        };
-        drop(state_guard);
+        }
+    }
 
-        // Notify the client of the mode change
-        self.publisher
-            .on_session_mode_change(SessionMode::Dvr { timestamp })
-            .await;
-
-        Ok(())
+    async fn terminate(&self) {
+        let state = self.state.lock().await;
+        match *state {
+            ClientSessionState::Live => {
+                // not much to do
+            }
+            ClientSessionState::Dvr(ref player, ref join_handle) => {
+                if let Some(join_handle) = join_handle {
+                    join_handle.abort();
+                }
+                if let Err(e) = player.terminate().await {
+                    log::error!("Failed to terminate DVR player: {}", e);
+                }
+            }
+        }
     }
 }
 pub struct GlobalState {
@@ -219,7 +257,6 @@ impl GlobalState {
         let rtsp_client_clone = rtsp_client.clone();
         let handle = tokio::spawn(async move {
             rtsp_client_clone.execute().await;
-            ()
         });
 
         self.sources.insert(
@@ -261,7 +298,7 @@ impl GlobalState {
 
         Ok(StreamInfo {
             source_id: source_id.clone(),
-            rtsp_inputs: source.source.inputs().iter().cloned().collect(),
+            rtsp_inputs: source.source.inputs().to_vec(),
             state,
             should_record: source.source.config().should_record,
             restart_interval_secs: source.source.config().restart_interval_secs,
@@ -327,24 +364,19 @@ impl GlobalState {
                 )
                 .await?;
 
-            let session_id = session.id().clone();
-            let client_session = ClientSession::new_live(
-                session_id.clone(),
-                source_id,
-                session.clone(),
-                packetizer.clone(),
-            );
+            let session_id = *session.id();
+            let client_session =
+                ClientSession::new_live(session_id, source_id, session.clone(), packetizer.clone());
             // Add the stitching consumer to packetizer (not the raw session)
             packetizer.add_consumer(client_session.stitching_consumer.clone());
-            self.client_sessions
-                .insert(session_id.clone(), client_session);
+            self.client_sessions.insert(session_id, client_session);
             Ok((session_id, answer_sdp))
         } else {
             bail!("Stream not found")
         }
     }
     pub async fn delete_webrtc_session(&self, session_id: &ClientSessionId) -> anyhow::Result<()> {
-        self.delete_client_session(session_id)?;
+        self.delete_client_session(session_id).await?;
         self.webrtc_manager.delete_session(session_id).await
     }
 
@@ -380,13 +412,14 @@ impl GlobalState {
         }
     }
 
-    pub fn delete_client_session(&self, session_id: &ClientSessionId) -> anyhow::Result<()> {
+    pub async fn delete_client_session(&self, session_id: &ClientSessionId) -> anyhow::Result<()> {
         if let Some((_id, session)) = self.client_sessions.remove(session_id) {
             if let Some(ref source) = self.sources.get(session.source_id()) {
                 // Remove the stitching consumer from the packetizer
                 source
                     .rtp_packetizer
                     .remove_consumer(session.stitching_consumer.as_ref());
+                session.terminate().await;
             } else {
                 log::error!("Stream not found, shouldn't be possible");
             }
@@ -397,7 +430,7 @@ impl GlobalState {
     }
 
     pub async fn delete_wsc_rtp_session(&self, id: &ClientSessionId) -> Result<()> {
-        self.delete_client_session(id)?;
+        self.delete_client_session(id).await?;
         if let Some((_, publisher)) = self.wsc_publishers.remove(id) {
             publisher.shutdown();
         }
@@ -429,7 +462,7 @@ impl GlobalState {
     ) -> Result<()> {
         if let Some(ref session) = self.client_sessions.get(session_id) {
             if let Some(source) = self.sources.get(session.source_id()).as_ref() {
-                let codec = source.value().source.codec().await.clone().ok_or(anyhow!(
+                let codec = source.value().source.codec().await.ok_or(anyhow!(
                     "source is not ready, no codec...\n try again later"
                 ))?;
                 return session.seek(timestamp, &codec).await;
@@ -483,7 +516,7 @@ impl GlobalState {
                 let state = entry.value().state.lock().await;
                 let is_live = matches!(*state, ClientSessionState::Live);
                 sessions.push(media_server_api_models::WebRtcSessionResponse {
-                    session_id: entry.key().clone(),
+                    session_id: *entry.key(),
                     source_id: source_id.clone(),
                     is_live,
                 });
