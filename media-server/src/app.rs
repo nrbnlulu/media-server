@@ -109,15 +109,26 @@ impl ClientSession {
 
     pub async fn seek(&self, timestamp: UnixTimestamp, codec: &VideoCodec) -> Result<()> {
         let mut state_guard = self.state.lock().await;
-        // first check that we're on dvr mode otherwise disable the live packetizer
         match *state_guard {
             ClientSessionState::Dvr(ref player, _) => {
+                // Validate timestamp against current recording bounds before seeking
+                let metadata = player.recording_metadata().await;
+                if timestamp < metadata.start_time {
+                    bail!("seek before start");
+                }
+                if let Some(end_time) = metadata.end_time {
+                    if timestamp > end_time {
+                        bail!("seek after end");
+                    }
+                }
                 player.seek_to_timestamp(timestamp, 1.0).await?;
+                Ok(())
             }
             ClientSessionState::Live => {
-                // Remove from live packetizer - we'll feed from DVR instead
-                self.live_packetizer
-                    .remove_consumer(self.stitching_consumer.as_ref());
+                // Validate timestamp before switching mode — don't enter DVR if no recording exists
+                if filesystem::find_recording_for_timestamp(&self.source_id, timestamp).is_none() {
+                    bail!("No recording found for timestamp {}", timestamp);
+                }
                 // Create DVR player that feeds into the same stitching consumer
                 let player = DvrPlayer::new(
                     self.source_id.clone(),
@@ -126,22 +137,33 @@ impl ClientSession {
                     self.stitching_consumer.clone(),
                 )?;
                 let player = Arc::new(player);
-                *state_guard = ClientSessionState::Dvr(player.clone(), None);
+
+                // Remove from live packetizer FIRST to prevent live packet leaking during DVR startup
+                self.live_packetizer
+                    .remove_consumer(self.stitching_consumer.as_ref());
+
                 let player_clone = player.clone();
-                let join_handle = tokio::spawn(async move {
-                    player_clone.play().await;
-                });
-                *state_guard = ClientSessionState::Dvr(player.clone(), Some(Arc::new(join_handle)));
+                match player.play().await {
+                    Ok(join_handle) => {
+                        *state_guard =
+                            ClientSessionState::Dvr(player.clone(), Some(Arc::new(join_handle)));
+
+                        // Notify the client of the mode change
+                        self.publisher
+                            .on_session_mode_change(SessionMode::Dvr { timestamp })
+                            .await;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = player_clone.terminate().await;
+                        // Re-add so live stream is restored
+                        self.live_packetizer
+                            .add_consumer(self.stitching_consumer.clone());
+                        Err(e)
+                    }
+                }
             }
-        };
-        drop(state_guard);
-
-        // Notify the client of the mode change
-        self.publisher
-            .on_session_mode_change(SessionMode::Dvr { timestamp })
-            .await;
-
-        Ok(())
+        }
     }
 }
 pub struct GlobalState {

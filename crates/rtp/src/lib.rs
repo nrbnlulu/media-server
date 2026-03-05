@@ -85,7 +85,7 @@ impl RtpPacket {
     /// Check if packet is empty
     #[inline]
     pub fn is_empty(&self) -> bool {
-        false
+        self.payload.is_empty()
     }
 }
 

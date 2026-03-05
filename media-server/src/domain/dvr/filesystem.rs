@@ -92,11 +92,6 @@ pub fn list_recordings_for_stream_id(stream_id: &VideoSourceId) -> Result<Vec<Re
                 // check that file size is greater than 663 (default metadata)
                 let file_size = fs::metadata(&path)?.len();
                 if file_size > 663 {
-                    if end_time.is_none()
-                        && let Some(duration_ms) = probe_mp4_duration_ms(&path)
-                    {
-                        end_time = Some(start_time.saturating_add(duration_ms));
-                    }
                     recordings.push(RecordingMetadata {
                         path,
                         start_time,
@@ -159,18 +154,4 @@ pub fn find_recording_for_timestamp(
         }
     }
     None
-}
-
-fn probe_mp4_duration_ms(path: &std::path::Path) -> Option<u64> {
-    let ictx = ffmpeg::format::input(path.to_str()?).ok()?;
-    let video_stream = ictx.streams().best(ffmpeg::media::Type::Video)?;
-    let time_base = video_stream.time_base();
-    let duration_ts = video_stream.duration();
-    if duration_ts <= 0 || time_base.denominator() == 0 {
-        return None;
-    }
-    Some(
-        ((duration_ts as u128) * 1000 * time_base.numerator() as u128
-            / time_base.denominator() as u128) as u64,
-    )
 }

@@ -21,36 +21,86 @@ struct CurrentPipelineState {
     speed: f64,
     recording_metadata: RecordingMetadata,
     initial_time: UnixTimestamp,
+    /// task that sends RTP packets to the consumer from gstreamer callbacks
+    sender_handle: tokio::task::JoinHandle<()>,
 }
 
 impl CurrentPipelineState {
     async fn stop(&self) -> anyhow::Result<()> {
-        let _ = self.pipeline.send_event(gst::event::Eos::new());
-        let mut bus_stream = self.bus.stream();
-        while let Some(msg) = bus_stream.next().await {
-            match msg.view() {
-                gst::MessageView::Eos(_) => break,
-                _ => continue,
-            }
-        }
-        self.pipeline
-            .set_state(gst::State::Null)
-            .map_err(|e| anyhow!("failed to stop pipeline {e}"))?;
+        self.sender_handle.abort();
+        // ideally you'd send EOS and wait for the bus to drain before setting Null
+        // but sometimes the pipeline wasn't even running so you'd hang here forever
+        let _ = self.pipeline.set_state(gst::State::Null);
         Ok(())
+    }
+
+    /// Wait for the pipeline to reach the target state with a timeout
+    async fn wait_for_state(&self, target: gst::State) -> anyhow::Result<()> {
+        let bus = self.pipeline.bus().ok_or_else(|| anyhow!("no bus"))?;
+        let mut stream = bus.stream();
+        let timeout = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(msg) = stream.next().await {
+                match msg.view() {
+                    gst::MessageView::StateChanged(changed) => {
+                        if changed.current() == target {
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                    }
+                    gst::MessageView::Eos(_) => {
+                        bail!("Pipeline reached EOS before state change completed");
+                    }
+                    gst::MessageView::Error(err) => {
+                        bail!("Pipeline error during state change: {:?}", err);
+                    }
+                    _ => {}
+                }
+            }
+            bail!("Bus stream ended before state change completed");
+        });
+        timeout.await??;
+        Ok(())
+    }
+
+    /// Wait for qtdemux to have parsed enough metadata to enable seeking
+    async fn wait_for_demuxer_ready(&self) -> anyhow::Result<()> {
+        let timeout = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                // For live fMP4, duration may be None, but we can check if the pipeline
+                // is seekable by querying position or checking if demuxer has pads
+                if self.pipeline.query_position::<gst::ClockTime>().is_some() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+        timeout.await?;
+        Ok(())
+    }
+
+    fn seek_to_offset(&self, timestamp: UnixTimestamp) -> anyhow::Result<()> {
+        let offset_ms = timestamp.saturating_sub(self.recording_metadata.start_time);
+        let seek_pos = gst::ClockTime::from_mseconds(offset_ms);
+        log::debug!("DVR seek to {} (offset_ms={})", timestamp, offset_ms);
+        self.pipeline
+            .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, seek_pos)
+            .map_err(|e| anyhow!("Seek failed: {e}"))
     }
 
     async fn play(&self) -> anyhow::Result<()> {
         self.pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| anyhow!("failed to play pipeline {e}"))?;
-        let offset_ms = self
-            .initial_time
-            .saturating_sub(self.recording_metadata.start_time);
-        if offset_ms > 0 {
-            let seek_pos = gst::ClockTime::from_mseconds(offset_ms);
-            self.pipeline
-                .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, seek_pos)
-                .map_err(|e| anyhow!("initial seek failed: {e}"))?;
+
+        // Wait for pipeline to reach Playing state
+        self.wait_for_state(gst::State::Playing).await?;
+
+        // Wait for qtdemux to have parsed enough metadata for seeking
+        self.wait_for_demuxer_ready().await?;
+
+        if self.initial_time >= self.recording_metadata.start_time {
+            self.seek_to_offset(self.initial_time)?;
+        } else {
+            bail!("initial time is before recording start time");
         }
         Ok(())
     }
@@ -143,14 +193,14 @@ impl DvrPlayer {
     ) -> anyhow::Result<CurrentPipelineState> {
         match res {
             Some((recording, None)) => {
-                let (pipeline, bus) =
-                    create_pipeline(&recording, initial_start_time, codec, consumer)?;
+                let (pipeline, bus, sender_handle) = create_pipeline(&recording, codec, consumer)?;
                 Ok(CurrentPipelineState {
                     pipeline,
                     bus,
                     speed: 1.0,
                     recording_metadata: recording,
                     initial_time: initial_start_time,
+                    sender_handle,
                 })
             }
             // FIXME: maybe we should wait until the recording is available?
@@ -158,30 +208,23 @@ impl DvrPlayer {
         }
     }
 
-    pub async fn play(&self) {
-        let join_handle = {
-            let bus = {
-                let state = self.state.lock().await;
-                if let Err(e) = state.play().await {
-                    log::error!("Failed to play pipeline: {}", e);
-                    return;
+    /// returns EOS watcher task
+    pub async fn play(&self) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+        let state = self.state.lock().await;
+        state.play().await?;
+        let bus = state.bus.clone();
+        drop(state);
+        let join_handle = tokio::spawn(async move {
+            let mut bus_stream = bus.stream();
+            while let Some(msg) = bus_stream.next().await {
+                if let gst::MessageView::Eos(_) = msg.view() {
+                    log::warn!("EOS is not expected");
+                    break;
                 }
-                // wait for EOS task
-                state.bus.clone()
-            };
+            }
+        });
 
-            tokio::spawn(async move {
-                let mut bus_stream = bus.stream();
-                while let Some(msg) = bus_stream.next().await {
-                    if let gst::MessageView::Eos(_) = msg.view() {
-                        // check the TODO.md
-                        log::warn!("EOS is not expected");
-                        break;
-                    }
-                }
-            })
-        };
-        let _ = join_handle.await;
+        Ok(join_handle)
     }
 
     pub async fn terminate(&self) -> Result<()> {
@@ -189,39 +232,24 @@ impl DvrPlayer {
         state_guard.stop().await
     }
 
-    pub async fn seek_to_timestamp(&self, timestamp: u64, _speed: f64) -> Result<(), SeekError> {
-        {
-            let state_guard = self.state.lock().await;
+    pub async fn recording_metadata(&self) -> RecordingMetadata {
+        self.state.lock().await.recording_metadata.clone()
+    }
 
-            if timestamp < state_guard.recording_metadata.start_time {
-                return Err(SeekError::SeekBeforeStart);
-            }
-            if let Some(end_time) = state_guard.recording_metadata.end_time
-                && timestamp > end_time
-            {
-                return Err(SeekError::SeekAfterEnd);
-            }
-            let offset_ms = timestamp.saturating_sub(state_guard.recording_metadata.start_time);
-            let start = gst::ClockTime::from_mseconds(offset_ms);
-            log::debug!("DVR seek to {} (offset_ms={})", timestamp, offset_ms);
-            state_guard
-                .pipeline
-                .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, start)
-                .map_err(|e| anyhow::anyhow!(format!("Seek failed: {}", e)))
-                .map_err(SeekError::GstError)?;
-        }
+    pub async fn seek_to_timestamp(&self, timestamp: u64, _speed: f64) -> Result<(), SeekError> {
+        let state_guard = self.state.lock().await;
+        state_guard
+            .seek_to_offset(timestamp)
+            .map_err(SeekError::GstError)?;
         Ok(())
     }
 }
 
 fn create_pipeline(
     recording: &RecordingMetadata,
-    _initial_time: UnixTimestamp,
-    // FIXME: we know that based on the current source (rtsp) codec
-    // FIXME: thus if it changed somehow mid stream we're doomed.
     src_codec: &VideoCodec,
     consumer: Arc<dyn RtpConsumer>,
-) -> Result<(gst::Pipeline, gst::Bus)> {
+) -> Result<(gst::Pipeline, gst::Bus, tokio::task::JoinHandle<()>)> {
     let path_str = recording.path.to_string_lossy().to_string();
     log::info!("Opening DVR file: {}", path_str);
 
@@ -342,7 +370,7 @@ fn create_pipeline(
     let rtp_packetizer = RtpPacketizer::new(rand::random::<u32>(), 96);
     let codec_clone = *src_codec;
 
-    let _sender_handle = tokio::spawn(async move {
+    let sender_handle = tokio::spawn(async move {
         let mut frame_count = 0u64;
         while let Some((raw_data, pts)) = packet_rx.recv().await {
             // Convert PTS from nanoseconds to RTP timestamp (90kHz clock)
@@ -408,8 +436,8 @@ fn create_pipeline(
             }
         }
     });
-    let bus = pipeline.bus().ok_or(anyhow!("no bust"))?;
-    Ok((pipeline, bus))
+    let bus = pipeline.bus().ok_or(anyhow!("no bus"))?;
+    Ok((pipeline, bus, sender_handle))
 }
 
 #[derive(Debug, thiserror::Error)]

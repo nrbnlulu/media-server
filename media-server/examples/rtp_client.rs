@@ -364,70 +364,55 @@ fn build_gstreamer_pipeline(port: u16, codec_info: &CodecInfo) -> anyhow::Result
         .build()
         .map_err(|_| anyhow::anyhow!("Failed to create udpsrc"))?;
 
-    // Create RTP depayloader and decoder based on codec
-    let (_depayloader, decoder): (gst::Element, gst::Element) = match codec_info {
-        CodecInfo::H264 { payload_type: _ } => {
-            udp_src.set_property("caps", gst::Caps::builder("application/x-rtp").build());
+    udp_src.set_property("caps", gst::Caps::builder("application/x-rtp").build());
 
-            let depayloader = gst::ElementFactory::make("rtph264depay")
-                .build()
-                .map_err(|_| anyhow::anyhow!("Failed to create rtph264depay"))?;
+    // Create codec-specific elements
+    let (depayloader, parser, decoder): (gst::Element, gst::Element, gst::Element) =
+        match codec_info {
+            CodecInfo::H264 { .. } => (
+                gst::ElementFactory::make("rtph264depay")
+                    .build()
+                    .map_err(|_| anyhow::anyhow!("Failed to create rtph264depay"))?,
+                gst::ElementFactory::make("h264parse")
+                    .build()
+                    .map_err(|_| anyhow::anyhow!("Failed to create h264parse"))?,
+                gst::ElementFactory::make("avdec_h264")
+                    .build()
+                    .map_err(|_| anyhow::anyhow!("Failed to create avdec_h264"))?,
+            ),
+            CodecInfo::H265 { .. } => (
+                gst::ElementFactory::make("rtph265depay")
+                    .build()
+                    .map_err(|_| anyhow::anyhow!("Failed to create rtph265depay"))?,
+                gst::ElementFactory::make("h265parse")
+                    .build()
+                    .map_err(|_| anyhow::anyhow!("Failed to create h265parse"))?,
+                gst::ElementFactory::make("avdec_h265")
+                    .build()
+                    .map_err(|_| anyhow::anyhow!("Failed to create avdec_h265"))?,
+            ),
+            CodecInfo::Unknown => {
+                return Err(anyhow::anyhow!(
+                    "Unknown codec in SDP, cannot build pipeline"
+                ));
+            }
+        };
 
-            let parser = gst::ElementFactory::make("h264parse")
-                .build()
-                .map_err(|_| anyhow::anyhow!("Failed to create h264parse"))?;
+    // Add all elements to pipeline
+    pipeline
+        .add_many([&udp_src, &depayloader, &parser, &decoder])
+        .map_err(|e| anyhow::anyhow!("Failed to add elements: {:?}", e))?;
 
-            let decoder = gst::ElementFactory::make("avdec_h264")
-                .build()
-                .map_err(|_| anyhow::anyhow!("Failed to create avdec_h264"))?;
-
-            pipeline
-                .add_many([&udp_src, &depayloader, &parser, &decoder])
-                .map_err(|e| anyhow::anyhow!("Failed to add elements: {:?}", e))?;
-
-            udp_src
-                .link(&depayloader)
-                .map_err(|e| anyhow::anyhow!("Failed to link udpsrc to depayloader: {:?}", e))?;
-            depayloader
-                .link(&parser)
-                .map_err(|e| anyhow::anyhow!("Failed to link depayloader to parser: {:?}", e))?;
-
-            (depayloader, decoder)
-        }
-        CodecInfo::H265 { payload_type: _ } => {
-            udp_src.set_property("caps", gst::Caps::builder("application/x-rtp").build());
-
-            let depayloader = gst::ElementFactory::make("rtph265depay")
-                .build()
-                .map_err(|_| anyhow::anyhow!("Failed to create rtph265depay"))?;
-
-            let parser = gst::ElementFactory::make("h265parse")
-                .build()
-                .map_err(|_| anyhow::anyhow!("Failed to create h265parse"))?;
-
-            let decoder = gst::ElementFactory::make("avdec_h265")
-                .build()
-                .map_err(|_| anyhow::anyhow!("Failed to create avdec_h265"))?;
-
-            pipeline
-                .add_many([&udp_src, &depayloader, &parser, &decoder])
-                .map_err(|e| anyhow::anyhow!("Failed to add elements: {:?}", e))?;
-
-            udp_src
-                .link(&depayloader)
-                .map_err(|e| anyhow::anyhow!("Failed to link udpsrc to depayloader: {:?}", e))?;
-            depayloader
-                .link(&parser)
-                .map_err(|e| anyhow::anyhow!("Failed to link depayloader to parser: {:?}", e))?;
-
-            (depayloader, decoder)
-        }
-        CodecInfo::Unknown => {
-            return Err(anyhow::anyhow!(
-                "Unknown codec in SDP, cannot build pipeline"
-            ));
-        }
-    };
+    // Link elements
+    udp_src
+        .link(&depayloader)
+        .map_err(|e| anyhow::anyhow!("Failed to link udpsrc to depayloader: {:?}", e))?;
+    depayloader
+        .link(&parser)
+        .map_err(|e| anyhow::anyhow!("Failed to link depayloader to parser: {:?}", e))?;
+    parser
+        .link(&decoder)
+        .map_err(|e| anyhow::anyhow!("Failed to link parser to decoder: {:?}", e))?;
 
     // Add video converter and sink
     let videoconvert = gst::ElementFactory::make("videoconvert")
