@@ -116,10 +116,8 @@ impl ClientSession {
                 if timestamp < metadata.start_time {
                     bail!("seek before start");
                 }
-                if let Some(end_time) = metadata.end_time {
-                    if timestamp > end_time {
+                if let Some(end_time) = metadata.end_time && timestamp > end_time {
                         bail!("seek after end");
-                    }
                 }
                 player.seek_to_timestamp(timestamp, 1.0).await?;
                 Ok(())
@@ -161,6 +159,23 @@ impl ClientSession {
                             .add_consumer(self.stitching_consumer.clone());
                         Err(e)
                     }
+                }
+            }
+        }
+    }
+
+    async fn terminate(&self) {
+        let state = self.state.lock().await;
+        match *state {
+            ClientSessionState::Live => {
+                // not much to do
+            }
+            ClientSessionState::Dvr(ref player, ref join_handle) => {
+                if let Some(join_handle) = join_handle {
+                    join_handle.abort();
+                }
+                if let Err(e) = player.terminate().await {
+                    log::error!("Failed to terminate DVR player: {}", e);
                 }
             }
         }
@@ -361,7 +376,7 @@ impl GlobalState {
         }
     }
     pub async fn delete_webrtc_session(&self, session_id: &ClientSessionId) -> anyhow::Result<()> {
-        self.delete_client_session(session_id)?;
+        self.delete_client_session(session_id).await?;
         self.webrtc_manager.delete_session(session_id).await
     }
 
@@ -397,13 +412,14 @@ impl GlobalState {
         }
     }
 
-    pub fn delete_client_session(&self, session_id: &ClientSessionId) -> anyhow::Result<()> {
+    pub async fn delete_client_session(&self, session_id: &ClientSessionId) -> anyhow::Result<()> {
         if let Some((_id, session)) = self.client_sessions.remove(session_id) {
             if let Some(ref source) = self.sources.get(session.source_id()) {
                 // Remove the stitching consumer from the packetizer
                 source
                     .rtp_packetizer
                     .remove_consumer(session.stitching_consumer.as_ref());
+                session.terminate().await;
             } else {
                 log::error!("Stream not found, shouldn't be possible");
             }
@@ -414,7 +430,7 @@ impl GlobalState {
     }
 
     pub async fn delete_wsc_rtp_session(&self, id: &ClientSessionId) -> Result<()> {
-        self.delete_client_session(id)?;
+        self.delete_client_session(id).await?;
         if let Some((_, publisher)) = self.wsc_publishers.remove(id) {
             publisher.shutdown();
         }

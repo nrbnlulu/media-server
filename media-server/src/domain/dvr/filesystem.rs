@@ -82,7 +82,7 @@ pub fn list_recordings_for_stream_id(stream_id: &VideoSourceId) -> Result<Vec<Re
             if parts.len() == 2
                 && let Ok(start_time) = parts[0].parse::<u64>()
             {
-                let mut end_time = if parts[1] == "latest" {
+                let end_time = if parts[1] == "latest" {
                     None
                 } else {
                     parts[1].parse::<u64>().ok()

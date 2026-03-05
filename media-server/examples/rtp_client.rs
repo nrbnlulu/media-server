@@ -424,7 +424,7 @@ fn build_gstreamer_pipeline(port: u16, codec_info: &CodecInfo) -> anyhow::Result
         .map_err(|_| anyhow::anyhow!("Failed to create autovideosink"))?;
 
     pipeline
-        .add_many([&decoder, &videoconvert, &autovideosink])
+        .add_many([&videoconvert, &autovideosink])
         .map_err(|e| anyhow::anyhow!("Failed to add elements: {:?}", e))?;
 
     decoder
