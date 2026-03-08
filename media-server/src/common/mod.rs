@@ -53,7 +53,6 @@ impl TimeBase {
 pub struct FFmpegVideoMetadata {
     pub codec: VideoCodec,
     pub extradata: Option<Vec<u8>>,
-    pub parameters: ffmpeg::codec::Parameters,
     pub timebase: TimeBase,
 }
 

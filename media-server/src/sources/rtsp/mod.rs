@@ -289,7 +289,6 @@ impl RtspClient {
             let video_metadata = FFmpegVideoMetadata {
                 codec: detected_codec,
                 extradata,
-                parameters,
                 timebase,
             };
             // Try to send metadata - it's ok if the receiver already has it (channel full)
