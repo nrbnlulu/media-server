@@ -138,30 +138,38 @@ impl RecordingState {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
-        // emit EOS event to the pipeline
-        let _ = self.appsrc.end_of_stream()?;
+        // Emit EOS event to the pipeline to signal end of stream
+        let _ = self.appsrc.end_of_stream();
+
         let bus = self
             .pipeline
             .bus()
             .ok_or_else(|| anyhow::anyhow!("Pipeline has no bus"))?;
-        // wait for EOS or error message
+
+        // Wait for EOS or error message with a reasonable timeout
+        // DVR recordings may have buffered data that needs to be flushed
         if let Some(msg) = bus.timed_pop_filtered(
-            gst::ClockTime::from_seconds(5),
+            gst::ClockTime::from_seconds(10),
             &[gst::MessageType::Eos, gst::MessageType::Error],
         ) {
             match msg.view() {
                 gst::MessageView::Error(err) => {
-                    eprintln!("Error during EOS: {}", err.error());
+                    log::warn!("Error during EOS: {}", err.error());
                 }
                 gst::MessageView::Eos(_) => {
-                    println!("Stream finished successfully.");
+                    log::debug!("DVR stream finished successfully.");
                 }
                 _ => (),
             }
         } else {
-            println!("Shutdown timed out after 5 seconds.");
+            log::warn!("DVR shutdown timed out after 10 seconds, forcing cleanup.");
         }
 
+        // Set pipeline to PAUSED first to allow elements to drain buffers
+        let _ = self.pipeline.set_state(gst::State::Paused);
+
+        // Then set to NULL to release all resources properly
+        // This ensures all child elements (capsfilter, parser, mux, sink) are properly disposed
         self.pipeline
             .set_state(gst::State::Null)
             .map_err(|_| anyhow::anyhow!("Failed to set pipeline to null state"))?;

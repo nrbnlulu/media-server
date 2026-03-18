@@ -28,9 +28,45 @@ struct CurrentPipelineState {
 impl CurrentPipelineState {
     async fn stop(&self) -> anyhow::Result<()> {
         self.sender_handle.abort();
-        // ideally you'd send EOS and wait for the bus to drain before setting Null
-        // but sometimes the pipeline wasn't even running so you'd hang here forever
-        let _ = self.pipeline.set_state(gst::State::Null);
+
+        // Check current pipeline state before attempting graceful shutdown
+        let current_state = self.pipeline.current_state();
+        if current_state == gst::State::Null {
+            log::debug!("Pipeline already in NULL state, skipping graceful shutdown");
+            return Ok(());
+        }
+
+        // Send EOS event to the pipeline to signal end of stream
+        // This allows elements to properly flush buffers and clean up
+        if let Some(bus) = self.pipeline.bus() {
+            // Only post EOS if pipeline is in PLAYING or PAUSED state
+            if current_state == gst::State::Playing || current_state == gst::State::Paused {
+                if let Err(e) = bus.post(gst::message::Eos::new()) {
+                    log::warn!("Failed to post EOS message: {}", e);
+                }
+
+                // Set pipeline to PAUSED first to allow elements to drain
+                if let Err(e) = self.pipeline.set_state(gst::State::Paused) {
+                    log::warn!("Failed to set pipeline to PAUSED during shutdown: {}", e);
+                }
+
+                // Wait briefly for state change to propagate
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+
+            // Set to NULL to release all resources
+            // This ensures child elements (qtdemux, queue, capsfilter, parser) are properly disposed
+            if let Err(e) = self.pipeline.set_state(gst::State::Null) {
+                log::warn!("Failed to set pipeline to NULL during shutdown: {}", e);
+            }
+        } else {
+            // Fallback if no bus is available
+            log::warn!("Pipeline has no bus during shutdown, setting to NULL directly");
+            if let Err(e) = self.pipeline.set_state(gst::State::Null) {
+                log::warn!("Failed to set pipeline to NULL (no bus): {}", e);
+            }
+        }
+
         Ok(())
     }
 
@@ -242,6 +278,27 @@ impl DvrPlayer {
             .seek_to_offset(timestamp)
             .map_err(SeekError::GstError)?;
         Ok(())
+    }
+}
+
+impl Drop for DvrPlayer {
+    fn drop(&mut self) {
+        // DvrPlayer should be explicitly terminated via terminate() before being dropped.
+        // This Drop impl is a safety net to catch cases where explicit termination was missed.
+        //
+        // We cannot properly clean up the GStreamer pipeline here because:
+        // 1. Drop cannot block, but pipeline shutdown requires async operations
+        // 2. Attempting to block in Drop can cause deadlocks during panic unwinds
+        // 3. GStreamer state changes require async message bus handling
+        //
+        // The pipeline will eventually be reclaimed by GStreamer's refcounting,
+        // but may log warnings about non-NULL state. This is acceptable for a
+        // last-resort cleanup path.
+        log::debug!(
+            "DvrPlayer dropped without explicit terminate() call. \
+             This is acceptable during panic unwinds, but consider reviewing \
+             shutdown logic if this appears frequently."
+        );
     }
 }
 

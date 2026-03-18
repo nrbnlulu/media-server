@@ -116,8 +116,10 @@ impl ClientSession {
                 if timestamp < metadata.start_time {
                     bail!("seek before start");
                 }
-                if let Some(end_time) = metadata.end_time && timestamp > end_time {
-                        bail!("seek after end");
+                if let Some(end_time) = metadata.end_time
+                    && timestamp > end_time
+                {
+                    bail!("seek after end");
                 }
                 player.seek_to_timestamp(timestamp, 1.0).await?;
                 Ok(())
@@ -528,6 +530,26 @@ impl GlobalState {
     pub async fn cleanup(&self) -> Result<()> {
         log::info!("Starting cleanup of all streams...");
 
+        // FIRST: Terminate all client sessions (including DVR players) before stopping sources
+        // This ensures DVR pipelines are properly shut down before their source recordings are finalized
+        let session_ids: Vec<ClientSessionId> = self
+            .client_sessions
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+
+        for session_id in session_ids {
+            log::info!("Terminating client session {} during cleanup", session_id);
+            if let Err(e) = self.delete_client_session(&session_id).await {
+                log::error!(
+                    "Error terminating session {} during cleanup: {}",
+                    session_id,
+                    e
+                );
+            }
+        }
+
+        // SECOND: Stop all sources (which will finalize DVR recordings)
         let source_ids: Vec<VideoSourceId> = self
             .sources
             .iter()
