@@ -9,11 +9,22 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::signal;
+use tracing_subscriber::{EnvFilter, fmt::writer::MakeWriterExt};
 use utils::DVR_DIRECTORY;
 
 use crate::app::GlobalState;
 fn init() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let file_appender = tracing_appender::rolling::daily("logs", "media-server.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    std::mem::forget(_guard);
+
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stdout.and(non_blocking))
+        .with_env_filter(env_filter)
+        .init();
+
     ffmpeg::init()?;
     gstreamer::init()?;
 

@@ -360,11 +360,21 @@ impl FfmpegConsumer for RtpPacketizer {
                     )
                 };
 
+                let mut params_changed = false;
                 for nal in &nal_units_ {
                     // Update params in-band (e.g., resolution change)
-                    config.codec_params.update_from_nal(nal);
+                    if config.codec_params.update_from_nal(nal) {
+                        params_changed = true;
+                    }
                 }
                 nal_units = Some(nal_units_);
+
+                if params_changed {
+                    let consumers = self.consumers.lock().clone();
+                    for consumer in consumers {
+                        consumer.update_params(&config.codec_params);
+                    }
+                }
             }
 
             (config.codec, nal_units)
@@ -423,6 +433,7 @@ pub struct RtpStitcher {
     last_output_ts: AtomicU32,
     last_input_ts: AtomicU32,
     has_received_packet: AtomicBool,
+    force_next_switch: AtomicBool,
 }
 
 impl RtpStitcher {
@@ -434,7 +445,13 @@ impl RtpStitcher {
             last_output_ts: AtomicU32::new(0),
             last_input_ts: AtomicU32::new(0),
             has_received_packet: AtomicBool::new(false),
+            force_next_switch: AtomicBool::new(false),
         }
+    }
+
+    /// Manually trigger a source switch adjustment on the next packet.
+    pub fn trigger_source_switch(&self) {
+        self.force_next_switch.store(true, Ordering::Relaxed);
     }
 
     /// Rewrite RTP header fields (seq, timestamp, ssrc) while sharing payload (zero-copy).
@@ -449,20 +466,15 @@ impl RtpStitcher {
         // Normal inter-frame delta at 30fps/90kHz is ~3000, so anything > 1 second (90000)
         // of discontinuity likely indicates a source switch
         if self.has_received_packet.load(Ordering::Relaxed) {
-            let last_input = self.last_input_ts.load(Ordering::Relaxed);
-            let delta = orig_ts.abs_diff(last_input);
+            let force_switch = self.force_next_switch.swap(false, Ordering::Relaxed);
 
-            // If delta > 1 second of RTP time, assume source switch
-            const SOURCE_SWITCH_THRESHOLD: u32 = 90000; // 1 second at 90kHz
-            if delta > SOURCE_SWITCH_THRESHOLD {
-                log::debug!(
-                    "RtpStitcher: detected source switch (delta={}), adjusting offset",
-                    delta
-                );
+            if force_switch {
+                log::info!("RtpStitcher: forced source switch, adjusting offset");
                 self.adjust_for_source_switch(orig_ts);
             }
         } else {
             self.has_received_packet.store(true, Ordering::Relaxed);
+            self.force_next_switch.store(false, Ordering::Relaxed);
         }
 
         self.last_input_ts.store(orig_ts, Ordering::Relaxed);
@@ -505,7 +517,7 @@ impl RtpStitcher {
         let target_ts = last_ts.wrapping_add(FRAME_DELTA);
         let offset = target_ts as i64 - new_source_first_ts as i64;
         self.ts_offset.store(offset, Ordering::Relaxed);
-        log::debug!(
+        log::info!(
             "RtpStitcher: adjusted offset to {} (last_output={}, new_input={})",
             offset,
             last_ts,
@@ -542,6 +554,11 @@ impl StitchingConsumer {
             stitcher: RtpStitcher::new(rand::random()),
             inner,
         }
+    }
+
+    /// Manually trigger a source switch adjustment on the next packet.
+    pub fn trigger_source_switch(&self) {
+        self.stitcher.trigger_source_switch();
     }
 
     /// Call when switching sources to maintain timestamp continuity
@@ -630,17 +647,40 @@ impl CodecParameters {
         }
     }
 
-    pub fn update_from_nal(&mut self, nal: &[u8]) {
+    pub fn update_from_nal(&mut self, nal: &[u8]) -> bool {
         if nal.is_empty() {
-            return;
+            return false;
         }
 
+        let mut changed = false;
         match self {
             CodecParameters::H264 { sps, pps, .. } => {
                 if let Some(nal_type) = nal_utils::get_h264_nal_type(nal) {
                     match nal_type {
-                        H264NalType::Sps => *sps = Some(nal.to_vec()),
-                        H264NalType::Pps => *pps = Some(nal.to_vec()),
+                        H264NalType::Sps => {
+                            let new_sps = Some(nal.to_vec());
+                            if *sps != new_sps {
+                                log::info!(
+                                    "H264 SPS updated from NAL. Old: {:?}, New: {:?}",
+                                    sps.as_ref().map(|x| x.len()),
+                                    new_sps.as_ref().map(|x| x.len())
+                                );
+                                *sps = new_sps;
+                                changed = true;
+                            }
+                        }
+                        H264NalType::Pps => {
+                            let new_pps = Some(nal.to_vec());
+                            if *pps != new_pps {
+                                log::info!(
+                                    "H264 PPS updated from NAL. Old: {:?}, New: {:?}",
+                                    pps.as_ref().map(|x| x.len()),
+                                    new_pps.as_ref().map(|x| x.len())
+                                );
+                                *pps = new_pps;
+                                changed = true;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -648,17 +688,55 @@ impl CodecParameters {
             CodecParameters::H265 { vps, sps, pps, .. } => {
                 if let Some(nal_type) = nal_utils::get_h265_nal_type(nal) {
                     match nal_type {
-                        H265NalType::Vps => *vps = Some(nal.to_vec()),
-                        H265NalType::Sps => *sps = Some(nal.to_vec()),
-                        H265NalType::Pps => *pps = Some(nal.to_vec()),
+                        H265NalType::Vps => {
+                            let new_vps = Some(nal.to_vec());
+                            if *vps != new_vps {
+                                log::info!(
+                                    "H265 VPS updated from NAL. Old: {:?}, New: {:?}",
+                                    vps.as_ref().map(|x| x.len()),
+                                    new_vps.as_ref().map(|x| x.len())
+                                );
+                                *vps = new_vps;
+                                changed = true;
+                            }
+                        }
+                        H265NalType::Sps => {
+                            let new_sps = Some(nal.to_vec());
+                            if *sps != new_sps {
+                                log::info!(
+                                    "H265 SPS updated from NAL. Old: {:?}, New: {:?}",
+                                    sps.as_ref().map(|x| x.len()),
+                                    new_sps.as_ref().map(|x| x.len())
+                                );
+                                *sps = new_sps;
+                                changed = true;
+                            }
+                        }
+                        H265NalType::Pps => {
+                            let new_pps = Some(nal.to_vec());
+                            if *pps != new_pps {
+                                log::info!(
+                                    "H265 PPS updated from NAL. Old: {:?}, New: {:?}",
+                                    pps.as_ref().map(|x| x.len()),
+                                    new_pps.as_ref().map(|x| x.len())
+                                );
+                                *pps = new_pps;
+                                changed = true;
+                            }
+                        }
                         _ => {}
                     }
                 }
             }
         }
+        changed
     }
 
     pub fn update_from_extradata(&mut self, extradata: &[u8]) {
+        log::info!(
+            "update_from_extradata called with {} bytes",
+            extradata.len()
+        );
         if extradata.is_empty() {
             return;
         }
