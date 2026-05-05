@@ -26,8 +26,6 @@ struct FallbackContext {
     codec: VideoCodec,
     /// Timebase of the live stream (fallback must convert to this)
     live_timebase: ffmpeg::Rational,
-    /// Timestamp offset to apply (last_dts + last_duration from live stream)
-    ts_offset: i64,
 }
 pub struct RtspClient {
     config: StreamConfig,
@@ -112,6 +110,8 @@ impl RtspClient {
         let mut last_duration = 0i64; // Track for offset calculation during source switching
         let mut current_codec: Option<VideoCodec> = None;
         let mut live_timebase: Option<ffmpeg::Rational> = None;
+        let mut waiting_for_keyframe = false;
+        let mut force_discontinuity = false;
 
         loop {
             tokio::select! {
@@ -130,9 +130,6 @@ impl RtspClient {
                                 if let (Some(codec), Some(timebase)) = (current_codec, live_timebase) {
                                     log::info!("Starting fallback pipeline for {} with codec {:?}", &session_id, codec);
 
-                                    // Calculate offset for fallback: continue from where live stream left off
-                                    let fallback_ts_offset = last_dts + last_duration;
-
                                     fallback_terminate_sig.store(false, Ordering::SeqCst);
                                     fallback_is_running = true;
 
@@ -140,7 +137,6 @@ impl RtspClient {
                                     let ctx = FallbackContext {
                                         codec,
                                         live_timebase: timebase,
-                                        ts_offset: fallback_ts_offset,
                                     };
 
                                     let termination_sig_clone = fallback_terminate_sig.clone();
@@ -183,6 +179,12 @@ impl RtspClient {
 
                 // Handle Incoming Video Packets
                 Some(mut packet) = packet_rx.recv() => {
+                    if packet.size() == 0 {
+                        log::info!("Received source switch marker in packet stream for {}", session_id);
+                        force_discontinuity = true;
+                        continue;
+                    }
+
                     let dts = packet.dts().unwrap_or(0);
                     let pts = packet.pts().unwrap_or(dts);
                     let duration = packet.duration();
@@ -192,15 +194,47 @@ impl RtspClient {
                     let mut new_dts = dts + ts_offset;
                     let mut new_pts = pts + ts_offset;
 
-                    // Only adjust offset if the timestamp would still go backwards
-                    if new_dts < last_dts && last_dts != 0 {
-                        ts_offset = last_dts + last_duration - dts;
-                        log::info!("Source switch detected for {}: dts={} would become {} < last_dts={}, adjusting ts_offset to {}",
-                            session_id, dts, new_dts, last_dts, ts_offset);
+                    let mut discontinuity = false;
+                    if force_discontinuity {
+                        discontinuity = true;
+                        force_discontinuity = false;
+                    } else if new_dts < last_dts && last_dts != 0 {
+                        discontinuity = true;
+                    }
 
-                        // Recalculate with new offset
-                        new_dts = dts + ts_offset;
-                        new_pts = pts + ts_offset;
+                    if discontinuity {
+                        if last_dts != 0 {
+                            ts_offset = last_dts + last_duration - dts;
+                            log::info!("Source switch detected for {}: dts={} would become {} (last_dts={}), adjusting ts_offset to {}",
+                                session_id, dts, new_dts, last_dts, ts_offset);
+
+                            // Recalculate with new offset
+                            new_dts = dts + ts_offset;
+                            new_pts = pts + ts_offset;
+                        } else {
+                            log::info!("Initial stream started for {}, waiting for first keyframe", session_id);
+                        }
+                        waiting_for_keyframe = true;
+                    }
+
+                    if waiting_for_keyframe {
+                        let mut is_param_set = false;
+                        if let (Some(data), Some(codec)) = (packet.data(), current_codec) {
+                            if crate::common::nal_utils::is_annex_b(data) {
+                                is_param_set = crate::common::nal_utils::parse_annex_b(data)
+                                    .iter()
+                                    .any(|nal| crate::common::nal_utils::is_parameter_set(nal, &codec));
+                            }
+                        }
+
+                        if !packet.is_key() && !is_param_set {
+                            continue;
+                        }
+
+                        if packet.is_key() {
+                            log::info!("Keyframe found for {}, resuming stream delivery", session_id);
+                            waiting_for_keyframe = false;
+                        }
                     }
 
                     packet.set_dts(Some(new_dts));
@@ -288,7 +322,7 @@ impl RtspClient {
             let timebase = TimeBase::from_ffmpeg(video_stream.time_base())?;
             let video_metadata = FFmpegVideoMetadata {
                 codec: detected_codec,
-                extradata,
+                extradata: extradata.clone(),
                 timebase,
             };
             // Try to send metadata - it's ok if the receiver already has it (channel full)
@@ -318,6 +352,36 @@ impl RtspClient {
                                 log::error!("Failed to send online state: {}", err);
                             }
                             self_.set_active_video_input(stream_input.clone());
+
+                            // Send source switch marker
+                            let _ = packet_tx.blocking_send(ffmpeg::Packet::empty());
+
+                            if let Some(ext) = &extradata {
+                                let mut param_nals = Vec::new();
+                                match detected_codec {
+                                    VideoCodec::H264 => {
+                                        if let Some(parsed) =
+                                            crate::common::nal_utils::parse_h264_extradata(ext)
+                                        {
+                                            param_nals = parsed.nals;
+                                        }
+                                    }
+                                    VideoCodec::H265 => {
+                                        if let Some(parsed) =
+                                            crate::common::nal_utils::parse_h265_extradata(ext)
+                                        {
+                                            param_nals = parsed.nals;
+                                        }
+                                    }
+                                }
+                                if !param_nals.is_empty() {
+                                    let annex_b =
+                                        crate::common::nal_utils::build_annex_b(&param_nals);
+                                    let mut param_packet = ffmpeg::Packet::new(annex_b.len());
+                                    param_packet.data_mut().unwrap().copy_from_slice(&annex_b);
+                                    let _ = packet_tx.blocking_send(param_packet);
+                                }
+                            }
                         }
                         if packet.stream() != video_stream_index || packet.is_corrupt() {
                             continue;
@@ -456,10 +520,9 @@ fn run_fallback_pipeline(
     let file_path = format!("assets/placeholder_{}.mp4", codec_str);
 
     log::info!(
-        "Starting fallback pipeline for {} using {}, ts_offset={}, live_timebase={}/{}",
+        "Starting fallback pipeline for {} using {}, live_timebase={}/{}",
         session_id,
         file_path,
-        ctx.ts_offset,
         ctx.live_timebase.numerator(),
         ctx.live_timebase.denominator()
     );
@@ -490,13 +553,45 @@ fn run_fallback_pipeline(
         ctx.live_timebase.denominator()
     );
 
+    // Send source switch marker
+    let _ = packet_tx.blocking_send(ffmpeg::Packet::empty());
+
+    let fallback_extradata = extract_extradata(&stream.parameters());
+    let mut fallback_param_nals = Vec::new();
+    if let Some(ext) = fallback_extradata {
+        match ctx.codec {
+            VideoCodec::H264 => {
+                if let Some(parsed) = crate::common::nal_utils::parse_h264_extradata(&ext) {
+                    fallback_param_nals = parsed.nals;
+                }
+            }
+            VideoCodec::H265 => {
+                if let Some(parsed) = crate::common::nal_utils::parse_h265_extradata(&ext) {
+                    fallback_param_nals = parsed.nals;
+                }
+            }
+        }
+    }
+    let fallback_param_annex_b = crate::common::nal_utils::build_annex_b(&fallback_param_nals);
+
     // Track cumulative offset across file loops (in live timebase units)
-    let mut cumulative_offset = ctx.ts_offset;
-    let mut last_converted_dts = ctx.ts_offset;
+    let mut cumulative_offset = 0;
+    let mut last_converted_dts = 0;
 
     loop {
         // Reset playback timing for each loop iteration
         let start_time = time::Instant::now();
+
+        if !fallback_param_annex_b.is_empty() {
+            let mut param_packet = ffmpeg::Packet::new(fallback_param_annex_b.len());
+            param_packet
+                .data_mut()
+                .unwrap()
+                .copy_from_slice(&fallback_param_annex_b);
+            param_packet.set_dts(Some(last_converted_dts));
+            param_packet.set_pts(Some(last_converted_dts));
+            let _ = packet_tx.blocking_send(param_packet);
+        }
 
         loop {
             if terminate_sig.load(Ordering::SeqCst) {
@@ -537,6 +632,32 @@ fn run_fallback_pipeline(
                     packet.set_duration(converted_duration);
 
                     last_converted_dts = converted_dts;
+
+                    let mut is_avcc = false;
+                    if let Some(data) = packet.data() {
+                        if !crate::common::nal_utils::is_annex_b(data) {
+                            is_avcc = true;
+                        }
+                    }
+
+                    if is_avcc {
+                        if let Some(data) = packet.data() {
+                            use ffmpeg::packet::{Mut, Ref};
+                            let nals = crate::common::nal_utils::parse_avcc(data, &4);
+                            let annex_b = crate::common::nal_utils::build_annex_b(&nals);
+
+                            let mut new_packet = ffmpeg::Packet::new(annex_b.len());
+                            new_packet.data_mut().unwrap().copy_from_slice(&annex_b);
+                            new_packet.set_pts(packet.pts());
+                            new_packet.set_dts(packet.dts());
+                            new_packet.set_duration(packet.duration());
+                            new_packet.set_stream(packet.stream());
+                            unsafe {
+                                (*new_packet.as_mut_ptr()).flags = (*packet.as_ptr()).flags;
+                            }
+                            packet = new_packet;
+                        }
+                    }
 
                     if packet_tx.blocking_send(packet).is_err() {
                         log::info!("Fallback terminated for {} (channel closed)", session_id);

@@ -49,6 +49,10 @@ media-server-api-models = { workspace = true }
 parking_lot = "0.12.5"
 envy = "0.4.2"
 rtp = { path = "../crates/rtp" }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-appender = "0.2.5"
+tracing-log = "0.2.0"
 
 [dev-dependencies]
 tungstenite = { version = "0.21", features = ["native-tls"] }
