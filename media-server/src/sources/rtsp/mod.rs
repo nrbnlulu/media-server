@@ -387,6 +387,14 @@ impl RtspClient {
                                         crate::common::nal_utils::build_annex_b(&param_nals);
                                     let mut param_packet = ffmpeg::Packet::new(annex_b.len());
                                     param_packet.data_mut().unwrap().copy_from_slice(&annex_b);
+
+                                    // Stamp param_packet with metadata to match fallback path and enable correct ts_offset calculation
+                                    let anchor_dts = packet.dts().unwrap_or(0);
+                                    param_packet.set_dts(Some(anchor_dts));
+                                    param_packet.set_pts(Some(anchor_dts));
+                                    param_packet.set_is_key(true);
+                                    param_packet.set_stream(video_stream_index);
+
                                     let _ = packet_tx.blocking_send(PipelineMessage::Packet(param_packet));
                                 }
                             }
