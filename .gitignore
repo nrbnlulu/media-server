@@ -44,6 +44,7 @@ build/
 # Test artifacts
 test-output/
 cam1
-!media-server/assets/placeholder_h264.mp4
-!media-server/assets/placeholder_h265.mp4
+!media-server/assets/placeholder_h264.ts
+!media-server/assets/placeholder_h265.ts
 media-server/dvr
+logs

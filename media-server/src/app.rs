@@ -87,6 +87,8 @@ impl ClientSession {
                     handle.abort();
                 }
 
+                self.stitching_consumer.trigger_source_switch();
+
                 // Re-add stitching consumer to live packetizer
                 // Note: stitching consumer maintains seq continuity automatically
                 self.live_packetizer
@@ -116,9 +118,12 @@ impl ClientSession {
                 if timestamp < metadata.start_time {
                     bail!("seek before start");
                 }
-                if let Some(end_time) = metadata.end_time && timestamp > end_time {
-                        bail!("seek after end");
+                if let Some(end_time) = metadata.end_time
+                    && timestamp > end_time
+                {
+                    bail!("seek after end");
                 }
+                self.stitching_consumer.trigger_source_switch();
                 player.seek_to_timestamp(timestamp, 1.0).await?;
                 Ok(())
             }
@@ -135,6 +140,8 @@ impl ClientSession {
                     self.stitching_consumer.clone(),
                 )?;
                 let player = Arc::new(player);
+
+                self.stitching_consumer.trigger_source_switch();
 
                 // Remove from live packetizer FIRST to prevent live packet leaking during DVR startup
                 self.live_packetizer

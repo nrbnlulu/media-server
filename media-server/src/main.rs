@@ -9,16 +9,26 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::signal;
+use tracing_subscriber::{EnvFilter, fmt::writer::MakeWriterExt};
 use utils::DVR_DIRECTORY;
 
 use crate::app::GlobalState;
-fn init() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+fn init() -> Result<tracing_appender::non_blocking::WorkerGuard> {
+    let file_appender = tracing_appender::rolling::daily("logs", "media-server.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stdout.and(non_blocking))
+        .with_env_filter(env_filter)
+        .init();
+
     ffmpeg::init()?;
     gstreamer::init()?;
 
     // Verify fallback placeholder files exist
-    let placeholder_files = ["assets/placeholder_h264.mp4", "assets/placeholder_h265.mp4"];
+    let placeholder_files = ["assets/placeholder_h264.ts", "assets/placeholder_h265.ts"];
     for file_path in &placeholder_files {
         if !std::path::Path::new(file_path).exists() {
             anyhow::bail!(
@@ -28,12 +38,12 @@ fn init() -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(guard)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init()?;
+    let _guard = init()?;
     log::info!("Starting media server v{}", env!("CARGO_PKG_VERSION"));
 
     if let Err(e) = utils::check_dependencies() {

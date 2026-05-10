@@ -21,13 +21,16 @@ enum LiveStreamState {
     Offline,
 }
 
+enum PipelineMessage {
+    Packet(ffmpeg::Packet),
+    SourceSwitch,
+}
+
 /// Info needed by fallback pipeline to produce timestamp-compatible packets
 struct FallbackContext {
     codec: VideoCodec,
     /// Timebase of the live stream (fallback must convert to this)
     live_timebase: ffmpeg::Rational,
-    /// Timestamp offset to apply (last_dts + last_duration from live stream)
-    ts_offset: i64,
 }
 pub struct RtspClient {
     config: StreamConfig,
@@ -91,7 +94,7 @@ impl RtspClient {
 
     async fn _execute(self: Arc<Self>) {
         let (live_stream_state_tx, mut live_stream_state_rx) = mpsc::channel::<LiveStreamState>(4);
-        let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel::<ffmpeg::Packet>(30);
+        let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel::<PipelineMessage>(30);
 
         let session_id = self.config.source_id.clone();
         let session_id_for_loop = session_id.clone();
@@ -112,6 +115,8 @@ impl RtspClient {
         let mut last_duration = 0i64; // Track for offset calculation during source switching
         let mut current_codec: Option<VideoCodec> = None;
         let mut live_timebase: Option<ffmpeg::Rational> = None;
+        let mut waiting_for_keyframe = false;
+        let mut force_discontinuity = false;
 
         loop {
             tokio::select! {
@@ -130,9 +135,6 @@ impl RtspClient {
                                 if let (Some(codec), Some(timebase)) = (current_codec, live_timebase) {
                                     log::info!("Starting fallback pipeline for {} with codec {:?}", &session_id, codec);
 
-                                    // Calculate offset for fallback: continue from where live stream left off
-                                    let fallback_ts_offset = last_dts + last_duration;
-
                                     fallback_terminate_sig.store(false, Ordering::SeqCst);
                                     fallback_is_running = true;
 
@@ -140,7 +142,6 @@ impl RtspClient {
                                     let ctx = FallbackContext {
                                         codec,
                                         live_timebase: timebase,
-                                        ts_offset: fallback_ts_offset,
                                     };
 
                                     let termination_sig_clone = fallback_terminate_sig.clone();
@@ -182,32 +183,82 @@ impl RtspClient {
                 }
 
                 // Handle Incoming Video Packets
-                Some(mut packet) = packet_rx.recv() => {
+                Some(msg) = packet_rx.recv() => {
+                    let mut packet = match msg {
+                        PipelineMessage::SourceSwitch => {
+                            log::info!("Received source switch marker in packet stream for {}", session_id);
+                            force_discontinuity = true;
+                            continue;
+                        }
+                        PipelineMessage::Packet(p) => p,
+                    };
+
                     let dts = packet.dts().unwrap_or(0);
                     let pts = packet.pts().unwrap_or(dts);
                     let duration = packet.duration();
 
-                   // Rewrite timestamps to be continuous across source switches
+                    // Check early: synthesized param-set packets (SPS/PPS/VPS) have
+                    // no reliable timestamp and must not anchor ts_offset calculation.
+                    let is_param_set = if let (Some(data), Some(codec)) = (packet.data(), current_codec) {
+                        crate::common::nal_utils::is_annex_b(data)
+                            && crate::common::nal_utils::parse_annex_b(data)
+                                .iter()
+                                .any(|nal| crate::common::nal_utils::is_parameter_set(nal, &codec))
+                    } else {
+                        false
+                    };
+
+                    // Rewrite timestamps to be continuous across source switches
                     // Calculate what the new timestamp would be with current offset
                     let mut new_dts = dts + ts_offset;
                     let mut new_pts = pts + ts_offset;
 
-                    // Only adjust offset if the timestamp would still go backwards
-                    if new_dts < last_dts && last_dts != 0 {
-                        ts_offset = last_dts + last_duration - dts;
-                        log::info!("Source switch detected for {}: dts={} would become {} < last_dts={}, adjusting ts_offset to {}",
-                            session_id, dts, new_dts, last_dts, ts_offset);
+                    let mut discontinuity = false;
+                    if force_discontinuity {
+                        if is_param_set {
+                            // Re-arm so the next real video packet anchors ts_offset.
+                            // Stamp this packet at last_dts so it precedes the IDR.
+                            new_dts = last_dts;
+                            new_pts = last_dts;
+                            waiting_for_keyframe = true;
+                        } else {
+                            discontinuity = true;
+                            force_discontinuity = false;
+                        }
+                    } else if new_dts < last_dts && last_dts != 0 {
+                        discontinuity = true;
+                    }
 
-                        // Recalculate with new offset
-                        new_dts = dts + ts_offset;
-                        new_pts = pts + ts_offset;
+                    if discontinuity {
+                        if last_dts != 0 {
+                            ts_offset = last_dts + last_duration - dts;
+                            log::info!("Source switch detected for {}: dts={} would become {} (last_dts={}), adjusting ts_offset to {}",
+                                session_id, dts, new_dts, last_dts, ts_offset);
+
+                            // Recalculate with new offset
+                            new_dts = dts + ts_offset;
+                            new_pts = pts + ts_offset;
+                        } else {
+                            log::info!("Initial stream started for {}, waiting for first keyframe", session_id);
+                        }
+                        waiting_for_keyframe = true;
+                    }
+
+                    if waiting_for_keyframe && !is_param_set {
+                        if !packet.is_key() {
+                            continue;
+                        }
+                        log::info!("Keyframe found for {}, resuming stream delivery", session_id);
+                        waiting_for_keyframe = false;
                     }
 
                     packet.set_dts(Some(new_dts));
                     packet.set_pts(Some(new_pts));
 
-                    last_dts = new_dts;
-                    last_duration = duration;
+                    if !is_param_set {
+                        last_dts = new_dts;
+                        last_duration = duration;
+                    }
 
                     let consumers = {
                         let guard = self.consumers.lock().await;
@@ -235,14 +286,14 @@ impl RtspClient {
     fn run_live_ffmpeg_pipeline(
         &self,
         state_tx: mpsc::Sender<LiveStreamState>,
-        packet_tx: mpsc::Sender<ffmpeg::Packet>,
+        packet_tx: mpsc::Sender<PipelineMessage>,
         metadata_tx: mpsc::Sender<FFmpegVideoMetadata>,
     ) {
         fn real_impl(
             self_: &RtspClient,
             stream_input: &VideoSourceInput,
             state_tx: &mpsc::Sender<LiveStreamState>,
-            packet_tx: &mpsc::Sender<ffmpeg::Packet>,
+            packet_tx: &mpsc::Sender<PipelineMessage>,
             metadata_tx: &mpsc::Sender<FFmpegVideoMetadata>,
         ) -> anyhow::Result<()> {
             let url = &stream_input.url;
@@ -288,7 +339,7 @@ impl RtspClient {
             let timebase = TimeBase::from_ffmpeg(video_stream.time_base())?;
             let video_metadata = FFmpegVideoMetadata {
                 codec: detected_codec,
-                extradata,
+                extradata: extradata.clone(),
                 timebase,
             };
             // Try to send metadata - it's ok if the receiver already has it (channel full)
@@ -318,12 +369,43 @@ impl RtspClient {
                                 log::error!("Failed to send online state: {}", err);
                             }
                             self_.set_active_video_input(stream_input.clone());
+
+                            // Send source switch marker
+                            let _ = packet_tx.blocking_send(PipelineMessage::SourceSwitch);
+
+                            if let Some(ext) = &extradata {
+                                let mut param_nals = Vec::new();
+                                match detected_codec {
+                                    VideoCodec::H264 => {
+                                        if let Some(parsed) =
+                                            crate::common::nal_utils::parse_h264_extradata(ext)
+                                        {
+                                            param_nals = parsed.nals;
+                                        }
+                                    }
+                                    VideoCodec::H265 => {
+                                        if let Some(parsed) =
+                                            crate::common::nal_utils::parse_h265_extradata(ext)
+                                        {
+                                            param_nals = parsed.nals;
+                                        }
+                                    }
+                                }
+                                if !param_nals.is_empty() {
+                                    let annex_b =
+                                        crate::common::nal_utils::build_annex_b(&param_nals);
+                                    let mut param_packet = ffmpeg::Packet::new(annex_b.len());
+                                    param_packet.data_mut().unwrap().copy_from_slice(&annex_b);
+                                    let _ = packet_tx
+                                        .blocking_send(PipelineMessage::Packet(param_packet));
+                                }
+                            }
                         }
                         if packet.stream() != video_stream_index || packet.is_corrupt() {
                             continue;
                         }
 
-                        if let Err(e) = packet_tx.blocking_send(packet) {
+                        if let Err(e) = packet_tx.blocking_send(PipelineMessage::Packet(packet)) {
                             log::error!("Failed to send packet: {}", e);
                             break;
                         }
@@ -450,16 +532,15 @@ fn run_fallback_pipeline(
     ctx: FallbackContext,
     session_id: VideoSourceId,
     terminate_sig: Arc<AtomicBool>,
-    packet_tx: mpsc::Sender<ffmpeg::Packet>,
+    packet_tx: mpsc::Sender<PipelineMessage>,
 ) {
     let codec_str = format!("{:?}", ctx.codec).to_lowercase();
-    let file_path = format!("assets/placeholder_{}.mp4", codec_str);
+    let file_path = format!("assets/placeholder_{}.ts", codec_str);
 
     log::info!(
-        "Starting fallback pipeline for {} using {}, ts_offset={}, live_timebase={}/{}",
+        "Starting fallback pipeline for {} using {}, live_timebase={}/{}",
         session_id,
         file_path,
-        ctx.ts_offset,
         ctx.live_timebase.numerator(),
         ctx.live_timebase.denominator()
     );
@@ -490,9 +571,12 @@ fn run_fallback_pipeline(
         ctx.live_timebase.denominator()
     );
 
+    // Send source switch marker
+    let _ = packet_tx.blocking_send(PipelineMessage::SourceSwitch);
+
     // Track cumulative offset across file loops (in live timebase units)
-    let mut cumulative_offset = ctx.ts_offset;
-    let mut last_converted_dts = ctx.ts_offset;
+    let mut cumulative_offset = 0;
+    let mut last_converted_dts = 0;
 
     loop {
         // Reset playback timing for each loop iteration
@@ -538,7 +622,10 @@ fn run_fallback_pipeline(
 
                     last_converted_dts = converted_dts;
 
-                    if packet_tx.blocking_send(packet).is_err() {
+                    if packet_tx
+                        .blocking_send(PipelineMessage::Packet(packet))
+                        .is_err()
+                    {
                         log::info!("Fallback terminated for {} (channel closed)", session_id);
                         return;
                     }
