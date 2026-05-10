@@ -396,7 +396,8 @@ impl RtspClient {
                                         crate::common::nal_utils::build_annex_b(&param_nals);
                                     let mut param_packet = ffmpeg::Packet::new(annex_b.len());
                                     param_packet.data_mut().unwrap().copy_from_slice(&annex_b);
-                                    let _ = packet_tx.blocking_send(PipelineMessage::Packet(param_packet));
+                                    let _ = packet_tx
+                                        .blocking_send(PipelineMessage::Packet(param_packet));
                                 }
                             }
                         }
@@ -621,7 +622,10 @@ fn run_fallback_pipeline(
 
                     last_converted_dts = converted_dts;
 
-                    if packet_tx.blocking_send(PipelineMessage::Packet(packet)).is_err() {
+                    if packet_tx
+                        .blocking_send(PipelineMessage::Packet(packet))
+                        .is_err()
+                    {
                         log::info!("Fallback terminated for {} (channel closed)", session_id);
                         return;
                     }
