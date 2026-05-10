@@ -656,75 +656,40 @@ impl CodecParameters {
         match self {
             CodecParameters::H264 { sps, pps, .. } => {
                 if let Some(nal_type) = nal_utils::get_h264_nal_type(nal) {
-                    match nal_type {
-                        H264NalType::Sps => {
-                            let new_sps = Some(nal.to_vec());
-                            if *sps != new_sps {
-                                log::info!(
-                                    "H264 SPS updated from NAL. Old: {:?}, New: {:?}",
-                                    sps.as_ref().map(|x| x.len()),
-                                    new_sps.as_ref().map(|x| x.len())
-                                );
-                                *sps = new_sps;
-                                changed = true;
-                            }
-                        }
-                        H264NalType::Pps => {
-                            let new_pps = Some(nal.to_vec());
-                            if *pps != new_pps {
-                                log::info!(
-                                    "H264 PPS updated from NAL. Old: {:?}, New: {:?}",
-                                    pps.as_ref().map(|x| x.len()),
-                                    new_pps.as_ref().map(|x| x.len())
-                                );
-                                *pps = new_pps;
-                                changed = true;
-                            }
-                        }
-                        _ => {}
+                    let (target, label) = match nal_type {
+                        H264NalType::Sps => (sps, "SPS"),
+                        H264NalType::Pps => (pps, "PPS"),
+                        _ => return changed,
+                    };
+                    if target.as_deref() != Some(nal) {
+                        log::info!(
+                            "H264 {} updated from NAL. Old: {:?}, New: {}",
+                            label,
+                            target.as_ref().map(|x| x.len()),
+                            nal.len()
+                        );
+                        *target = Some(nal.to_vec());
+                        changed = true;
                     }
                 }
             }
             CodecParameters::H265 { vps, sps, pps, .. } => {
                 if let Some(nal_type) = nal_utils::get_h265_nal_type(nal) {
-                    match nal_type {
-                        H265NalType::Vps => {
-                            let new_vps = Some(nal.to_vec());
-                            if *vps != new_vps {
-                                log::info!(
-                                    "H265 VPS updated from NAL. Old: {:?}, New: {:?}",
-                                    vps.as_ref().map(|x| x.len()),
-                                    new_vps.as_ref().map(|x| x.len())
-                                );
-                                *vps = new_vps;
-                                changed = true;
-                            }
-                        }
-                        H265NalType::Sps => {
-                            let new_sps = Some(nal.to_vec());
-                            if *sps != new_sps {
-                                log::info!(
-                                    "H265 SPS updated from NAL. Old: {:?}, New: {:?}",
-                                    sps.as_ref().map(|x| x.len()),
-                                    new_sps.as_ref().map(|x| x.len())
-                                );
-                                *sps = new_sps;
-                                changed = true;
-                            }
-                        }
-                        H265NalType::Pps => {
-                            let new_pps = Some(nal.to_vec());
-                            if *pps != new_pps {
-                                log::info!(
-                                    "H265 PPS updated from NAL. Old: {:?}, New: {:?}",
-                                    pps.as_ref().map(|x| x.len()),
-                                    new_pps.as_ref().map(|x| x.len())
-                                );
-                                *pps = new_pps;
-                                changed = true;
-                            }
-                        }
-                        _ => {}
+                    let (target, label) = match nal_type {
+                        H265NalType::Vps => (vps, "VPS"),
+                        H265NalType::Sps => (sps, "SPS"),
+                        H265NalType::Pps => (pps, "PPS"),
+                        _ => return changed,
+                    };
+                    if target.as_deref() != Some(nal) {
+                        log::info!(
+                            "H265 {} updated from NAL. Old: {:?}, New: {}",
+                            label,
+                            target.as_ref().map(|x| x.len()),
+                            nal.len()
+                        );
+                        *target = Some(nal.to_vec());
+                        changed = true;
                     }
                 }
             }
