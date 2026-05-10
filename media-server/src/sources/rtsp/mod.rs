@@ -21,6 +21,11 @@ enum LiveStreamState {
     Offline,
 }
 
+enum PipelineMessage {
+    Packet(ffmpeg::Packet),
+    SourceSwitch,
+}
+
 /// Info needed by fallback pipeline to produce timestamp-compatible packets
 struct FallbackContext {
     codec: VideoCodec,
@@ -89,7 +94,7 @@ impl RtspClient {
 
     async fn _execute(self: Arc<Self>) {
         let (live_stream_state_tx, mut live_stream_state_rx) = mpsc::channel::<LiveStreamState>(4);
-        let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel::<ffmpeg::Packet>(30);
+        let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel::<PipelineMessage>(30);
 
         let session_id = self.config.source_id.clone();
         let session_id_for_loop = session_id.clone();
@@ -178,12 +183,15 @@ impl RtspClient {
                 }
 
                 // Handle Incoming Video Packets
-                Some(mut packet) = packet_rx.recv() => {
-                    if packet.size() == 0 {
-                        log::info!("Received source switch marker in packet stream for {}", session_id);
-                        force_discontinuity = true;
-                        continue;
-                    }
+                Some(msg) = packet_rx.recv() => {
+                    let mut packet = match msg {
+                        PipelineMessage::SourceSwitch => {
+                            log::info!("Received source switch marker in packet stream for {}", session_id);
+                            force_discontinuity = true;
+                            continue;
+                        }
+                        PipelineMessage::Packet(p) => p,
+                    };
 
                     let dts = packet.dts().unwrap_or(0);
                     let pts = packet.pts().unwrap_or(dts);
@@ -269,14 +277,14 @@ impl RtspClient {
     fn run_live_ffmpeg_pipeline(
         &self,
         state_tx: mpsc::Sender<LiveStreamState>,
-        packet_tx: mpsc::Sender<ffmpeg::Packet>,
+        packet_tx: mpsc::Sender<PipelineMessage>,
         metadata_tx: mpsc::Sender<FFmpegVideoMetadata>,
     ) {
         fn real_impl(
             self_: &RtspClient,
             stream_input: &VideoSourceInput,
             state_tx: &mpsc::Sender<LiveStreamState>,
-            packet_tx: &mpsc::Sender<ffmpeg::Packet>,
+            packet_tx: &mpsc::Sender<PipelineMessage>,
             metadata_tx: &mpsc::Sender<FFmpegVideoMetadata>,
         ) -> anyhow::Result<()> {
             let url = &stream_input.url;
@@ -354,7 +362,7 @@ impl RtspClient {
                             self_.set_active_video_input(stream_input.clone());
 
                             // Send source switch marker
-                            let _ = packet_tx.blocking_send(ffmpeg::Packet::empty());
+                            let _ = packet_tx.blocking_send(PipelineMessage::SourceSwitch);
 
                             if let Some(ext) = &extradata {
                                 let mut param_nals = Vec::new();
@@ -379,7 +387,7 @@ impl RtspClient {
                                         crate::common::nal_utils::build_annex_b(&param_nals);
                                     let mut param_packet = ffmpeg::Packet::new(annex_b.len());
                                     param_packet.data_mut().unwrap().copy_from_slice(&annex_b);
-                                    let _ = packet_tx.blocking_send(param_packet);
+                                    let _ = packet_tx.blocking_send(PipelineMessage::Packet(param_packet));
                                 }
                             }
                         }
@@ -387,7 +395,7 @@ impl RtspClient {
                             continue;
                         }
 
-                        if let Err(e) = packet_tx.blocking_send(packet) {
+                        if let Err(e) = packet_tx.blocking_send(PipelineMessage::Packet(packet)) {
                             log::error!("Failed to send packet: {}", e);
                             break;
                         }
@@ -514,10 +522,10 @@ fn run_fallback_pipeline(
     ctx: FallbackContext,
     session_id: VideoSourceId,
     terminate_sig: Arc<AtomicBool>,
-    packet_tx: mpsc::Sender<ffmpeg::Packet>,
+    packet_tx: mpsc::Sender<PipelineMessage>,
 ) {
     let codec_str = format!("{:?}", ctx.codec).to_lowercase();
-    let file_path = format!("assets/placeholder_{}.mp4", codec_str);
+    let file_path = format!("assets/placeholder_{}.ts", codec_str);
 
     log::info!(
         "Starting fallback pipeline for {} using {}, live_timebase={}/{}",
@@ -554,7 +562,7 @@ fn run_fallback_pipeline(
     );
 
     // Send source switch marker
-    let _ = packet_tx.blocking_send(ffmpeg::Packet::empty());
+    let _ = packet_tx.blocking_send(PipelineMessage::SourceSwitch);
 
     let fallback_extradata = extract_extradata(&stream.parameters());
     let mut fallback_param_nals = Vec::new();
@@ -590,7 +598,7 @@ fn run_fallback_pipeline(
                 .copy_from_slice(&fallback_param_annex_b);
             param_packet.set_dts(Some(last_converted_dts));
             param_packet.set_pts(Some(last_converted_dts));
-            let _ = packet_tx.blocking_send(param_packet);
+            let _ = packet_tx.blocking_send(PipelineMessage::Packet(param_packet));
         }
 
         loop {
@@ -633,33 +641,7 @@ fn run_fallback_pipeline(
 
                     last_converted_dts = converted_dts;
 
-                    let mut is_avcc = false;
-                    if let Some(data) = packet.data() {
-                        if !crate::common::nal_utils::is_annex_b(data) {
-                            is_avcc = true;
-                        }
-                    }
-
-                    if is_avcc {
-                        if let Some(data) = packet.data() {
-                            use ffmpeg::packet::{Mut, Ref};
-                            let nals = crate::common::nal_utils::parse_avcc(data, &4);
-                            let annex_b = crate::common::nal_utils::build_annex_b(&nals);
-
-                            let mut new_packet = ffmpeg::Packet::new(annex_b.len());
-                            new_packet.data_mut().unwrap().copy_from_slice(&annex_b);
-                            new_packet.set_pts(packet.pts());
-                            new_packet.set_dts(packet.dts());
-                            new_packet.set_duration(packet.duration());
-                            new_packet.set_stream(packet.stream());
-                            unsafe {
-                                (*new_packet.as_mut_ptr()).flags = (*packet.as_ptr()).flags;
-                            }
-                            packet = new_packet;
-                        }
-                    }
-
-                    if packet_tx.blocking_send(packet).is_err() {
+                    if packet_tx.blocking_send(PipelineMessage::Packet(packet)).is_err() {
                         log::info!("Fallback terminated for {} (channel closed)", session_id);
                         return;
                     }

@@ -29,7 +29,7 @@ fn init() -> Result<()> {
     gstreamer::init()?;
 
     // Verify fallback placeholder files exist
-    let placeholder_files = ["assets/placeholder_h264.mp4", "assets/placeholder_h265.mp4"];
+    let placeholder_files = ["assets/placeholder_h264.ts", "assets/placeholder_h265.ts"];
     for file_path in &placeholder_files {
         if !std::path::Path::new(file_path).exists() {
             anyhow::bail!(
