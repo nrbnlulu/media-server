@@ -197,15 +197,34 @@ impl RtspClient {
                     let pts = packet.pts().unwrap_or(dts);
                     let duration = packet.duration();
 
-                   // Rewrite timestamps to be continuous across source switches
+                    // Check early: synthesized param-set packets (SPS/PPS/VPS) have
+                    // no reliable timestamp and must not anchor ts_offset calculation.
+                    let is_param_set = if let (Some(data), Some(codec)) = (packet.data(), current_codec) {
+                        crate::common::nal_utils::is_annex_b(data)
+                            && crate::common::nal_utils::parse_annex_b(data)
+                                .iter()
+                                .any(|nal| crate::common::nal_utils::is_parameter_set(nal, &codec))
+                    } else {
+                        false
+                    };
+
+                    // Rewrite timestamps to be continuous across source switches
                     // Calculate what the new timestamp would be with current offset
                     let mut new_dts = dts + ts_offset;
                     let mut new_pts = pts + ts_offset;
 
                     let mut discontinuity = false;
                     if force_discontinuity {
-                        discontinuity = true;
-                        force_discontinuity = false;
+                        if is_param_set {
+                            // Re-arm so the next real video packet anchors ts_offset.
+                            // Stamp this packet at last_dts so it precedes the IDR.
+                            new_dts = last_dts;
+                            new_pts = last_dts;
+                            waiting_for_keyframe = true;
+                        } else {
+                            discontinuity = true;
+                            force_discontinuity = false;
+                        }
                     } else if new_dts < last_dts && last_dts != 0 {
                         discontinuity = true;
                     }
@@ -225,31 +244,21 @@ impl RtspClient {
                         waiting_for_keyframe = true;
                     }
 
-                    if waiting_for_keyframe {
-                        let mut is_param_set = false;
-                        if let (Some(data), Some(codec)) = (packet.data(), current_codec) {
-                            if crate::common::nal_utils::is_annex_b(data) {
-                                is_param_set = crate::common::nal_utils::parse_annex_b(data)
-                                    .iter()
-                                    .any(|nal| crate::common::nal_utils::is_parameter_set(nal, &codec));
-                            }
-                        }
-
-                        if !packet.is_key() && !is_param_set {
+                    if waiting_for_keyframe && !is_param_set {
+                        if !packet.is_key() {
                             continue;
                         }
-
-                        if packet.is_key() {
-                            log::info!("Keyframe found for {}, resuming stream delivery", session_id);
-                            waiting_for_keyframe = false;
-                        }
+                        log::info!("Keyframe found for {}, resuming stream delivery", session_id);
+                        waiting_for_keyframe = false;
                     }
 
                     packet.set_dts(Some(new_dts));
                     packet.set_pts(Some(new_pts));
 
-                    last_dts = new_dts;
-                    last_duration = duration;
+                    if !is_param_set {
+                        last_dts = new_dts;
+                        last_duration = duration;
+                    }
 
                     let consumers = {
                         let guard = self.consumers.lock().await;
