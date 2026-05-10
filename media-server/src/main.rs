@@ -13,10 +13,11 @@ use tracing_subscriber::{EnvFilter, fmt::writer::MakeWriterExt};
 use utils::DVR_DIRECTORY;
 
 use crate::app::GlobalState;
-fn init() -> Result<()> {
+fn init() -> Result<tracing_appender::non_blocking::WorkerGuard> {
+    tracing_log::LogTracer::init()?;
+
     let file_appender = tracing_appender::rolling::daily("logs", "media-server.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    std::mem::forget(_guard);
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -39,12 +40,12 @@ fn init() -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(guard)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init()?;
+    let _guard = init()?;
     log::info!("Starting media server v{}", env!("CARGO_PKG_VERSION"));
 
     if let Err(e) = utils::check_dependencies() {
