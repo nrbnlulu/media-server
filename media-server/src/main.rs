@@ -14,8 +14,6 @@ use utils::DVR_DIRECTORY;
 
 use crate::app::GlobalState;
 fn init() -> Result<tracing_appender::non_blocking::WorkerGuard> {
-    tracing_log::LogTracer::init()?;
-
     let file_appender = tracing_appender::rolling::daily("logs", "media-server.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 

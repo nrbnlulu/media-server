@@ -564,24 +564,6 @@ fn run_fallback_pipeline(
     // Send source switch marker
     let _ = packet_tx.blocking_send(PipelineMessage::SourceSwitch);
 
-    let fallback_extradata = extract_extradata(&stream.parameters());
-    let mut fallback_param_nals = Vec::new();
-    if let Some(ext) = fallback_extradata {
-        match ctx.codec {
-            VideoCodec::H264 => {
-                if let Some(parsed) = crate::common::nal_utils::parse_h264_extradata(&ext) {
-                    fallback_param_nals = parsed.nals;
-                }
-            }
-            VideoCodec::H265 => {
-                if let Some(parsed) = crate::common::nal_utils::parse_h265_extradata(&ext) {
-                    fallback_param_nals = parsed.nals;
-                }
-            }
-        }
-    }
-    let fallback_param_annex_b = crate::common::nal_utils::build_annex_b(&fallback_param_nals);
-
     // Track cumulative offset across file loops (in live timebase units)
     let mut cumulative_offset = 0;
     let mut last_converted_dts = 0;
@@ -589,17 +571,6 @@ fn run_fallback_pipeline(
     loop {
         // Reset playback timing for each loop iteration
         let start_time = time::Instant::now();
-
-        if !fallback_param_annex_b.is_empty() {
-            let mut param_packet = ffmpeg::Packet::new(fallback_param_annex_b.len());
-            param_packet
-                .data_mut()
-                .unwrap()
-                .copy_from_slice(&fallback_param_annex_b);
-            param_packet.set_dts(Some(last_converted_dts));
-            param_packet.set_pts(Some(last_converted_dts));
-            let _ = packet_tx.blocking_send(PipelineMessage::Packet(param_packet));
-        }
 
         loop {
             if terminate_sig.load(Ordering::SeqCst) {
