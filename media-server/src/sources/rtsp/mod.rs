@@ -561,10 +561,16 @@ fn run_fallback_pipeline(
     let mut cumulative_offset = 0;
     let mut last_converted_dts = 0;
     let mut found_first_keyframe = false;
+    // Playback origin in file-timebase seconds; the first kept keyframe becomes t=0
+    // so it is sent immediately. Subsequent file loops start from 0 (file beginning).
+    let mut throttle_origin_ts = 0.0f64;
 
     loop {
-        // Reset playback timing for each loop iteration
-        let start_time = time::Instant::now();
+        // Reset playback timing for each file loop iteration
+        let mut start_time = time::Instant::now();
+        if found_first_keyframe {
+            throttle_origin_ts = 0.0; // file looped back to start — origin resets
+        }
 
         loop {
             if terminate_sig.load(Ordering::SeqCst) {
@@ -583,17 +589,23 @@ fn run_fallback_pipeline(
                             continue;
                         }
                         found_first_keyframe = true;
+                        // Use this keyframe's position as t=0 so the throttle sends it
+                        // immediately instead of sleeping for its offset into the file.
+                        throttle_origin_ts = (packet.dts().unwrap_or(0) as f64
+                            * f64::from(file_timebase.numerator()))
+                            / f64::from(file_timebase.denominator());
+                        start_time = time::Instant::now();
                         let _ = packet_tx.blocking_send(PipelineMessage::SourceSwitch);
                     }
 
-                    // Throttle: Wait until it's time to send this packet (real-time playback)
-                    // Use original file timestamps for timing calculation
+                    // Throttle: wait until it's time to send this packet (real-time playback)
                     if let Some(dts) = packet.dts() {
                         let actual_ts = (dts as f64 * f64::from(file_timebase.numerator()))
                             / f64::from(file_timebase.denominator());
+                        let relative_ts = actual_ts - throttle_origin_ts;
                         let elapsed = start_time.elapsed().as_secs_f64();
-                        if actual_ts > elapsed {
-                            thread::sleep(time::Duration::from_secs_f64(actual_ts - elapsed));
+                        if relative_ts > elapsed {
+                            thread::sleep(time::Duration::from_secs_f64(relative_ts - elapsed));
                         }
                     }
 
