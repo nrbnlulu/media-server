@@ -17,13 +17,15 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::{broadcast, mpsc};
 
 enum LiveStreamState {
-    Online,
     Offline,
 }
 
 enum PipelineMessage {
     Packet(ffmpeg::Packet),
+    /// Sent by the fallback pipeline on startup — adjust timestamps only.
     SourceSwitch,
+    /// Sent by the live pipeline on first IDR — stop fallback, adjust timestamps, set Running.
+    GoLive,
 }
 
 /// Info needed by fallback pipeline to produce timestamp-compatible packets
@@ -122,12 +124,6 @@ impl RtspClient {
                 // Handle State Changes (Online/Offline)
                 Some(new_live_state) = live_stream_state_rx.recv() => {
                     match new_live_state {
-                        LiveStreamState::Online => {
-                            log::info!("Live stream restored for {}, stopping fallback", session_id);
-                            // Reset consecutive failures when we get a successful connection
-                            fallback_terminate_sig.store(true, Ordering::SeqCst);
-                            fallback_is_running = false;
-                        },
                         LiveStreamState::Offline => {
                              log::info!("Live stream down for {}, checking fallback state", &session_id);
                              if !fallback_is_running {
@@ -178,15 +174,23 @@ impl RtspClient {
                     }
 
                     *self.codec.lock().await = Some(metadata.codec);
-                    self.set_state(StreamState::Running).await;
+                    // Running state is set in GoLive, after the first decodable IDR is confirmed.
                 }
 
                 // Handle Incoming Video Packets
                 Some(msg) = packet_rx.recv() => {
                     let mut packet = match msg {
                         PipelineMessage::SourceSwitch => {
-                            log::info!("Received source switch marker in packet stream for {}", session_id);
+                            log::info!("Source switch (fallback) for {}", session_id);
                             force_discontinuity = true;
+                            continue;
+                        }
+                        PipelineMessage::GoLive => {
+                            log::info!("Live stream ready for {}, stopping fallback", session_id);
+                            fallback_terminate_sig.store(true, Ordering::SeqCst);
+                            fallback_is_running = false;
+                            force_discontinuity = true;
+                            self.set_state(StreamState::Running).await;
                             continue;
                         }
                         PipelineMessage::Packet(p) => p,
@@ -198,21 +202,23 @@ impl RtspClient {
 
                     // Synthesized param-set packets (SPS/PPS/VPS) carry no meaningful
                     // timestamp; stamp them at last_dts and skip updating the offset anchor.
-                    let is_param_set = if let (Some(data), Some(codec)) = (packet.data(), current_codec) {
-                        crate::common::nal_utils::is_annex_b(data)
-                            && crate::common::nal_utils::parse_annex_b(data)
-                                .iter()
-                                .any(|nal| crate::common::nal_utils::is_parameter_set(nal, &codec))
-                    } else {
-                        false
-                    };
+                    // Exclude keyframes: an IDR with in-band SPS/PPS must anchor the offset.
+                    let is_param_set = !packet.is_key()
+                        && if let (Some(data), Some(codec)) = (packet.data(), current_codec) {
+                            crate::common::nal_utils::is_annex_b(data)
+                                && crate::common::nal_utils::parse_annex_b(data)
+                                    .iter()
+                                    .any(|nal| crate::common::nal_utils::is_parameter_set(nal, &codec))
+                        } else {
+                            false
+                        };
 
                     let mut new_dts = dts + ts_offset;
                     let mut new_pts = pts + ts_offset;
 
-                    if is_param_set && force_discontinuity {
-                        // Param packets have no timestamp; pin them to last_dts so they
-                        // precede the real video packet without disturbing the offset anchor.
+                    if is_param_set {
+                        // Pin to last_dts unconditionally: synthesized SPS/PPS/VPS have DTS=0
+                        // which would otherwise trigger the rollback path below.
                         new_dts = last_dts;
                         new_pts = last_dts;
                     } else if force_discontinuity {
@@ -221,8 +227,8 @@ impl RtspClient {
                             ts_offset = last_dts + last_duration - dts;
                             new_dts = dts + ts_offset;
                             new_pts = pts + ts_offset;
-                            log::info!("Source switch for {}: adjusted ts_offset to {} (last_dts={}, new dts={})",
-                                session_id, ts_offset, last_dts, dts);
+                            log::info!("Source switch for {}: adjusted ts_offset to {} (last_dts={}, new_dts={})",
+                                session_id, ts_offset, last_dts, new_dts);
                         }
                     } else if new_dts < last_dts && last_dts != 0 {
                         ts_offset = last_dts + last_duration - dts;
@@ -271,7 +277,6 @@ impl RtspClient {
         fn real_impl(
             self_: &RtspClient,
             stream_input: &VideoSourceInput,
-            state_tx: &mpsc::Sender<LiveStreamState>,
             packet_tx: &mpsc::Sender<PipelineMessage>,
             metadata_tx: &mpsc::Sender<FFmpegVideoMetadata>,
         ) -> anyhow::Result<()> {
@@ -351,12 +356,11 @@ impl RtspClient {
                                 continue; // discard pre-IDR packets; fallback keeps playing
                             }
                             found_first_keyframe = true;
-                            if let Err(err) = state_tx.blocking_send(LiveStreamState::Online) {
-                                log::error!("Failed to send online state: {}", err);
-                            }
                             self_.set_active_video_input(stream_input.clone());
 
-                            let _ = packet_tx.blocking_send(PipelineMessage::SourceSwitch);
+                            // GoLive is a single ordered message: stops fallback, adjusts
+                            // timestamps, and sets Running — no race with a separate state_tx send.
+                            let _ = packet_tx.blocking_send(PipelineMessage::GoLive);
 
                             if let Some(ext) = &extradata {
                                 let mut param_nals = Vec::new();
@@ -447,7 +451,7 @@ impl RtspClient {
                 current_stream_input_index += 1;
             }
 
-            match real_impl(self, &input, &state_tx, &packet_tx, &metadata_tx) {
+            match real_impl(self, &input, &packet_tx, &metadata_tx) {
                 Ok(_) => {}
                 Err(e) => {
                     log::warn!("RTSP stream for {} failed due to: {}", source_id, e);
