@@ -17,7 +17,6 @@ use std::sync::Arc;
 struct CurrentPipelineState {
     pipeline: gst::Pipeline,
     bus: gst::Bus,
-    #[allow(dead_code)]
     speed: f64,
     recording_metadata: RecordingMetadata,
     initial_time: UnixTimestamp,
@@ -77,16 +76,46 @@ impl CurrentPipelineState {
         Ok(())
     }
 
-    fn seek_to_offset(&self, timestamp: UnixTimestamp) -> anyhow::Result<()> {
-        let offset_ms = timestamp.saturating_sub(self.recording_metadata.start_time);
-        let seek_pos = gst::ClockTime::from_mseconds(offset_ms);
-        log::debug!("DVR seek to {} (offset_ms={})", timestamp, offset_ms);
-        self.pipeline
-            .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, seek_pos)
-            .map_err(|e| anyhow!("Seek failed: {e}"))
+    fn seek_to_offset(&mut self, timestamp: UnixTimestamp) -> anyhow::Result<()> {
+        self.seek_to_offset_at_rate(timestamp, self.speed)
     }
 
-    async fn play(&self) -> anyhow::Result<()> {
+    fn seek_to_offset_at_rate(
+        &mut self,
+        timestamp: UnixTimestamp,
+        speed: f64,
+    ) -> anyhow::Result<()> {
+        validate_playback_speed(speed)?;
+        let offset_ms = timestamp.saturating_sub(self.recording_metadata.start_time);
+        let seek_pos = gst::ClockTime::from_mseconds(offset_ms);
+        log::debug!(
+            "DVR seek to {} (offset_ms={}, speed={}x)",
+            timestamp,
+            offset_ms,
+            speed
+        );
+        self.pipeline
+            .seek(
+                speed,
+                gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                gst::SeekType::Set,
+                seek_pos,
+                gst::SeekType::None,
+                gst::ClockTime::NONE,
+            )
+            .map_err(|e| anyhow!("Seek failed: {e}"))?;
+        self.speed = speed;
+        Ok(())
+    }
+
+    fn current_timestamp_ms(&self) -> UnixTimestamp {
+        self.pipeline
+            .query_position::<gst::ClockTime>()
+            .map(|pos| self.recording_metadata.start_time + pos.mseconds())
+            .unwrap_or(self.recording_metadata.start_time)
+    }
+
+    async fn play(&mut self) -> anyhow::Result<()> {
         self.pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| anyhow!("failed to play pipeline {e}"))?;
@@ -154,14 +183,7 @@ impl DvrPlayer {
     }
     pub async fn current_timestamp(&self) -> UnixTimestamp {
         let state_guard = self.state.lock().await;
-        let start_time = state_guard.recording_metadata.start_time;
-        if let Some(clock_time) = state_guard.pipeline.current_clock_time()
-            && let Some(base_time) = state_guard.pipeline.base_time()
-        {
-            let running_time = clock_time.saturating_sub(base_time);
-            return start_time + running_time.nseconds();
-        }
-        start_time
+        state_guard.current_timestamp_ms()
     }
 
     pub async fn current_time_ms(&self) -> Option<u64> {
@@ -169,19 +191,18 @@ impl DvrPlayer {
         state_guard
             .pipeline
             .query_position::<gst::ClockTime>()
-            .map(|pos| pos.mseconds())
+            .map(|pos| state_guard.recording_metadata.start_time + pos.mseconds())
     }
 
-    pub fn speed(&self) -> f64 {
-        // Speed is stored in the state, but we'd need async to access it
-        // For now, return 1.0 as default
-        1.0
+    pub async fn speed(&self) -> f64 {
+        self.state.lock().await.speed
     }
 
-    pub fn set_speed(&self, _speed: f64) {
-        // Speed control requires seeking with a rate parameter
-        // This is a placeholder - full implementation would need async
-        log::warn!("set_speed not fully implemented yet");
+    pub async fn set_speed(&self, speed: f64) -> Result<()> {
+        let mut state_guard = self.state.lock().await;
+        let timestamp = state_guard.current_timestamp_ms();
+        state_guard.seek_to_offset_at_rate(timestamp, speed)?;
+        Ok(())
     }
 
     fn resolve_new_state(
@@ -210,7 +231,7 @@ impl DvrPlayer {
 
     /// returns EOS watcher task
     pub async fn play(&self) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
         state.play().await?;
         let bus = state.bus.clone();
         drop(state);
@@ -236,13 +257,20 @@ impl DvrPlayer {
         self.state.lock().await.recording_metadata.clone()
     }
 
-    pub async fn seek_to_timestamp(&self, timestamp: u64, _speed: f64) -> Result<(), SeekError> {
-        let state_guard = self.state.lock().await;
+    pub async fn seek_to_timestamp(&self, timestamp: u64) -> Result<(), SeekError> {
+        let mut state_guard = self.state.lock().await;
         state_guard
             .seek_to_offset(timestamp)
             .map_err(SeekError::GstError)?;
         Ok(())
     }
+}
+
+fn validate_playback_speed(speed: f64) -> anyhow::Result<()> {
+    if !speed.is_finite() || speed <= 0.0 {
+        bail!("playback speed must be a positive finite number");
+    }
+    Ok(())
 }
 
 fn create_pipeline(
