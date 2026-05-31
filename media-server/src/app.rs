@@ -540,8 +540,10 @@ impl GlobalState {
             .map(|entry| *entry.key())
             .collect();
         for session_id in session_ids {
-            if let Some((_, session)) = self.client_sessions.remove(&session_id) {
-                session.terminate().await;
+            if self.wsc_publishers.contains_key(&session_id) {
+                let _ = self.delete_wsc_rtp_session(&session_id).await;
+            } else {
+                let _ = self.delete_webrtc_session(&session_id).await;
             }
         }
 
