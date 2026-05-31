@@ -1,5 +1,6 @@
 use crate::api::{GlobalState, models::*};
 use crate::app::VideoSourceId;
+use crate::common::traits::RtpConsumer;
 use crate::domain::StreamConfig;
 use crate::publishers::wsc_rtp::handle_incoming_wsc_rtp_websocket;
 use crate::sources::rtsp::validate_rtsp_inputs;
@@ -210,13 +211,18 @@ pub async fn wsc_rtp(
         }
     };
 
-    ws.on_upgrade(move |socket| {
+    ws.on_upgrade(move |socket| async move {
+        let session_id = *publisher.id();
         handle_incoming_wsc_rtp_websocket(
             socket,
             publisher,
             source,
             query.force_websocket_transport,
         )
+        .await;
+        if let Err(e) = state.delete_wsc_rtp_session(&session_id).await {
+            log::warn!("Failed to cleanup wsc-rtp session {}: {}", session_id, e);
+        }
     })
 }
 

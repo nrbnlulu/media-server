@@ -25,6 +25,13 @@ struct CurrentPipelineState {
     sender_handle: tokio::task::JoinHandle<()>,
 }
 
+impl Drop for CurrentPipelineState {
+    fn drop(&mut self) {
+        self.sender_handle.abort();
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
 impl CurrentPipelineState {
     async fn stop(&self) -> anyhow::Result<()> {
         self.sender_handle.abort();
