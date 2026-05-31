@@ -422,14 +422,13 @@ impl GlobalState {
     pub async fn delete_client_session(&self, session_id: &ClientSessionId) -> anyhow::Result<()> {
         if let Some((_id, session)) = self.client_sessions.remove(session_id) {
             if let Some(ref source) = self.sources.get(session.source_id()) {
-                // Remove the stitching consumer from the packetizer
                 source
                     .rtp_packetizer
                     .remove_consumer(session.stitching_consumer.as_ref());
-                session.terminate().await;
             } else {
-                log::error!("Stream not found, shouldn't be possible");
+                log::error!("Stream not found when deleting session {}", session_id);
             }
+            session.terminate().await;
         } else {
             bail!("session not found");
         }
@@ -534,6 +533,17 @@ impl GlobalState {
 
     pub async fn cleanup(&self) -> Result<()> {
         log::info!("Starting cleanup of all streams...");
+
+        let session_ids: Vec<ClientSessionId> = self
+            .client_sessions
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+        for session_id in session_ids {
+            if let Some((_, session)) = self.client_sessions.remove(&session_id) {
+                session.terminate().await;
+            }
+        }
 
         let source_ids: Vec<VideoSourceId> = self
             .sources
