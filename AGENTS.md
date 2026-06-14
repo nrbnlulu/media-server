@@ -42,8 +42,3 @@ ___
 │           └───────►LIVE   ├─────►   switch    ┼────►    webrtc    │    
 └───────────────────────────┘     └─────────────┘    └──────────────┘    
 ```
-
-## Agentic guidelines
-
-- all plan files u write whould be stored under <project_root>/PLANS/<your_plan_name>.md
-
