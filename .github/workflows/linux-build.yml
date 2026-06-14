@@ -39,6 +39,7 @@ jobs:
             libssl-dev \
             libswresample-dev \
             libswscale-dev \
+            libunwind-dev \
             pkg-config
 
       - name: Cache cargo
