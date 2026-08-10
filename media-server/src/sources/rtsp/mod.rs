@@ -345,8 +345,9 @@ impl RtspClient {
                     break;
                 }
 
-                match ictx.next_packet() {
-                    Ok(packet) => {
+                let mut packet = ffmpeg::Packet::empty();
+                match packet.read(&mut ictx) {
+                    Ok(()) => {
                         if packet.stream() != video_stream_index || packet.is_corrupt() {
                             continue;
                         }
@@ -578,8 +579,9 @@ fn run_fallback_pipeline(
                 return;
             }
 
-            match ictx.next_packet() {
-                Ok(mut packet) => {
+            let mut packet = ffmpeg::Packet::empty();
+            match packet.read(&mut ictx) {
+                Ok(()) => {
                     if packet.stream() != stream_index {
                         continue;
                     }
