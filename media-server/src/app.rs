@@ -124,7 +124,7 @@ impl ClientSession {
                     bail!("seek after end");
                 }
                 self.stitching_consumer.trigger_source_switch();
-                player.seek_to_timestamp(timestamp, 1.0).await?;
+                player.seek_to_timestamp(timestamp).await?;
                 Ok(())
             }
             ClientSessionState::Live => {
@@ -494,7 +494,7 @@ impl GlobalState {
                 Ok(media_server_api_models::SessionModeResponse {
                     is_live: false,
                     current_time_ms: current_time,
-                    speed: player.speed(),
+                    speed: player.speed().await,
                 })
             }
         }
@@ -504,7 +504,7 @@ impl GlobalState {
         if let Some(ref session) = self.client_sessions.get(&session_id) {
             let state_guard = session.state.lock().await;
             if let ClientSessionState::Dvr(ref player, _) = *state_guard {
-                player.set_speed(speed);
+                player.set_speed(speed).await?;
                 return Ok(());
             }
             bail!("Speed control only available in DVR mode");
