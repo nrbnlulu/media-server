@@ -135,10 +135,10 @@ impl RtspClient {
                 Some(new_live_state) = live_stream_state_rx.recv() => {
                     match new_live_state {
                         LiveStreamState::Offline => {
-                             log::info!("Live stream down for {}, checking fallback state", &session_id);
+                             log::info!("Live stream down for {}, checking fallback state", session_id);
                              if !fallback_is_running {
                                 if let (Some(codec), Some(timebase)) = (current_codec, live_timebase) {
-                                    log::info!("Starting fallback pipeline for {} with codec {:?}", &session_id, codec);
+                                    log::info!("Starting fallback pipeline for {} with codec {:?}", session_id, codec);
 
                                     fallback_terminate_sig = Arc::new(AtomicBool::new(false));
                                     fallback_generation += 1;
@@ -163,7 +163,7 @@ impl RtspClient {
                                         );
                                     });
                                 } else {
-                                    log::debug!("Cannot start fallback for {}: codec or timebase not yet detected", &session_id);
+                                    log::debug!("Cannot start fallback for {}: codec or timebase not yet detected", session_id);
                                 }
                             }
                         }
@@ -450,7 +450,7 @@ impl RtspClient {
                 i
             })
             .collect();
-        inputs.sort_by(|a, b| a.priority.cmp(&b.priority));
+        inputs.sort_by_key(|input| input.priority);
         let inputs = inputs;
         let mut have_tested_all_inputs = false;
 
