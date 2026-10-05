@@ -21,9 +21,16 @@ enum LiveStreamState {
 }
 
 enum PipelineMessage {
+    /// Packet from the live pipeline.
     Packet(ffmpeg::Packet),
+    /// Packet from a fallback pipeline run. `generation` identifies the run so stale
+    /// packets (sent after the fallback was told to stop) can be dropped.
+    FallbackPacket {
+        generation: u64,
+        packet: ffmpeg::Packet,
+    },
     /// Sent by the fallback pipeline on startup — adjust timestamps only.
-    SourceSwitch,
+    SourceSwitch { generation: u64 },
     /// Sent by the live pipeline on first IDR — stop fallback, adjust timestamps, set Running.
     GoLive,
 }
@@ -111,7 +118,10 @@ impl RtspClient {
 
         let session_id = session_id_for_loop;
         let mut fallback_is_running = false;
-        let fallback_terminate_sig = Arc::new(AtomicBool::new(true));
+        // Each fallback run gets its own terminate signal and generation so a stale run
+        // can neither be revived by a later run nor inject packets after GoLive.
+        let mut fallback_terminate_sig = Arc::new(AtomicBool::new(true));
+        let mut fallback_generation = 0u64;
         let mut last_dts = 0i64;
         let mut ts_offset = 0i64;
         let mut last_duration = 0i64;
@@ -125,12 +135,13 @@ impl RtspClient {
                 Some(new_live_state) = live_stream_state_rx.recv() => {
                     match new_live_state {
                         LiveStreamState::Offline => {
-                             log::info!("Live stream down for {}, checking fallback state", &session_id);
+                             log::info!("Live stream down for {}, checking fallback state", session_id);
                              if !fallback_is_running {
                                 if let (Some(codec), Some(timebase)) = (current_codec, live_timebase) {
-                                    log::info!("Starting fallback pipeline for {} with codec {:?}", &session_id, codec);
+                                    log::info!("Starting fallback pipeline for {} with codec {:?}", session_id, codec);
 
-                                    fallback_terminate_sig.store(false, Ordering::SeqCst);
+                                    fallback_terminate_sig = Arc::new(AtomicBool::new(false));
+                                    fallback_generation += 1;
                                     fallback_is_running = true;
 
                                     let fallback_packet_tx = packet_tx.clone();
@@ -141,16 +152,18 @@ impl RtspClient {
 
                                     let termination_sig_clone = fallback_terminate_sig.clone();
                                     let session_id_clone = session_id.clone();
+                                    let generation = fallback_generation;
                                     tokio::task::spawn_blocking(move || {
                                         run_fallback_pipeline(
                                             ctx,
                                             session_id_clone,
+                                            generation,
                                             termination_sig_clone,
                                             fallback_packet_tx,
                                         );
                                     });
                                 } else {
-                                    log::debug!("Cannot start fallback for {}: codec or timebase not yet detected", &session_id);
+                                    log::debug!("Cannot start fallback for {}: codec or timebase not yet detected", session_id);
                                 }
                             }
                         }
@@ -180,7 +193,17 @@ impl RtspClient {
                 // Handle Incoming Video Packets
                 Some(msg) = packet_rx.recv() => {
                     let mut packet = match msg {
-                        PipelineMessage::SourceSwitch => {
+                        PipelineMessage::SourceSwitch { generation }
+                        | PipelineMessage::FallbackPacket { generation, .. }
+                            if !fallback_is_running || generation != fallback_generation =>
+                        {
+                            // A fallback packet arriving after GoLive carries fallback-timeline
+                            // timestamps; stamping it with the live offset would push last_dts
+                            // far into the future and make live play in slow motion.
+                            log::debug!("Dropping stale fallback message for {}", session_id);
+                            continue;
+                        }
+                        PipelineMessage::SourceSwitch { .. } => {
                             log::info!("Source switch (fallback) for {}", session_id);
                             force_discontinuity = true;
                             continue;
@@ -194,6 +217,7 @@ impl RtspClient {
                             continue;
                         }
                         PipelineMessage::Packet(p) => p,
+                        PipelineMessage::FallbackPacket { packet, .. } => packet,
                     };
 
                     let dts = packet.dts().unwrap_or(0);
@@ -426,7 +450,7 @@ impl RtspClient {
                 i
             })
             .collect();
-        inputs.sort_by(|a, b| a.priority.cmp(&b.priority));
+        inputs.sort_by_key(|input| input.priority);
         let inputs = inputs;
         let mut have_tested_all_inputs = false;
 
@@ -518,6 +542,7 @@ fn rescale_ts(ts: i64, from_tb: ffmpeg::Rational, to_tb: ffmpeg::Rational) -> i6
 fn run_fallback_pipeline(
     ctx: FallbackContext,
     session_id: VideoSourceId,
+    generation: u64,
     terminate_sig: Arc<AtomicBool>,
     packet_tx: mpsc::Sender<PipelineMessage>,
 ) {
@@ -597,7 +622,8 @@ fn run_fallback_pipeline(
                             * f64::from(file_timebase.numerator()))
                             / f64::from(file_timebase.denominator());
                         start_time = time::Instant::now();
-                        let _ = packet_tx.blocking_send(PipelineMessage::SourceSwitch);
+                        let _ =
+                            packet_tx.blocking_send(PipelineMessage::SourceSwitch { generation });
                     }
 
                     // Throttle: wait until it's time to send this packet (real-time playback)
@@ -609,6 +635,12 @@ fn run_fallback_pipeline(
                         if relative_ts > elapsed {
                             thread::sleep(time::Duration::from_secs_f64(relative_ts - elapsed));
                         }
+                    }
+
+                    // The live stream may have come back while we were sleeping.
+                    if terminate_sig.load(Ordering::SeqCst) {
+                        log::info!("Fallback terminated for {} (terminate signal)", session_id);
+                        return;
                     }
 
                     // Convert timestamps from file timebase to live stream timebase
@@ -629,7 +661,7 @@ fn run_fallback_pipeline(
                     last_converted_dts = converted_dts;
 
                     if packet_tx
-                        .blocking_send(PipelineMessage::Packet(packet))
+                        .blocking_send(PipelineMessage::FallbackPacket { generation, packet })
                         .is_err()
                     {
                         log::info!("Fallback terminated for {} (channel closed)", session_id);
@@ -718,5 +750,38 @@ impl VideoSource for RtspClient {
 
     fn subscribe_state(&self) -> broadcast::Receiver<StreamState> {
         self.state_tx.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ffmpeg_init_succeeds() {
+        // Smoke test: confirms the ffmpeg-next crate links against a compatible
+        // installed ffmpeg version.
+        ffmpeg::init().expect("ffmpeg::init() should succeed");
+    }
+
+    #[test]
+    fn rescale_ts_same_timebase_is_identity() {
+        let tb = ffmpeg::Rational::new(1, 90000);
+        assert_eq!(rescale_ts(12345, tb, tb), 12345);
+    }
+
+    #[test]
+    fn rescale_ts_converts_between_timebases() {
+        // 1 second at 1/90000 timebase -> 1 second at 1/1000 timebase
+        let from_tb = ffmpeg::Rational::new(1, 90000);
+        let to_tb = ffmpeg::Rational::new(1, 1000);
+        assert_eq!(rescale_ts(90000, from_tb, to_tb), 1000);
+    }
+
+    #[test]
+    fn rescale_ts_invalid_timebase_returns_original() {
+        let from_tb = ffmpeg::Rational::new(1, 0);
+        let to_tb = ffmpeg::Rational::new(1, 1000);
+        assert_eq!(rescale_ts(42, from_tb, to_tb), 42);
     }
 }

@@ -1,7 +1,6 @@
 [workspace]
 members = ["media-server", "crates/media-server-api-models", "crates/rtp"]
 resolver = "2"
-edition = "2024"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
