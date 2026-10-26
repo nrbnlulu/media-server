@@ -148,7 +148,7 @@
                 <h2 class="text-xl font-semibold mb-4">Add New Stream</h2>
                 <form
                     id="add-stream-form"
-                    class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-4"
+                    class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4"
                 >
                     <div class="space-y-1">
                         <label
@@ -156,23 +156,9 @@
                             >Stream ID</label
                         >
                         <input
-                            type="number"
-                            name="source_id"
-                            placeholder="1"
-                            required
-                            min="1"
-                            class="w-full bg-[#121212] border-[#333333] rounded-lg px-4 py-2 focus:ring-2 focus:ring-[#F59E0B] outline-none text-[#eaeaea]"
-                        />
-                    </div>
-                    <div class="space-y-1 lg:col-span-2">
-                        <label
-                            class="text-xs uppercase font-bold text-[#8a8a8d]"
-                            >RTSP URL</label
-                        >
-                        <input
                             type="text"
-                            name="rtsp_url"
-                            placeholder="rtsp://192.168.1.50:554/ch1"
+                            name="source_id"
+                            placeholder="camera-1"
                             required
                             class="w-full bg-[#121212] border-[#333333] rounded-lg px-4 py-2 focus:ring-2 focus:ring-[#F59E0B] outline-none text-[#eaeaea]"
                         />
@@ -201,10 +187,39 @@
                             class="w-full bg-[#121212] border-[#333333] rounded-lg px-4 py-2 focus:ring-2 focus:ring-[#F59E0B] outline-none text-[#eaeaea]"
                         />
                     </div>
+                    <div class="space-y-1">
+                        <label
+                            class="text-xs uppercase font-bold text-[#8a8a8d]"
+                            >Restart Interval (s, Optional)</label
+                        >
+                        <input
+                            type="number"
+                            name="restart_interval_secs"
+                            min="1"
+                            placeholder="none"
+                            class="w-full bg-[#121212] border-[#333333] rounded-lg px-4 py-2 focus:ring-2 focus:ring-[#F59E0B] outline-none text-[#eaeaea]"
+                        />
+                    </div>
 
-                    <div
-                        class="flex items-end pb-2 gap-4 md:col-span-2 lg:col-span-1"
-                    >
+                    <div class="space-y-2 md:col-span-2 lg:col-span-4">
+                        <div class="flex items-center justify-between">
+                            <label
+                                class="text-xs uppercase font-bold text-[#8a8a8d]"
+                                >RTSP Inputs (lower priority number =
+                                preferred)</label
+                            >
+                            <button
+                                type="button"
+                                id="add-input-btn"
+                                class="text-sm text-[#F59E0B] hover:text-[#D97706]"
+                            >
+                                + Add input
+                            </button>
+                        </div>
+                        <div id="inputs-list" class="space-y-2"></div>
+                    </div>
+
+                    <div class="flex items-center gap-4 lg:col-span-3">
                         <label class="flex items-center gap-2 cursor-pointer">
                             <input
                                 type="checkbox"
@@ -215,7 +230,7 @@
                             <span class="text-sm">Enable DVR</span>
                         </label>
                     </div>
-                    <div class="flex items-end md:col-span-2 lg:col-span-1">
+                    <div class="flex items-end">
                         <button
                             type="submit"
                             class="w-full bg-[#F59E0B] hover:bg-[#D97706] text-[#121212] font-bold py-2 px-4 rounded-lg transition-colors"
@@ -229,7 +244,21 @@
             <section>
                 <div class="flex items-center justify-between mb-4">
                     <h2 class="text-xl font-semibold">Active Streams</h2>
-                    <div class="flex gap-2">
+                    <div class="flex gap-2 flex-wrap justify-end">
+                        <input
+                            type="text"
+                            id="ice-servers"
+                            placeholder="ICE servers, comma sep (stun:..., turn:...)"
+                            title="Extra STUN/TURN URLs used by the browser. Defaults to Google STUN."
+                            class="text-xs bg-[#121212] border-[#333333] rounded px-2 py-1 outline-none text-[#bebebe] w-64"
+                        />
+                        <input
+                            type="text"
+                            id="public-host"
+                            placeholder="Server public IP (NAT override)"
+                            title="Rewrites ICE candidate IPs in the server answer. Use when the server is behind NAT/port-forwarding."
+                            class="text-xs bg-[#121212] border-[#333333] rounded px-2 py-1 outline-none text-[#bebebe] w-48"
+                        />
                         <input
                             type="text"
                             id="api-override"
@@ -551,7 +580,46 @@
                     return override.endsWith("/")
                         ? override.slice(0, -1)
                         : override;
-                return window.location.origin;
+                // Derive the base from the page URL so a reverse-proxy path
+                // prefix (e.g. https://host/media/debug/webrtc-client) is kept.
+                const marker = "/debug/webrtc-client";
+                const path = window.location.pathname;
+                const idx = path.indexOf(marker);
+                const prefix = idx >= 0 ? path.slice(0, idx) : "";
+                return window.location.origin + prefix;
+            }
+
+            function getIceServers() {
+                const raw = document.getElementById("ice-servers").value.trim();
+                const urls = raw
+                    ? raw
+                          .split(",")
+                          .map((u) => u.trim())
+                          .filter(Boolean)
+                    : ["stun:stun.l.google.com:19302"];
+                return urls.map((u) => ({ urls: u }));
+            }
+
+            // Replace the IP of every host/srflx candidate (and c= line) in the
+            // server's answer with the user supplied public address.
+            function applyPublicHost(sdp) {
+                const host = document
+                    .getElementById("public-host")
+                    .value.trim();
+                if (!host) return sdp;
+                return sdp
+                    .split(/\r?\n/)
+                    .map((line) => {
+                        if (line.startsWith("a=candidate:")) {
+                            const parts = line.split(" ");
+                            if (parts[4] !== undefined) parts[4] = host;
+                            return parts.join(" ");
+                        }
+                        if (line.startsWith("c=IN IP4 "))
+                            return `c=IN IP4 ${host}`;
+                        return line;
+                    })
+                    .join("\r\n");
             }
 
             async function api(path, method = "GET", body = null) {
@@ -667,10 +735,10 @@
                             </div>
                         </div>
                         <div class="p-4 flex gap-2">
-                            <button onclick="startViewing('${stream.source_id}')" class="flex-1 bg-[#F59E0B] hover:bg-[#D97706] py-2 rounded-lg text-sm font-semibold text-[#121212]">
+                            <button onclick="startViewing(${JSON.stringify(stream.source_id).replace(/"/g, "&quot;")})" class="flex-1 bg-[#F59E0B] hover:bg-[#D97706] py-2 rounded-lg text-sm font-semibold text-[#121212]">
                                 View Stream
                             </button>
-                            <button onclick="deleteStream('${stream.source_id}')" class="p-2 text-[#B91C1C] hover:bg-[#B91C1C]/10 rounded-lg">
+                            <button onclick="deleteStream(${JSON.stringify(stream.source_id).replace(/"/g, "&quot;")})" class="p-2 text-[#B91C1C] hover:bg-[#B91C1C]/10 rounded-lg">
                                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
                             </button>
                         </div>
@@ -684,56 +752,81 @@
                 }
             }
 
+            const inputsList = document.getElementById("inputs-list");
+
+            function addInputRow(label = "", url = "") {
+                const row = document.createElement("div");
+                row.className = "input-row grid grid-cols-12 gap-2";
+                const cls =
+                    "bg-[#121212] border-[#333333] rounded-lg px-3 py-2 focus:ring-2 focus:ring-[#F59E0B] outline-none text-[#eaeaea]";
+                row.innerHTML = `
+                    <input type="text" data-f="label" placeholder="label" value="${label}" class="col-span-3 ${cls}" />
+                    <input type="text" data-f="url" required placeholder="rtsp://192.168.1.50:554/ch1" value="${url}" class="col-span-6 ${cls}" />
+                    <input type="number" data-f="priority" min="0" value="${inputsList.children.length}" title="Priority (lower = preferred)" class="col-span-2 ${cls}" />
+                    <button type="button" class="col-span-1 text-[#B91C1C] hover:bg-[#B91C1C]/10 rounded-lg" title="Remove">&times;</button>`;
+                row.querySelector("button").onclick = () => {
+                    if (inputsList.children.length > 1) row.remove();
+                };
+                inputsList.appendChild(row);
+            }
+            document.getElementById("add-input-btn").onclick = () =>
+                addInputRow();
+            addInputRow("main");
+
             document.getElementById("add-stream-form").onsubmit = async (e) => {
                 e.preventDefault();
-                const formData = new FormData(e.target);
+                const form = e.target;
+                const formData = new FormData(form);
 
-                let rtspUrl = formData.get("rtsp_url");
+                const rtspInputs = [...inputsList.children].map((row, i) => {
+                    const get = (f) =>
+                        row.querySelector(`[data-f=${f}]`).value.trim();
+                    return {
+                        label: get("label") || `input-${i}`,
+                        url: get("url"),
+                        priority: parseInt(get("priority")) || 0,
+                    };
+                });
+
+                // Pull credentials embedded in the URL (rtsp://user:pass@host/..)
+                // out into the username/password fields, like the server expects.
                 let username = formData.get("username") || null;
                 let password = formData.get("password") || null;
-
-                const rtspRegex =
-                    /^(rtsp(?:s)?:\/\/)(?:([^:@]+)(?::([^@]*))?@)?(.+)$/;
-                const match = rtspUrl.match(rtspRegex);
-
-                if (match) {
-                    const protocol = match[1];
-                    const urlUsername = match[2] || null;
-                    const urlPassword = match[3] || null;
-                    const hostAndPath = match[4];
-
-                    if (urlUsername || urlPassword) {
-                        if (!username && urlUsername) {
-                            username = urlUsername;
-                        }
-                        if (!password && urlPassword) {
-                            password = urlPassword;
-                        }
-                        rtspUrl = protocol + hostAndPath;
-                    }
+                for (const input of rtspInputs) {
+                    const m = input.url.match(
+                        /^(rtsps?:\/\/)(?:([^:@\/]+)(?::([^@\/]*))?@)(.+)$/,
+                    );
+                    if (!m) continue;
+                    if (!username && m[2]) username = decodeURIComponent(m[2]);
+                    if (!password && m[3]) password = decodeURIComponent(m[3]);
+                    input.url = m[1] + m[4];
                 }
 
+                const restart = parseInt(formData.get("restart_interval_secs"));
                 const payload = {
-                    source_id: parseInt(formData.get("source_id")),
-                    rtsp_url: rtspUrl,
-                    username: username,
-                    password: password,
+                    source_id: formData.get("source_id").trim(),
+                    rtsp_inputs: rtspInputs,
+                    username,
+                    password,
                     should_record: formData.get("should_record") === "on",
+                    restart_interval_secs: restart > 0 ? restart : null,
                 };
 
                 try {
                     await api("/streams", "POST", payload);
-                    e.target.reset();
+                    form.reset();
+                    inputsList.innerHTML = "";
+                    addInputRow("main");
                     refreshStreams();
                     showToast("Stream added successfully");
-                } catch (e) {}
+                } catch (err) {}
             };
 
             async function deleteStream(id) {
                 if (!confirm("Are you sure you want to remove this stream?"))
                     return;
                 try {
-                    await api(`/streams/${id}`, "DELETE");
+                    await api(`/streams/${encodeURIComponent(id)}`, "DELETE");
                     refreshStreams();
                     showToast("Stream deleted");
                 } catch (e) {}
@@ -778,7 +871,7 @@
 
                     // Use the detected RTCPeerConnection constructor
                     pc = new webrtcSupport.RTCPeerConnection({
-                        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+                        iceServers: getIceServers(),
                     });
 
                     const video = document.getElementById("remote-video");
@@ -856,7 +949,7 @@
                     await pc.setRemoteDescription(
                         new webrtcSupport.RTCSessionDescription({
                             type: "answer",
-                            sdp: response.answer,
+                            sdp: applyPublicHost(response.answer),
                         }),
                     );
                     console.log(
@@ -898,7 +991,7 @@
                 await closeActiveSession();
                 await setupWebRTC(
                     streamId,
-                    `/streams/${streamId}/webrtc`,
+                    `/streams/${encodeURIComponent(streamId)}/webrtc`,
                     {},
                     true,
                 );
@@ -908,7 +1001,7 @@
                 await closeActiveSession();
                 await setupWebRTC(
                     streamId,
-                    `/streams/${streamId}/webrtc/dvr`,
+                    `/streams/${encodeURIComponent(streamId)}/webrtc/dvr`,
                     { timestamp: timestampMs },
                     false,
                 );
@@ -931,7 +1024,9 @@
 
                 // Fetch stream info to get recording_start_time and display active source
                 try {
-                    const streamInfo = await api(`/streams/${streamId}`);
+                    const streamInfo = await api(
+                        `/streams/${encodeURIComponent(streamId)}`,
+                    );
                     if (streamInfo && streamInfo.recording_start_time) {
                         // The API returns UnixTimestamp which is u64 in milliseconds
                         currentSession.recordingStartTimeMs =
