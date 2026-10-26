@@ -327,6 +327,8 @@ impl DvrRecorder {
 
         let start_time = crate::utils::get_current_unix_timestamp();
         let dir = filesystem::ensure_stream_dvr_dir(&self.stream_id)?;
+        // The previous state (if any) was stopped above, so any remaining `_latest` file is abandoned.
+        filesystem::remove_abandoned_active_recordings(&self.stream_id)?;
         let filename = filesystem::generate_active_recording_filename(start_time);
         let path = dir.join(filename);
 

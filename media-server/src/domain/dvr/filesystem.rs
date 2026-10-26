@@ -47,6 +47,37 @@ pub fn generate_active_recording_filename(start_time: UnixTimestamp) -> String {
     format!("{}_latest.mp4", start_time)
 }
 
+/// Removes `<start>_latest.mp4` files left behind by recordings that were never finalized
+/// (crash, killed process, ...). Must only be called when no recording is active for the stream,
+/// otherwise multiple `_latest` files would make DVR lookups ambiguous.
+pub fn remove_abandoned_active_recordings(stream_id: &VideoSourceId) -> Result<usize> {
+    let dir = get_stream_dvr_dir(stream_id);
+    if !dir.exists() {
+        return Ok(0);
+    }
+
+    let mut removed = 0;
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let is_active = path.is_file()
+            && path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|f| f.ends_with("_latest.mp4"));
+        if !is_active {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                log::warn!("Removed abandoned DVR recording: {:?}", path);
+                removed += 1;
+            }
+            Err(e) => log::error!("Failed to remove abandoned DVR recording {:?}: {}", path, e),
+        }
+    }
+    Ok(removed)
+}
+
 pub fn generate_finished_recording_filename(
     start_time: UnixTimestamp,
     end_time: UnixTimestamp,
