@@ -587,6 +587,10 @@ impl RtpConsumer for StitchingConsumer {
         self.inner.update_params(params);
     }
 
+    fn on_source_switch(&self) {
+        self.trigger_source_switch();
+    }
+
     async fn finalize(&self) -> anyhow::Result<()> {
         self.inner.finalize().await
     }

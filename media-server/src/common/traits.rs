@@ -44,6 +44,8 @@ pub trait RtpConsumer: Send + Sync {
     async fn on_new_packet(&self, frame: Arc<RtpPacket>);
     /// Called when codec parameters are available or updated.
     fn update_params(&self, _params: &CodecParameters) {}
+    /// Called immediately before forwarding packets from a newly prepared timeline.
+    fn on_source_switch(&self) {}
     async fn finalize(&self) -> anyhow::Result<()> {
         Ok(())
     }

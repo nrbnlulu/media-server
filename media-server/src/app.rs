@@ -38,7 +38,7 @@ impl AppSettings {
 #[derive(Clone)]
 pub enum ClientSessionState {
     Live,
-    Dvr(Arc<DvrPlayer>, Option<Arc<tokio::task::JoinHandle<()>>>),
+    Dvr(Arc<DvrPlayer>),
 }
 
 #[allow(dead_code)]
@@ -77,14 +77,9 @@ impl ClientSession {
         let mut state_guard = self.state.lock().await;
         let mut notify_needed = false;
         match &*state_guard {
-            ClientSessionState::Dvr(player, handle_opt) => {
+            ClientSessionState::Dvr(player) => {
                 if let Err(err) = player.terminate().await {
                     log::error!("Failed to stop pipeline: {}", err);
-                }
-
-                // Abort the spawned task if it exists
-                if let Some(handle) = handle_opt {
-                    handle.abort();
                 }
 
                 self.stitching_consumer.trigger_source_switch();
@@ -112,7 +107,7 @@ impl ClientSession {
     pub async fn seek(&self, timestamp: UnixTimestamp, codec: &VideoCodec) -> Result<()> {
         let mut state_guard = self.state.lock().await;
         match *state_guard {
-            ClientSessionState::Dvr(ref player, _) => {
+            ClientSessionState::Dvr(ref player) => {
                 // Validate timestamp against current recording bounds before seeking
                 let metadata = player.recording_metadata().await;
                 if timestamp < metadata.start_time {
@@ -123,7 +118,6 @@ impl ClientSession {
                 {
                     bail!("seek after end");
                 }
-                self.stitching_consumer.trigger_source_switch();
                 player.seek_to_timestamp(timestamp, 1.0).await?;
                 Ok(())
             }
@@ -138,10 +132,9 @@ impl ClientSession {
                     timestamp,
                     *codec,
                     self.stitching_consumer.clone(),
-                )?;
+                )
+                .await?;
                 let player = Arc::new(player);
-
-                self.stitching_consumer.trigger_source_switch();
 
                 // Remove from live packetizer FIRST to prevent live packet leaking during DVR startup
                 self.live_packetizer
@@ -149,9 +142,8 @@ impl ClientSession {
 
                 let player_clone = player.clone();
                 match player.play().await {
-                    Ok(join_handle) => {
-                        *state_guard =
-                            ClientSessionState::Dvr(player.clone(), Some(Arc::new(join_handle)));
+                    Ok(()) => {
+                        *state_guard = ClientSessionState::Dvr(player.clone());
 
                         // Notify the client of the mode change
                         self.publisher
@@ -177,10 +169,7 @@ impl ClientSession {
             ClientSessionState::Live => {
                 // not much to do
             }
-            ClientSessionState::Dvr(ref player, ref join_handle) => {
-                if let Some(join_handle) = join_handle {
-                    join_handle.abort();
-                }
+            ClientSessionState::Dvr(ref player) => {
                 if let Err(e) = player.terminate().await {
                     log::error!("Failed to terminate DVR player: {}", e);
                 }
@@ -489,7 +478,7 @@ impl GlobalState {
                 current_time_ms: None,
                 speed: 1.0,
             }),
-            ClientSessionState::Dvr(player, _) => {
+            ClientSessionState::Dvr(player) => {
                 let current_time = player.current_time_ms().await;
                 Ok(media_server_api_models::SessionModeResponse {
                     is_live: false,
@@ -503,7 +492,7 @@ impl GlobalState {
     pub async fn set_session_speed(&self, session_id: ClientSessionId, speed: f64) -> Result<()> {
         if let Some(ref session) = self.client_sessions.get(&session_id) {
             let state_guard = session.state.lock().await;
-            if let ClientSessionState::Dvr(ref player, _) = *state_guard {
+            if let ClientSessionState::Dvr(ref player) = *state_guard {
                 player.set_speed(speed);
                 return Ok(());
             }
