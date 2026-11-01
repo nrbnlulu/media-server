@@ -5,7 +5,7 @@ use crate::common::traits::{RtpConsumer, RtpVideoPublisher, VideoSource};
 use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
-use media_server_api_models::{ClientSessionId, SessionMode, wsc_rtp as proto};
+use media_server_api_models::{ClientSessionId, PlaybackEvent, SessionMode, wsc_rtp as proto};
 use media_server_api_models::{WscRtpClientMessage, WscRtpServerMessage};
 use parking_lot::Mutex;
 use std::net::SocketAddr;
@@ -144,6 +144,12 @@ pub fn build_unicast_sdp(
     session.marshal().replace("\r\n", "\n")
 }
 
+enum SessionControl {
+    Mode(SessionMode),
+    Playback(PlaybackEvent),
+    Error(String),
+}
+
 pub struct WscRtpPublisher {
     id: ClientSessionId,
     video_source_id: VideoSourceId,
@@ -152,9 +158,11 @@ pub struct WscRtpPublisher {
     /// Channel used to deliver SDP updates when codec parameters change.
     sdp_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
     /// Channel used to deliver session mode changes to the WebSocket main loop.
-    control_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<(u64, SessionMode)>>>,
+    control_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<(u64, SessionControl)>>>,
     /// Cached current SDP so it's available even if update_params was called before the channel was set up.
     current_sdp: Mutex<Option<String>>,
+    playback: Mutex<Option<PlaybackEvent>>,
+    playback_events: std::sync::atomic::AtomicBool,
     generation: AtomicU64,
     holepunch_port: Mutex<Option<u16>>,
     dead: std::sync::atomic::AtomicBool,
@@ -169,6 +177,8 @@ impl WscRtpPublisher {
             sdp_tx: Mutex::new(None),
             control_tx: Mutex::new(None),
             current_sdp: Mutex::new(None),
+            playback: Mutex::new(None),
+            playback_events: std::sync::atomic::AtomicBool::new(false),
             generation: AtomicU64::new(0),
             holepunch_port: Mutex::new(None),
             dead: std::sync::atomic::AtomicBool::new(false),
@@ -347,6 +357,28 @@ impl RtpConsumer for WscRtpPublisher {
         }
     }
 
+    async fn on_playback_event(&self, event: PlaybackEvent) {
+        *self.playback.lock() = Some(event.clone());
+        let control = if self.playback_events.load(Ordering::Acquire) {
+            Some(SessionControl::Playback(event))
+        } else {
+            match event {
+                PlaybackEvent::Error { message, .. }
+                | PlaybackEvent::RenegotiationRequired { message, .. } => {
+                    Some(SessionControl::Error(message))
+                }
+                _ => None,
+            }
+        };
+        if let Some(control) = control
+            && let Some(tx) = self.control_tx.lock().as_ref()
+        {
+            let _ = tx.send((self.generation.load(Ordering::Acquire), control));
+        }
+    }
+    fn playback_event(&self) -> Option<PlaybackEvent> {
+        self.playback.lock().clone()
+    }
     fn on_source_switch(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
     }
@@ -368,9 +400,15 @@ impl RtpVideoPublisher for WscRtpPublisher {
     }
 
     async fn on_session_mode_change(&self, mode: SessionMode) {
+        if matches!(mode, SessionMode::Live) {
+            *self.playback.lock() = None;
+        }
         if let Some(tx) = self.control_tx.lock().as_ref()
             && tx
-                .send((self.generation.load(Ordering::Acquire), mode))
+                .send((
+                    self.generation.load(Ordering::Acquire),
+                    SessionControl::Mode(mode),
+                ))
                 .is_err()
         {
             log::warn!(
@@ -483,7 +521,11 @@ pub async fn handle_incoming_wsc_rtp_websocket(
     publisher: Arc<WscRtpPublisher>,
     source: Arc<dyn VideoSource>,
     force_websocket_transport: bool,
+    playback_events: bool,
 ) {
+    publisher
+        .playback_events
+        .store(playback_events, Ordering::Release);
     let session_id = *publisher.id();
     let source_id = publisher.source_id().clone();
 
@@ -596,7 +638,8 @@ pub async fn handle_incoming_wsc_rtp_websocket(
     *publisher.rtp_tx.lock() = Some(rtp_tx);
 
     // Create the control channel for session mode changes.
-    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, SessionMode)>();
+    let (control_tx, mut control_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(u64, SessionControl)>();
     *publisher.control_tx.lock() = Some(control_tx);
 
     if udp_sock.is_some() {
@@ -629,8 +672,8 @@ pub async fn handle_incoming_wsc_rtp_websocket(
             }
             Some((generation, mode)) = control_rx.recv() => {
                 if generation != publisher.generation.load(Ordering::Acquire) { continue; }
-                log::info!("Session {}: sending session mode change: {:?}", session_id, mode);
-                if let Ok(payload) = serde_json::to_string(&WscRtpServerMessage::SessionMode(mode)) {
+                let message = match mode { SessionControl::Mode(mode) => WscRtpServerMessage::SessionMode(mode), SessionControl::Playback(event) => WscRtpServerMessage::Playback { event }, SessionControl::Error(message) => WscRtpServerMessage::Error { message } };
+                if let Ok(payload) = serde_json::to_string(&message) {
                     let _ = enqueue(&sender, Message::Text(payload), Some(generation)).await;
                 }
             }
@@ -719,6 +762,50 @@ mod transition_tests {
         assert_eq!(next.seq, first.seq.wrapping_add(1));
         assert_eq!(next.timestamp, first.timestamp.wrapping_add(3000));
         assert_eq!(next.ssrc, first.ssrc);
+    }
+
+    #[tokio::test]
+    async fn playback_events_are_opt_in_but_fatal_errors_remain_compatible() {
+        let publisher = WscRtpPublisher::new("test".into());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *publisher.control_tx.lock() = Some(tx);
+        publisher
+            .on_playback_event(PlaybackEvent::Waiting { timestamp: 123 })
+            .await;
+        assert!(rx.try_recv().is_err());
+        publisher
+            .on_playback_event(PlaybackEvent::Error {
+                timestamp: 123,
+                message: "read failed".into(),
+            })
+            .await;
+        assert!(
+            matches!(rx.recv().await.unwrap().1, SessionControl::Error(message) if message == "read failed")
+        );
+        publisher.playback_events.store(true, Ordering::Release);
+        let event = PlaybackEvent::Ended { timestamp: 123 };
+        publisher.on_playback_event(event.clone()).await;
+        assert!(
+            matches!(rx.recv().await.unwrap().1, SessionControl::Playback(actual) if actual == event)
+        );
+        assert_eq!(publisher.playback_event(), Some(event));
+    }
+    #[test]
+    fn playback_event_round_trips_and_old_query_defaults_remain_valid() {
+        let query: media_server_api_models::WscRtpQuery = serde_json::from_str("{}").unwrap();
+        assert!(!query.playback_events);
+        let message = WscRtpServerMessage::Playback {
+            event: PlaybackEvent::GapSkipped { from: 10, to: 20 },
+        };
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["type"], "playback");
+        assert_eq!(json["event"]["state"], "gap_skipped");
+        assert!(matches!(
+            serde_json::from_value::<WscRtpServerMessage>(json).unwrap(),
+            WscRtpServerMessage::Playback {
+                event: PlaybackEvent::GapSkipped { from: 10, to: 20 }
+            }
+        ));
     }
     #[test]
     fn wire_timeline_uses_sent_packets_not_discarded_backlog() {

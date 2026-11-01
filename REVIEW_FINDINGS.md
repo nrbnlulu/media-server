@@ -8,6 +8,41 @@ The deployed server's exact source revision was not established. During the init
 review, no implementation changes were made. All 25 existing tests passed; they do not cover WSC-RTP
 negotiation or DVR/live transitions.
 
+## Command-line configuration
+
+All server startup settings now use binary arguments. The README lists each flag,
+default and example. Bind address/port, retention period, cleanup interval, DVR root,
+log directory and log filter are configurable; `--help` and `--version` work before
+media/storage initialization. The old BIND_ADDRESS, DVR_RETENTION_SECS and RUST_LOG
+environment settings are ignored. Later historical mentions of environment-based
+configuration are superseded by these flags.
+
+## Playback lifecycle, codec changes and storage maintenance
+
+Implemented observable playing/waiting/gap/end/error states, gap skipping to a safe
+frame, WSC codec/parameter updates, fixed-codec WebRTC renegotiation errors, and
+recording-codec negotiation for new DVR WebRTC sessions. Non-1.0 speeds now fail
+explicitly instead of reporting success without changing playback.
+
+New segments carry pending descriptors for startup recovery. Complete decodable
+fragments are recovered, incomplete tails discarded, and unrecoverable recordings
+quarantined or retained with an error log. Configurable automatic retention excludes
+active/pending files and leased open readers. Deletion is disabled until a positive
+`--dvr-retention-secs` is configured; no production retention setting was changed.
+
+Structured WSC playback events require `playback_events=true` for compatibility;
+REST mode responses expose the latest playback state for both transports. WebRTC
+clients must submit a new offer/session for an incompatible codec. See
+`docs/dvr-playback-and-storage.md` for the full policy and protocol examples.
+
+Validation: 54 workspace tests passed, one optional probe ignored. All ten camera
+compatibility cases pass. Clippy with warnings denied, formatting and whitespace
+checks pass. Coverage includes waiting/resume/end, gaps, codec changes including
+RAM-before-first-fragment transitions, unsupported rates, error notification,
+truncated-file recovery/quarantine, idempotent recovery and retention protections.
+No production deployment or native-client/network interoperability test was run.
+Historical findings below may describe behavior superseded by these changes.
+
 ## Safe DVR/live switching and heartbeat fixes
 
 Implemented generation-scoped playback inputs and complete-access-unit delivery.

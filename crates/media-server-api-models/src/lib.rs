@@ -92,6 +92,8 @@ pub struct SessionModeResponse {
     /// Absolute Unix timestamp in milliseconds of the current DVR frame.
     pub current_time_ms: Option<u64>,
     pub speed: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playback: Option<PlaybackEvent>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -112,6 +114,9 @@ pub struct WscRtpQuery {
     /// Skip UDP negotiation and use WebSocket for RTP delivery from the start
     #[serde(default)]
     pub force_websocket_transport: bool,
+    /// Opt in to structured playback lifecycle events.
+    #[serde(default)]
+    pub playback_events: bool,
 }
 
 pub mod wsc_rtp {
@@ -150,6 +155,17 @@ pub enum SessionMode {
     Dvr { timestamp: u64 },
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PlaybackEvent {
+    Playing { timestamp: u64 },
+    Waiting { timestamp: u64 },
+    GapSkipped { from: u64, to: u64 },
+    Ended { timestamp: u64 },
+    Error { timestamp: u64, message: String },
+    RenegotiationRequired { codec: String, message: String },
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WscRtpServerMessage {
@@ -164,6 +180,9 @@ pub enum WscRtpServerMessage {
         sdp: String,
     },
     SessionMode(SessionMode),
+    Playback {
+        event: PlaybackEvent,
+    },
     Error {
         message: String,
     },

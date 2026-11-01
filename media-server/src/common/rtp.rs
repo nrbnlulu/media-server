@@ -264,9 +264,7 @@ impl RtpPacketizer {
 #[async_trait]
 impl FfmpegConsumer for RtpPacketizer {
     fn initialize(&self, metadata: &FFmpegVideoMetadata) -> anyhow::Result<()> {
-        if self.is_initialized.load(Ordering::Relaxed) {
-            bail!("RtpPacketizer is already initialized");
-        }
+        let reinitializing = self.is_initialized.load(Ordering::Acquire);
 
         let ffmpeg_extradata = metadata
             .extradata
@@ -312,6 +310,9 @@ impl FfmpegConsumer for RtpPacketizer {
         if let Some(params) = self.get_codec_params() {
             let consumers = self.consumers.lock().clone();
             for consumer in &consumers {
+                if reinitializing {
+                    consumer.on_source_switch();
+                }
                 consumer.update_params(&params);
             }
         }
@@ -372,6 +373,7 @@ impl FfmpegConsumer for RtpPacketizer {
                 if params_changed {
                     let consumers = self.consumers.lock().clone();
                     for consumer in consumers {
+                        consumer.on_source_switch();
                         consumer.update_params(&config.codec_params);
                     }
                 }
@@ -587,6 +589,8 @@ impl StitchingConsumer {
             parent: self.clone(),
             generation: self.generation.load(Ordering::Acquire),
             waiting: AtomicBool::new(true),
+            codec: Mutex::new(None),
+            codec_error: AtomicBool::new(false),
         })
     }
     pub async fn next_input(self: &Arc<Self>) -> Arc<dyn RtpConsumer> {
@@ -617,9 +621,23 @@ struct SwitchInput {
     parent: Arc<StitchingConsumer>,
     generation: u64,
     waiting: AtomicBool,
+    codec: Mutex<Option<VideoCodec>>,
+    codec_error: AtomicBool,
 }
 #[async_trait]
 impl RtpConsumer for SwitchInput {
+    fn accepts_codec(&self, codec: VideoCodec) -> bool {
+        self.parent.inner.accepts_codec(codec)
+    }
+    async fn on_playback_event(&self, event: media_server_api_models::PlaybackEvent) {
+        let _delivery = self.parent.delivery.lock().await;
+        if self.generation == self.parent.generation.load(Ordering::Acquire) {
+            self.parent.inner.on_playback_event(event).await;
+        }
+    }
+    fn playback_event(&self) -> Option<media_server_api_models::PlaybackEvent> {
+        self.parent.inner.playback_event()
+    }
     fn id(&self) -> &ClientSessionId {
         &self.parent.id
     }
@@ -630,6 +648,23 @@ impl RtpConsumer for SwitchInput {
     async fn on_frame(&self, packets: Vec<Arc<RtpPacket>>, independent: bool) {
         let _delivery = self.parent.delivery.lock().await;
         if self.generation != self.parent.generation.load(Ordering::Acquire) {
+            return;
+        }
+        let codec = *self.codec.lock();
+        if let Some(codec) = codec
+            && !self.parent.inner.accepts_codec(codec)
+        {
+            if !self.codec_error.swap(true, Ordering::AcqRel) {
+                self.parent
+                    .inner
+                    .on_playback_event(
+                        media_server_api_models::PlaybackEvent::RenegotiationRequired {
+                            codec: codec.mime_type().into(),
+                            message: "Create a new WebRTC offer/session for this codec".into(),
+                        },
+                    )
+                    .await;
+            }
             return;
         }
         if self.waiting.load(Ordering::Acquire) {
@@ -646,6 +681,8 @@ impl RtpConsumer for SwitchInput {
     fn update_params(&self, params: &CodecParameters) {
         let _generation = self.parent.generation_guard.lock();
         if self.generation == self.parent.generation.load(Ordering::Acquire) {
+            *self.codec.lock() = Some(params.codec());
+            self.codec_error.store(false, Ordering::Release);
             self.parent.inner.update_params(params);
         }
     }
@@ -661,6 +698,15 @@ impl RtpConsumer for SwitchInput {
 
 #[async_trait]
 impl RtpConsumer for StitchingConsumer {
+    fn accepts_codec(&self, codec: VideoCodec) -> bool {
+        self.inner.accepts_codec(codec)
+    }
+    async fn on_playback_event(&self, event: media_server_api_models::PlaybackEvent) {
+        self.inner.on_playback_event(event).await;
+    }
+    fn playback_event(&self) -> Option<media_server_api_models::PlaybackEvent> {
+        self.inner.playback_event()
+    }
     fn id(&self) -> &ClientSessionId {
         &self.id
     }
@@ -1054,6 +1100,41 @@ mod tests {
         assert!(frames[frames.len() - 1].header.marker); // Marker bit set
     }
 
+    #[test]
+    fn packetizer_reinitializes_for_codec_changes_without_losing_valid_state_on_error() {
+        let packetizer = RtpPacketizer::new(100, 96);
+        let mut metadata = FFmpegVideoMetadata {
+            codec: VideoCodec::H264,
+            timebase: TimeBase { num: 1, den: 90000 },
+            extradata: Some(vec![
+                1, 100, 0, 30, 255, 225, 0, 4, 0x67, 0x42, 0, 30, 1, 0, 4, 0x68, 0xce, 0x3c, 0x80,
+            ]),
+        };
+        packetizer.initialize(&metadata).unwrap();
+        assert_eq!(
+            packetizer.get_codec_params().unwrap().codec(),
+            VideoCodec::H264
+        );
+        let mut hvcc = vec![
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 30, 0xf0, 0, 0xfc, 0xfc, 0xf8, 0xf8, 0, 0, 3, 3,
+        ];
+        push_h265_array(&mut hvcc, 32, &[0x40, 1, 0x0c]);
+        push_h265_array(&mut hvcc, 33, &[0x42, 1, 1, 0x60]);
+        push_h265_array(&mut hvcc, 34, &[0x44, 1, 0xc0]);
+        metadata.codec = VideoCodec::H265;
+        metadata.extradata = Some(hvcc);
+        packetizer.initialize(&metadata).unwrap();
+        assert_eq!(
+            packetizer.get_codec_params().unwrap().codec(),
+            VideoCodec::H265
+        );
+        metadata.extradata = None;
+        assert!(packetizer.initialize(&metadata).is_err());
+        assert_eq!(
+            packetizer.get_codec_params().unwrap().codec(),
+            VideoCodec::H265
+        );
+    }
     #[test]
     fn test_update_from_h264_extradata() {
         let sps = vec![0x67, 0x42, 0x00, 0x1e];

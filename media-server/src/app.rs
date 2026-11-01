@@ -31,7 +31,7 @@ pub struct AppSettings {}
 
 impl AppSettings {
     pub fn new() -> anyhow::Result<Self> {
-        envy::from_env::<Self>().map_err(|e| anyhow::anyhow!(e))
+        Ok(Self {})
     }
 }
 #[derive(Clone)]
@@ -315,42 +315,56 @@ impl GlobalState {
 
     pub async fn create_websocket_session(
         self: Arc<Self>,
-        sdp_request: CreateWebRtcSessionRequest,
+        request: CreateWebRtcSessionRequest,
         source_id: VideoSourceId,
     ) -> Result<(ClientSessionId, String)> {
-        if let Some(source) = self.sources.get(&source_id).as_ref() {
-            let packetizer = &source.rtp_packetizer;
-            let codec_params = packetizer.get_codec_params();
-            log::debug!(
-                "create_websocket_session: source_id={}, codec_params={:?}",
-                source_id,
-                codec_params.is_some()
-            );
-            let codec_params = codec_params.ok_or_else(|| {
-                anyhow::anyhow!("Codec parameters not found - stream may not be ready")
-            })?;
-
-            let (session, answer_sdp) = self
-                .webrtc_manager
-                .create_new_session(
-                    source_id.clone(),
-                    codec_params,
-                    sdp_request,
-                    self.downgrade(),
-                )
-                .await?;
-
-            let session_id = *session.id();
-            let client_session =
-                ClientSession::new_live(session_id, source_id, session.clone(), packetizer.clone());
-            // Add the stitching consumer to packetizer (not the raw session)
-            packetizer.add_consumer(client_session.stitching_consumer.input());
-            self.client_sessions.insert(session_id, client_session);
-            Ok((session_id, answer_sdp))
-        } else {
-            bail!("Stream not found")
-        }
+        self.create_rtc_session(request, source_id, None).await
     }
+    pub async fn create_dvr_webrtc_session(
+        self: Arc<Self>,
+        request: CreateWebRtcSessionRequest,
+        source_id: VideoSourceId,
+        timestamp: u64,
+    ) -> Result<(ClientSessionId, String)> {
+        self.create_rtc_session(request, source_id, Some(timestamp))
+            .await
+    }
+    async fn create_rtc_session(
+        self: Arc<Self>,
+        request: CreateWebRtcSessionRequest,
+        source_id: VideoSourceId,
+        timestamp: Option<u64>,
+    ) -> Result<(ClientSessionId, String)> {
+        let packetizer = self
+            .sources
+            .get(&source_id)
+            .map(|source| source.rtp_packetizer.clone())
+            .ok_or_else(|| anyhow!("Stream not found"))?;
+        let params = if let Some(timestamp) = timestamp {
+            DvrPlayer::codec_parameters(&source_id, timestamp).await?
+        } else {
+            packetizer
+                .get_codec_params()
+                .ok_or_else(|| anyhow!("Codec parameters not found - stream may not be ready"))?
+        };
+        let (publisher, answer) = self
+            .webrtc_manager
+            .create_new_session(source_id.clone(), params, request, self.downgrade())
+            .await?;
+        let id = *publisher.id();
+        let session = ClientSession::new_live(id, source_id, publisher, packetizer.clone());
+        if let Some(timestamp) = timestamp {
+            if let Err(error) = session.seek(timestamp).await {
+                let _ = self.webrtc_manager.delete_session(&id).await;
+                return Err(error);
+            }
+        } else {
+            packetizer.add_consumer(session.stitching_consumer.input());
+        }
+        self.client_sessions.insert(id, session);
+        Ok((id, answer))
+    }
+
     pub async fn delete_webrtc_session(&self, session_id: &ClientSessionId) -> anyhow::Result<()> {
         self.delete_client_session(session_id).await?;
         self.webrtc_manager.delete_session(session_id).await
@@ -454,6 +468,10 @@ impl GlobalState {
                 is_live: true,
                 current_time_ms: None,
                 speed: 1.0,
+                playback: self
+                    .client_sessions
+                    .get(&session_id)
+                    .and_then(|session| session.publisher.playback_event()),
             }),
             ClientSessionState::Dvr(player) => {
                 let current_time = Some(player.current_timestamp().await);
@@ -461,6 +479,7 @@ impl GlobalState {
                     is_live: false,
                     current_time_ms: current_time,
                     speed: player.speed(),
+                    playback: Some(player.playback_event()),
                 })
             }
         }
@@ -470,7 +489,7 @@ impl GlobalState {
         if let Some(ref session) = self.client_sessions.get(&session_id) {
             let state_guard = session.state.lock().await;
             if let ClientSessionState::Dvr(ref player) = *state_guard {
-                player.set_speed(speed);
+                player.set_speed(speed)?;
                 return Ok(());
             }
             bail!("Speed control only available in DVR mode");

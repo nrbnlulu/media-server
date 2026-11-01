@@ -48,6 +48,13 @@ pub trait RtpConsumer: Send + Sync {
             self.on_new_packet(packet).await;
         }
     }
+    fn accepts_codec(&self, _codec: VideoCodec) -> bool {
+        true
+    }
+    async fn on_playback_event(&self, _event: media_server_api_models::PlaybackEvent) {}
+    fn playback_event(&self) -> Option<media_server_api_models::PlaybackEvent> {
+        None
+    }
     /// Called when codec parameters are available or updated.
     fn update_params(&self, _params: &CodecParameters) {}
     /// Called immediately before forwarding packets from a newly prepared timeline.

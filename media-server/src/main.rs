@@ -2,22 +2,26 @@ mod api;
 pub mod app;
 pub mod common;
 pub mod domain;
+mod options;
 pub mod publishers;
 pub mod sources;
 mod utils;
 use anyhow::Result;
+use clap::Parser;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::signal;
 use tracing_subscriber::{EnvFilter, fmt::writer::MakeWriterExt};
-use utils::DVR_DIRECTORY;
 
 use crate::app::GlobalState;
-fn init() -> Result<tracing_appender::non_blocking::WorkerGuard> {
-    let file_appender = tracing_appender::rolling::daily("logs", "media-server.log");
+fn init(options: &options::Options) -> Result<tracing_appender::non_blocking::WorkerGuard> {
+    let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("media-server.log")
+        .build(&options.log_dir)?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_new(&options.log_filter)?;
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stdout.and(non_blocking))
@@ -43,7 +47,9 @@ fn init() -> Result<tracing_appender::non_blocking::WorkerGuard> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _guard = init()?;
+    let options = options::Options::parse();
+    domain::dvr::filesystem::configure_base_dir(options.dvr_dir.clone())?;
+    let _guard = init(&options)?;
     log::info!("Starting media server v{}", env!("CARGO_PKG_VERSION"));
 
     if let Err(e) = utils::check_dependencies() {
@@ -51,26 +57,50 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Create DVR directory if it doesn't exist
-    std::fs::create_dir_all(DVR_DIRECTORY)?;
-    log::info!("DVR directory: {}", DVR_DIRECTORY);
+    let addr = options.address();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
 
+    let addr = listener.local_addr()?;
+
+    // Create DVR directory if it doesn't exist
+    std::fs::create_dir_all(&options.dvr_dir)?;
+    log::info!("DVR directory: {}", options.dvr_dir.display());
+
+    let recovery_dir = options.dvr_dir.clone();
+    let recovered =
+        tokio::task::spawn_blocking(move || domain::dvr::maintenance::recover(&recovery_dir))
+            .await??;
+    log::info!("Recovered {} DVR segments", recovered);
+    let maintenance = options.retention_seconds().map(|seconds| {
+        let directory = options.dvr_dir.clone();
+        let interval_seconds = options.retention_interval_secs;
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
+            loop {
+                interval.tick().await;
+                let directory = directory.clone();
+                match tokio::task::spawn_blocking(move || {
+                    domain::dvr::maintenance::retain(
+                        &directory,
+                        utils::get_current_unix_timestamp(),
+                        seconds,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(count)) => {
+                        if count > 0 {
+                            log::info!("Removed {} expired DVR segments", count);
+                        }
+                    }
+                    result => log::error!("DVR retention failed: {:?}", result),
+                }
+            }
+        })
+    });
     let app_state = Arc::new(GlobalState::new().await?);
     let app = api::create_router(app_state.clone());
-
-    let mut port = 8009;
-    let args: Vec<String> = std::env::args().collect();
-    for i in 0..args.len() {
-        if args[i] == "--port"
-            && i + 1 < args.len()
-            && let Ok(p) = args[i + 1].parse::<u16>()
-        {
-            port = p;
-        }
-    }
-
-    let addr = std::env::var("BIND_ADDRESS").unwrap_or_else(|_| format!("0.0.0.0:{}", port));
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     log::info!("Server listening on {}", addr);
     log::info!("Swagger UI available at http://{}/swagger-ui", addr);
@@ -89,6 +119,10 @@ async fn main() -> Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
 
+    if let Some(maintenance) = maintenance {
+        maintenance.abort();
+        let _ = maintenance.await;
+    }
     // Perform cleanup after server shutdown
     log::info!("Performing cleanup...");
     if let Err(e) = app_state_clone.cleanup().await {

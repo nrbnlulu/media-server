@@ -271,7 +271,7 @@ impl RecordingState {
             if let Some(segment) = active.iter_mut().find(|s| s.path == self.file_path) {
                 segment.end_ns = segment.end_ns.max(pts_ns);
             } else {
-                active.push(Segment {
+                let segment = Segment {
                     origin_ms: self.session.origin_ms,
                     first_ns: pts_ns,
                     end_ns: pts_ns,
@@ -281,7 +281,14 @@ impl RecordingState {
                     }
                     .into(),
                     path: self.file_path.clone(),
-                });
+                };
+                if let Err(error) = segment.journal() {
+                    log::error!(
+                        "Failed to journal DVR segment {:?}: {error:#}",
+                        segment.path
+                    );
+                }
+                active.push(segment);
             }
         }
         self.session.push(Frame {
@@ -593,11 +600,23 @@ mod tests {
         id: ClientSessionId,
         tx: tokio::sync::mpsc::UnboundedSender<(u16, u32)>,
         previous: Mutex<Option<(u16, u32)>>,
+        events: Mutex<Vec<media_server_api_models::PlaybackEvent>>,
+        codecs: Mutex<Vec<VideoCodec>>,
+        supported: Option<VideoCodec>,
     }
     #[async_trait]
     impl RtpConsumer for Capture {
         fn id(&self) -> &ClientSessionId {
             &self.id
+        }
+        fn accepts_codec(&self, codec: VideoCodec) -> bool {
+            self.supported.is_none_or(|supported| supported == codec)
+        }
+        fn update_params(&self, params: &crate::common::rtp::CodecParameters) {
+            self.codecs.lock().push(params.codec());
+        }
+        async fn on_playback_event(&self, event: media_server_api_models::PlaybackEvent) {
+            self.events.lock().push(event);
         }
         fn on_source_switch(&self) {
             *self.previous.lock() = None;
@@ -677,6 +696,9 @@ mod tests {
                 id: uuid::Uuid::new_v4(),
                 tx,
                 previous: Mutex::new(None),
+                events: Mutex::new(Vec::new()),
+                codecs: Mutex::new(Vec::new()),
+                supported: None,
             }),
             rx,
         )
@@ -982,6 +1004,200 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn playback_notifies_waiting_resume_and_finite_end() {
+        use media_server_api_models::PlaybackEvent;
+        let (source, session, mut state, _cleanup, input) = recording(1, VideoCodec::H264);
+        let (capture, _rx) = new_capture();
+        let player = SegmentedPlayer::new(source, session.origin_ms + 500, capture.clone())
+            .await
+            .unwrap();
+        player.play().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1250)).await;
+        assert!(matches!(
+            player.playback_event(),
+            PlaybackEvent::Waiting { .. }
+        ));
+        for frame in &input {
+            state
+                .push_at(&frame.data, frame.key, frame.pts_ns + 1_000_000_000)
+                .unwrap();
+        }
+        state.stop().unwrap();
+        session.close();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(matches!(
+            player.playback_event(),
+            PlaybackEvent::Ended { .. }
+        ));
+        {
+            let events = capture.events.lock();
+            assert!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, PlaybackEvent::Playing { .. }))
+                    .count()
+                    >= 2
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, PlaybackEvent::Waiting { .. }))
+            );
+            assert!(matches!(events.last(), Some(PlaybackEvent::Ended { .. })));
+        }
+        player.terminate().await.unwrap();
+    }
+    #[tokio::test]
+    async fn playback_skips_a_gap_and_renegotiates_codec_before_new_media() {
+        use media_server_api_models::PlaybackEvent;
+        let (source, session, mut state, _cleanup, _input) = recording(1, VideoCodec::H264);
+        state.stop().unwrap();
+        session.close();
+        let second = Session::new(&source, session.origin_ms + 5000, VideoCodec::H265).unwrap();
+        let mut second_state = RecordingState::new(
+            second.clone(),
+            &VideoCodec::H265,
+            second.origin_ms,
+            FramingFormat::AnnexB,
+        )
+        .unwrap();
+        for frame in fixture_frames(VideoCodec::H265).into_iter().take(30) {
+            second_state
+                .push_at(&frame.data, frame.key, frame.pts_ns)
+                .unwrap();
+        }
+        second_state.stop().unwrap();
+        second.close();
+        let (capture, _rx) = new_capture();
+        let player = SegmentedPlayer::new(source.clone(), session.origin_ms + 500, capture.clone())
+            .await
+            .unwrap();
+        player.play().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2400)).await;
+        assert!(matches!(
+            player.playback_event(),
+            PlaybackEvent::Ended { .. }
+        ));
+        assert_eq!(
+            *capture.codecs.lock(),
+            vec![VideoCodec::H264, VideoCodec::H265]
+        );
+        assert!(
+            capture
+                .events
+                .lock()
+                .iter()
+                .any(|e| matches!(e, PlaybackEvent::GapSkipped { .. }))
+        );
+        player.terminate().await.unwrap();
+        let seek = SegmentedPlayer::new(source, session.origin_ms + 3000, capture)
+            .await
+            .unwrap();
+        assert!(seek.current_timestamp().await >= second.origin_ms);
+    }
+    #[tokio::test]
+    async fn playback_reports_io_failure_and_rejects_unsupported_speed() {
+        use media_server_api_models::PlaybackEvent;
+        let (source, session, mut state, _cleanup, _input) = recording(1, VideoCodec::H264);
+        state.stop().unwrap();
+        session.close();
+        session.clear_recent_for_test();
+        let (capture, _rx) = new_capture();
+        let player = SegmentedPlayer::new(source, session.origin_ms + 500, capture.clone())
+            .await
+            .unwrap();
+        for speed in [0.0, -1.0, 2.0, f64::NAN, f64::INFINITY] {
+            assert!(player.set_speed(speed).is_err());
+        }
+        player.set_speed(1.0).unwrap();
+        std::fs::write(state.file_path.with_extension("json"), b"invalid catalog").unwrap();
+        player.play().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(matches!(
+            player.playback_event(),
+            PlaybackEvent::Error { .. }
+        ));
+        assert!(
+            capture
+                .events
+                .lock()
+                .iter()
+                .any(|e| matches!(e, PlaybackEvent::Error { .. }))
+        );
+        player.terminate().await.unwrap();
+    }
+    #[tokio::test]
+    async fn playback_rejects_an_unnegotiated_codec_with_an_explicit_event() {
+        use media_server_api_models::PlaybackEvent;
+        let (source, session, mut state, _cleanup, _input) = recording(1, VideoCodec::H265);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let capture = Arc::new(Capture {
+            id: uuid::Uuid::new_v4(),
+            tx,
+            previous: Mutex::new(None),
+            events: Mutex::new(Vec::new()),
+            codecs: Mutex::new(Vec::new()),
+            supported: Some(VideoCodec::H264),
+        });
+        assert!(
+            SegmentedPlayer::new(source, session.origin_ms + 500, capture.clone())
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            capture.events.lock().last(),
+            Some(PlaybackEvent::RenegotiationRequired { .. })
+        ));
+        state.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn codec_transition_can_start_from_ram_before_its_first_fragment_is_ready() {
+        use media_server_api_models::PlaybackEvent;
+        let (source, session, mut state, _cleanup, _input) = recording(1, VideoCodec::H264);
+        state.stop().unwrap();
+        session.close();
+        let second = Session::new(&source, session.origin_ms + 5000, VideoCodec::H265).unwrap();
+        let mut second_state = RecordingState::new(
+            second.clone(),
+            &VideoCodec::H265,
+            second.origin_ms,
+            FramingFormat::AnnexB,
+        )
+        .unwrap();
+        let frames = fixture_frames(VideoCodec::H265);
+        second_state
+            .push_at(&frames[0].data, true, frames[0].pts_ns)
+            .unwrap();
+        let (capture, _rx) = new_capture();
+        let player = SegmentedPlayer::new(source, session.origin_ms + 500, capture.clone())
+            .await
+            .unwrap();
+        player.play().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1400)).await;
+        assert_eq!(
+            *capture.codecs.lock(),
+            vec![VideoCodec::H264, VideoCodec::H265]
+        );
+        assert!(matches!(
+            player.playback_event(),
+            PlaybackEvent::Waiting { .. }
+        ));
+        for frame in frames.iter().skip(1).take(29) {
+            second_state
+                .push_at(&frame.data, frame.key, frame.pts_ns)
+                .unwrap();
+        }
+        second_state.stop().unwrap();
+        second.close();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(matches!(
+            player.playback_event(),
+            PlaybackEvent::Ended { .. }
+        ));
+        player.terminate().await.unwrap();
+    }
     /// Optional compatibility matrix: creates encoded video locally and runs it
     /// through the same recorder used for cameras. No network/device is required.
     #[tokio::test]

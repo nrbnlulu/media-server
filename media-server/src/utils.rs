@@ -199,8 +199,6 @@ pub fn unix_epoch_to_system_time(epoch: u64) -> std::time::SystemTime {
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
 
-pub const DVR_DIRECTORY: &str = "dvr";
-
 #[allow(dead_code)]
 pub fn get_stream_hash(rtsp_url: &str) -> String {
     let mut hasher = Sha256::new();
@@ -216,7 +214,7 @@ pub fn get_stream_hash(rtsp_url: &str) -> String {
 
 #[allow(dead_code)]
 pub fn get_dvr_path(source_id: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(DVR_DIRECTORY).join(format!("{}.mp4", source_id))
+    crate::domain::dvr::filesystem::base_dir().join(format!("{}.mp4", source_id))
 }
 
 #[cfg(test)]

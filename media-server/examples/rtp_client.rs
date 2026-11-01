@@ -170,6 +170,7 @@ fn main() -> anyhow::Result<()> {
                     WscRtpServerMessage::SessionMode(mode) => {
                         println!("Session mode: {:?}", mode);
                     }
+                    WscRtpServerMessage::Playback { event } => println!("Playback: {:?}", event),
                     WscRtpServerMessage::Error { message } => {
                         anyhow::bail!("Server error: {}", message);
                     }
@@ -302,6 +303,9 @@ fn build_ws_url(base: &Url, source_id: &str) -> anyhow::Result<Url> {
         .set_scheme(scheme)
         .map_err(|_| anyhow::anyhow!("Failed to set WebSocket scheme"))?;
     ws_url.set_path(&format!("/streams/{}/wsc-rtp", source_id));
+    ws_url
+        .query_pairs_mut()
+        .append_pair("playback_events", "true");
     ws_url.set_query(None);
     Ok(ws_url)
 }

@@ -53,17 +53,41 @@ impl Segment {
     pub fn codec(&self) -> Result<VideoCodec> {
         VideoCodec::from_encoding_name(&self.codec).ok_or_else(|| anyhow!("Unsupported DVR codec"))
     }
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.end_ns >= self.first_ns, "Invalid DVR segment interval");
+        ensure!(
+            self.origin_ms
+                .checked_mul(1_000_000)
+                .and_then(|origin| origin.checked_add(self.end_ns))
+                .is_some(),
+            "DVR segment timestamp overflow"
+        );
+        self.codec()?;
+        Ok(())
+    }
     pub fn start_ms(&self) -> u64 {
         self.origin_ms + self.first_ns / 1_000_000
     }
     pub fn end_ms(&self) -> u64 {
         self.origin_ms + self.end_ns / 1_000_000
     }
+    pub fn journal(&self) -> Result<()> {
+        let pending = self.path.with_extension("pending");
+        let temporary = self.path.with_extension("pending.tmp");
+        std::fs::write(&temporary, serde_json::to_vec(self)?)?;
+        std::fs::rename(temporary, pending)?;
+        Ok(())
+    }
     pub fn publish(&self) -> Result<()> {
         let path = self.path.with_extension("json");
         let temporary = path.with_extension("json.tmp");
         std::fs::write(&temporary, serde_json::to_vec(self)?)?;
         std::fs::rename(temporary, path)?;
+        match std::fs::remove_file(self.path.with_extension("pending")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         Ok(())
     }
 }
@@ -82,6 +106,7 @@ pub struct Session {
     pub closed: AtomicBool,
     pub started: std::time::Instant,
     pub next_file: AtomicU64,
+    pub first_dts: AtomicU64,
     pub completed_until: AtomicU64,
     pub active_files: Mutex<Vec<Segment>>,
 }
@@ -112,6 +137,7 @@ impl Session {
             closed: AtomicBool::new(false),
             started: std::time::Instant::now(),
             next_file: AtomicU64::new(0),
+            first_dts: AtomicU64::new(u64::MAX),
             completed_until: AtomicU64::new(0),
             active_files: Mutex::new(Vec::new()),
         });
@@ -128,6 +154,12 @@ impl Session {
         if recent.frames.is_empty() && !frame.key {
             return;
         }
+        let _ = self.first_dts.compare_exchange(
+            u64::MAX,
+            frame.dts_ns,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
         recent.bytes += frame.data.len();
         let newest = frame.pts_ns;
         recent.frames.push_back(frame);
@@ -215,6 +247,22 @@ impl Session {
     }
 }
 
+pub fn active_paths() -> std::collections::HashSet<PathBuf> {
+    sessions()
+        .lock()
+        .values()
+        .filter_map(Weak::upgrade)
+        .flat_map(|session| {
+            session
+                .active_files
+                .lock()
+                .iter()
+                .map(|s| s.path.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 pub fn list_in(directory: &Path) -> Result<Vec<Segment>> {
     let mut segments = Vec::new();
     if !directory.exists() {
@@ -227,10 +275,7 @@ pub fn list_in(directory: &Path) -> Result<Vec<Segment>> {
         }
         let mut segment: Segment = serde_json::from_slice(&std::fs::read(&path)?)?;
         segment.path = path.with_extension("mp4");
-        ensure!(
-            segment.end_ns >= segment.first_ns,
-            "Invalid DVR segment interval"
-        );
+        segment.validate()?;
         if segment.path.is_file() {
             segments.push(segment);
         }

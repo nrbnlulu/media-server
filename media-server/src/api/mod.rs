@@ -48,6 +48,7 @@ use crate::app::GlobalState;
             models::SeekRequest,
             models::SpeedRequest,
             models::SessionModeResponse,
+            models::PlaybackEvent,
         )
     ),
     tags(

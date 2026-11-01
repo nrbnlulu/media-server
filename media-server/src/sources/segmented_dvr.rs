@@ -1,13 +1,14 @@
 //! One paced RTP timeline spanning finalized MP4 files and recent encoded video.
+#[cfg(test)]
+pub(crate) use crate::domain::dvr::reader::read_segment;
+use crate::domain::dvr::reader::{SegmentReader, readable_len};
 use crate::{
     app::VideoSourceId,
     common::{VideoCodec, nal_utils, rtp::RtpPacketizer, traits::RtpConsumer},
     domain::dvr::segments::{self, Frame, Segment, Session},
 };
 use anyhow::{Result, anyhow, bail, ensure};
-use gst::prelude::*;
-use gstreamer as gst;
-use gstreamer_app as gst_app;
+use media_server_api_models::PlaybackEvent;
 use std::{
     collections::VecDeque,
     sync::{
@@ -17,8 +18,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAX_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
-
 fn absolute(session: &Session, frame: &Frame) -> Frame {
     Frame {
         pts_ns: session.origin_ms * 1_000_000 + frame.pts_ns,
@@ -27,239 +26,10 @@ fn absolute(session: &Session, frame: &Frame) -> Frame {
     }
 }
 
-// Expose only complete top-level MP4 boxes through the last complete mdat.
-// This is a bounded byte view, not a synthetic MP4 index or footer.
-fn readable_len(path: &std::path::Path) -> Result<u64> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path)?;
-    let length = file.metadata()?.len();
-    if path.with_extension("json").exists() {
-        return Ok(length);
-    }
-    let mut offset = 0u64;
-    let mut complete = 0;
-    while length.saturating_sub(offset) >= 8 {
-        file.seek(SeekFrom::Start(offset))?;
-        let mut header = [0u8; 8];
-        file.read_exact(&mut header)?;
-        let short = u32::from_be_bytes(header[..4].try_into()?);
-        let (size, minimum) = if short == 1 {
-            if length - offset < 16 {
-                break;
-            }
-            let mut extended = [0u8; 8];
-            file.read_exact(&mut extended)?;
-            (u64::from_be_bytes(extended), 16)
-        } else {
-            (short as u64, 8)
-        };
-        if size < minimum || size > length - offset {
-            break;
-        }
-        offset += size;
-        if &header[4..] == b"mdat" {
-            complete = offset;
-        }
-    }
-    ensure!(
-        complete > 0,
-        "Active DVR file has no complete media fragment yet"
-    );
-    Ok(complete)
-}
-
-fn snapshot_source(path: &std::path::Path, size: u64) -> Result<gst::Element> {
-    use std::io::{Read, Seek, SeekFrom};
-    let file = Arc::new(parking_lot::Mutex::new(std::fs::File::open(path)?));
-    let seek_file = file.clone();
-    let source = gst_app::AppSrc::builder()
-        .stream_type(gst_app::AppStreamType::RandomAccess)
-        .format(gst::Format::Bytes)
-        .size(i64::try_from(size)?)
-        .build();
-    source.set_callbacks(
-        gst_app::AppSrcCallbacks::builder()
-            .seek_data(move |_, offset| {
-                offset <= size && seek_file.lock().seek(SeekFrom::Start(offset)).is_ok()
-            })
-            .need_data(move |source, requested| {
-                let result = (|| -> Result<Vec<u8>> {
-                    let mut file = file.lock();
-                    let remaining = size.saturating_sub(file.stream_position()?);
-                    let mut data =
-                        vec![0; remaining.min(requested as u64).min(1024 * 1024) as usize];
-                    file.read_exact(&mut data)?;
-                    Ok(data)
-                })();
-                match result {
-                    Ok(data) if data.is_empty() => {
-                        let _ = source.end_of_stream();
-                    }
-                    Ok(data) => {
-                        let _ = source.push_buffer(gst::Buffer::from_mut_slice(data));
-                    }
-                    Err(error) => gst::element_error!(
-                        source,
-                        gst::ResourceError::Read,
-                        ("DVR read failed"),
-                        ["{error:#}"]
-                    ),
-                }
-            })
-            .build(),
-    );
-    Ok(source.upcast())
-}
-
-/// A pull-based demuxer keeps only a bounded appsink queue and one batch in RAM.
-struct SegmentReader {
-    pipeline: gst::Pipeline,
-    sink: gst_app::AppSink,
-    segment: Segment,
-    first_pts: Option<u64>,
-    opened_len: u64,
-    exhausted: bool,
-}
-impl Drop for SegmentReader {
-    fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
-    }
-}
-impl SegmentReader {
-    fn open(segment: Segment) -> Result<Self> {
-        let codec = segment.codec()?;
-        let pipeline = gst::Pipeline::new();
-        let opened_len = readable_len(&segment.path)?;
-        let src = if segment.path.with_extension("json").exists() {
-            gst::ElementFactory::make("filesrc")
-                .property("location", segment.path.to_string_lossy().as_ref())
-                .build()?
-        } else {
-            snapshot_source(&segment.path, opened_len)?
-        };
-        let demux = gst::ElementFactory::make("qtdemux").build()?;
-        let parser = gst::ElementFactory::make(match codec {
-            VideoCodec::H264 => "h264parse",
-            VideoCodec::H265 => "h265parse",
-        })
-        .property("config-interval", -1i32)
-        .build()?;
-        let caps = gst::Caps::builder(match codec {
-            VideoCodec::H264 => "video/x-h264",
-            VideoCodec::H265 => "video/x-h265",
-        })
-        .field("stream-format", "byte-stream")
-        .field("alignment", "au")
-        .build();
-        let sink = gst_app::AppSink::builder()
-            .caps(&caps)
-            .sync(false)
-            .max_buffers(8)
-            .build();
-        if sink.find_property("max-bytes").is_some() {
-            sink.set_property("max-bytes", 4 * 1024 * 1024u64);
-        }
-        pipeline.add_many([&src, &demux, &parser, sink.upcast_ref()])?;
-        src.link(&demux)?;
-        parser.link(&sink)?;
-        let parser_clone = parser.clone();
-        demux.connect_pad_added(move |_, pad| {
-            if let Some(sink) = parser_clone.static_pad("sink")
-                && !sink.is_linked()
-            {
-                let _ = pad.link(&sink);
-            }
-        });
-        pipeline.set_state(gst::State::Playing)?;
-        Ok(Self {
-            pipeline,
-            sink,
-            opened_len,
-            segment,
-            first_pts: None,
-            exhausted: false,
-        })
-    }
-    fn next(&mut self) -> Result<Option<Frame>> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(sample) = self
-                .sink
-                .try_pull_sample(gst::ClockTime::from_mseconds(100))
-            {
-                let buffer = sample
-                    .buffer()
-                    .ok_or_else(|| anyhow!("Missing DVR buffer"))?;
-                let pts = buffer
-                    .pts()
-                    .ok_or_else(|| anyhow!("Missing DVR timestamp"))?
-                    .nseconds();
-                let first = *self.first_pts.get_or_insert(pts);
-                let absolute = self.segment.origin_ms as i128 * 1_000_000
-                    + self.segment.first_ns as i128
-                    + pts as i128
-                    - first as i128;
-                let dts = buffer.dts().map(|t| t.nseconds()).unwrap_or(pts);
-                let absolute_dts = self.segment.origin_ms as i128 * 1_000_000
-                    + self.segment.first_ns as i128
-                    + dts as i128
-                    - first as i128;
-                let data = buffer.map_readable()?;
-                ensure!(
-                    data.len() <= MAX_SEGMENT_BYTES,
-                    "Single DVR frame exceeds memory budget"
-                );
-                return Ok(Some(Frame {
-                    pts_ns: u64::try_from(absolute)?,
-                    dts_ns: u64::try_from(absolute_dts)?,
-                    key: segments::independent_frame(data.as_slice(), self.segment.codec()?),
-                    data: Arc::new(data.as_slice().to_vec()),
-                }));
-            }
-            if let Some(message) = self
-                .pipeline
-                .bus()
-                .and_then(|bus| bus.pop_filtered(&[gst::MessageType::Error]))
-                && let gst::MessageView::Error(error) = message.view()
-            {
-                bail!("DVR segment read failed: {}", error.error());
-            }
-            if self.sink.is_eos() {
-                self.exhausted = true;
-                return Ok(None);
-            }
-            ensure!(Instant::now() < deadline, "DVR segment read timed out");
-        }
-    }
-    fn batch(&mut self) -> Result<VecDeque<Frame>> {
-        let mut frames = VecDeque::new();
-        let mut bytes = 0;
-        while bytes < 4 * 1024 * 1024 && frames.len() < 64 {
-            let Some(frame) = self.next()? else {
-                break;
-            };
-            bytes += frame.data.len();
-            frames.push_back(frame);
-        }
-        Ok(frames)
-    }
-}
-
-// Only test/probe code materializes a whole file to compare all source frames.
-#[cfg(test)]
-pub(crate) fn read_segment(segment: Segment) -> Result<Vec<Frame>> {
-    let mut reader = SegmentReader::open(segment)?;
-    let mut result = Vec::new();
-    while let Some(frame) = reader.next()? {
-        result.push(frame);
-    }
-    ensure!(!result.is_empty(), "DVR segment has no video");
-    Ok(result)
-}
-
 #[derive(Default)]
 struct DiskCursor {
     reader: Option<SegmentReader>,
+    codec: Option<VideoCodec>,
 }
 type SharedDisk = Arc<parking_lot::Mutex<DiskCursor>>;
 
@@ -275,8 +45,9 @@ async fn disk_batch(
                 || (r.exhausted
                     && readable_len(&segment.path).is_ok_and(|length| length != r.opened_len))
         }) {
-            cursor.reader = Some(SegmentReader::open(segment)?);
+            cursor.reader = Some(SegmentReader::open(segment.clone())?);
         }
+        cursor.codec = Some(segment.codec()?);
         let reader = cursor.reader.as_mut().unwrap();
         if let Some(target) = target {
             let mut anchor = None;
@@ -319,6 +90,7 @@ struct Prepared {
     session: Option<Arc<Session>>,
     codec: VideoCodec,
     disk: SharedDisk,
+    seek_gap: Option<(u64, u64)>,
 }
 
 async fn prepare(source: &VideoSourceId, timestamp: u64) -> Result<Prepared> {
@@ -343,6 +115,7 @@ async fn prepare(source: &VideoSourceId, timestamp: u64) -> Result<Prepared> {
             codec: recent.codec,
             disk,
             session,
+            seek_gap: None,
         });
     }
 
@@ -350,6 +123,7 @@ async fn prepare(source: &VideoSourceId, timestamp: u64) -> Result<Prepared> {
     let index = catalog
         .iter()
         .rposition(|s| s.start_ms() <= timestamp && s.end_ms() >= timestamp)
+        .or_else(|| catalog.iter().position(|s| s.start_ms() > timestamp))
         .ok_or_else(|| anyhow!("No segmented recording at requested time"))?;
     let selected = &catalog[index];
     let codec = selected.codec()?;
@@ -360,7 +134,8 @@ async fn prepare(source: &VideoSourceId, timestamp: u64) -> Result<Prepared> {
         }
         // Search earlier files when an open-GOP file has no independent start.
         *disk.lock() = DiskCursor::default();
-        match disk_batch(disk.clone(), segment.clone(), Some(target)).await {
+        let scan_target = target.max(selected.origin_ms * 1_000_000 + selected.first_ns);
+        match disk_batch(disk.clone(), segment.clone(), Some(scan_target)).await {
             Ok(frames) => {
                 prepared_frames = Some(frames);
                 break;
@@ -373,11 +148,14 @@ async fn prepare(source: &VideoSourceId, timestamp: u64) -> Result<Prepared> {
     }
     let frames =
         prepared_frames.ok_or_else(|| anyhow!("No retained independent decoding point"))?;
+    let actual = frames.front().unwrap().pts_ns / 1_000_000;
     Ok(Prepared {
         frames,
         session,
         codec,
         disk,
+        seek_gap: (actual > timestamp && selected.start_ms() > timestamp)
+            .then_some((timestamp, actual)),
     })
 }
 
@@ -387,12 +165,14 @@ async fn next_frames(
     source: &VideoSourceId,
     session: Option<&Arc<Session>>,
     last: u64,
-    codec: VideoCodec,
+    _codec: VideoCodec,
     disk: SharedDisk,
 ) -> Result<VecDeque<Frame>> {
     if let Some(session) = session
         && let Some(frames) = session.after(last)
+        && (!frames.is_empty() || !session.closed.load(Ordering::Acquire))
     {
+        disk.lock().codec = Some(session.codec);
         return Ok(frames);
     }
     let cached = disk.lock().reader.as_ref().map(|r| r.segment.clone());
@@ -412,14 +192,33 @@ async fn next_frames(
         if segment.origin_ms * 1_000_000 + segment.end_ns < last {
             continue;
         }
-        ensure!(
-            segment.codec()? == codec,
-            "DVR codec changed between recordings"
-        );
-        let frames = disk_batch(disk.clone(), segment, None).await?;
+        let frames = match disk_batch(disk.clone(), segment, None).await {
+            Ok(frames) => frames,
+            Err(error)
+                if error
+                    .downcast_ref::<crate::domain::dvr::reader::NotReady>()
+                    .is_some() =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let frames: VecDeque<_> = frames.into_iter().filter(|f| f.dts_ns > last).collect();
         if !frames.is_empty() {
             return Ok(frames);
+        }
+    }
+    // A new source session can already be in RAM before its first fragment
+    // closes. Use it only if its original independent start is still retained.
+    if let Some(active) = Session::active(source) {
+        let frames = active.snapshot();
+        if let Some(first) = frames.first()
+            && first.key
+            && first.dts_ns == active.first_dts.load(Ordering::Acquire)
+            && active.origin_ms * 1_000_000 + first.dts_ns > last
+        {
+            disk.lock().codec = Some(active.codec);
+            return Ok(frames.iter().map(|f| absolute(&active, f)).collect());
         }
     }
     Ok(VecDeque::new())
@@ -435,6 +234,7 @@ pub struct SegmentedPlayer {
     consumer: Arc<dyn RtpConsumer>,
     state: tokio::sync::Mutex<Playback>,
     position_ns: Arc<AtomicU64>,
+    status: Arc<parking_lot::Mutex<PlaybackEvent>>,
 }
 impl Drop for SegmentedPlayer {
     fn drop(&mut self) {
@@ -444,19 +244,30 @@ impl Drop for SegmentedPlayer {
     }
 }
 impl SegmentedPlayer {
+    pub async fn codec_parameters(
+        source: &VideoSourceId,
+        timestamp: u64,
+    ) -> Result<crate::common::rtp::CodecParameters> {
+        let prepared = prepare(source, timestamp).await?;
+        Ok(parameters(prepared.frames.front().unwrap(), prepared.codec))
+    }
     pub fn available(source: &VideoSourceId, timestamp: u64) -> bool {
         Session::active(source).is_some_and(|session| session.contains(timestamp))
-            || segments::list(source).is_ok_and(|catalog| {
-                catalog
-                    .iter()
-                    .any(|segment| segment.start_ms() <= timestamp && timestamp <= segment.end_ms())
-            })
+            || segments::list(source)
+                .is_ok_and(|catalog| catalog.iter().any(|segment| timestamp <= segment.end_ms()))
     }
     pub fn speed(&self) -> f64 {
         1.0
     }
-    pub fn set_speed(&self, _speed: f64) {
-        log::warn!("set_speed not fully implemented yet");
+    pub fn set_speed(&self, speed: f64) -> Result<()> {
+        ensure!(
+            speed == 1.0,
+            "unsupported playback speed: only 1.0 is supported"
+        );
+        Ok(())
+    }
+    pub fn playback_event(&self) -> PlaybackEvent {
+        self.status.lock().clone()
     }
     pub async fn new(
         source: VideoSourceId,
@@ -464,6 +275,7 @@ impl SegmentedPlayer {
         consumer: Arc<dyn RtpConsumer>,
     ) -> Result<Self> {
         let prepared = prepare(&source, timestamp).await?;
+        check_codec(&consumer, prepared.codec).await?;
         let actual_ns = prepared.frames.front().unwrap().pts_ns;
         Ok(Self {
             source,
@@ -473,15 +285,32 @@ impl SegmentedPlayer {
                 prepared: Some(prepared),
             }),
             position_ns: Arc::new(AtomicU64::new(actual_ns)),
+            status: Arc::new(parking_lot::Mutex::new(PlaybackEvent::Playing {
+                timestamp: actual_ns / 1_000_000,
+            })),
         })
     }
     fn spawn(&self, prepared: Prepared) -> tokio::task::JoinHandle<()> {
         let source = self.source.clone();
         let consumer = self.consumer.clone();
         let position = self.position_ns.clone();
+        let status = self.status.clone();
         tokio::spawn(async move {
-            if let Err(error) = stream(source, consumer, position, prepared).await {
-                log::error!("Segmented DVR playback stopped: {error:#}");
+            if let Err(error) = stream(
+                source,
+                consumer.clone(),
+                position.clone(),
+                status.clone(),
+                prepared,
+            )
+            .await
+            {
+                let event = PlaybackEvent::Error {
+                    timestamp: position.load(Ordering::Acquire) / 1_000_000,
+                    message: error.to_string(),
+                };
+                *status.lock() = event.clone();
+                consumer.on_playback_event(event).await;
             }
         })
     }
@@ -504,16 +333,20 @@ impl SegmentedPlayer {
         }
         Ok(())
     }
-    pub async fn seek_to_timestamp(&self, timestamp: u64, _speed: f64) -> Result<()> {
+    pub async fn seek_to_timestamp(&self, timestamp: u64, speed: f64) -> Result<()> {
+        self.set_speed(speed)?;
         let mut state = self.state.lock().await;
         let prepared = prepare(&self.source, timestamp).await?;
+        check_codec(&self.consumer, prepared.codec).await?;
         if let Some(task) = state.task.take() {
             task.abort();
             let _ = task.await;
         }
         self.consumer.on_source_switch();
+        let timestamp = prepared.frames.front().unwrap().pts_ns / 1_000_000;
         self.position_ns
             .store(prepared.frames.front().unwrap().pts_ns, Ordering::Release);
+        *self.status.lock() = PlaybackEvent::Playing { timestamp };
         state.task = Some(self.spawn(prepared));
         Ok(())
     }
@@ -530,10 +363,41 @@ impl Drop for Prefetch {
     }
 }
 
+async fn check_codec(consumer: &Arc<dyn RtpConsumer>, codec: VideoCodec) -> Result<()> {
+    if !consumer.accepts_codec(codec) {
+        consumer
+            .on_playback_event(PlaybackEvent::RenegotiationRequired {
+                codec: codec.mime_type().into(),
+                message: "Create a new WebRTC offer/session for this codec".into(),
+            })
+            .await;
+        bail!(
+            "renegotiation required for {}: create a new WebRTC offer/session",
+            codec.mime_type()
+        );
+    }
+    Ok(())
+}
+async fn notify(
+    consumer: &Arc<dyn RtpConsumer>,
+    status: &parking_lot::Mutex<PlaybackEvent>,
+    event: PlaybackEvent,
+) {
+    *status.lock() = event.clone();
+    consumer.on_playback_event(event).await;
+}
+fn parameters(frame: &Frame, codec: VideoCodec) -> crate::common::rtp::CodecParameters {
+    let mut params = crate::common::rtp::CodecParameters::new(&codec);
+    for nal in nal_utils::parse_annex_b(&frame.data) {
+        params.update_from_nal(&nal);
+    }
+    params
+}
 async fn stream(
     source: VideoSourceId,
     consumer: Arc<dyn RtpConsumer>,
     position: Arc<AtomicU64>,
+    status: Arc<parking_lot::Mutex<PlaybackEvent>>,
     mut prepared: Prepared,
 ) -> Result<()> {
     let packetizer = RtpPacketizer::new(rand::random(), 96);
@@ -542,7 +406,11 @@ async fn stream(
         .front()
         .ok_or_else(|| anyhow!("No DVR frames"))?
         .dts_ns;
-    let started = tokio::time::Instant::now();
+    let mut first = first;
+    let mut started = tokio::time::Instant::now();
+    let mut last_sent = None;
+    let mut configured = None;
+    let mut configured_params = None;
     let mut empty_since = None;
     loop {
         let last = prepared
@@ -559,6 +427,88 @@ async fn stream(
             next_frames(&next_source, session.as_ref(), last, codec, disk).await
         }));
         while let Some(frame) = prepared.frames.pop_front() {
+            if configured != Some(prepared.codec) {
+                if !consumer.accepts_codec(prepared.codec) {
+                    notify(
+                        &consumer,
+                        &status,
+                        PlaybackEvent::RenegotiationRequired {
+                            codec: prepared.codec.mime_type().into(),
+                            message: "Create a new WebRTC offer/session for this codec".into(),
+                        },
+                    )
+                    .await;
+                    return Ok(());
+                }
+                ensure!(frame.key, "Codec transition requires an independent frame");
+                if configured.is_some() {
+                    consumer.on_source_switch();
+                }
+                configured = Some(prepared.codec);
+            }
+            if frame.key {
+                let params = parameters(&frame, prepared.codec);
+                let ready = match &params {
+                    crate::common::rtp::CodecParameters::H264 { sps, pps, .. } => {
+                        sps.is_some() && pps.is_some()
+                    }
+                    crate::common::rtp::CodecParameters::H265 { vps, sps, pps, .. } => {
+                        vps.is_some() && sps.is_some() && pps.is_some()
+                    }
+                };
+                ensure!(ready, "Independent DVR frame is missing codec parameters");
+                if configured_params.as_ref() != Some(&params) {
+                    if configured_params.as_ref().is_some_and(
+                        |old: &crate::common::rtp::CodecParameters| old.codec() == prepared.codec,
+                    ) {
+                        consumer.on_source_switch();
+                    }
+                    consumer.update_params(&params);
+                    configured_params = Some(params);
+                }
+            }
+            if let Some((from, to)) = prepared.seek_gap.take() {
+                notify(&consumer, &status, PlaybackEvent::GapSkipped { from, to }).await;
+            }
+            if let Some(previous) = last_sent
+                && frame.dts_ns.saturating_sub(previous) > 1_000_000_000
+            {
+                if !frame.key {
+                    if !matches!(*status.lock(), PlaybackEvent::Waiting { .. }) {
+                        notify(
+                            &consumer,
+                            &status,
+                            PlaybackEvent::Waiting {
+                                timestamp: position.load(Ordering::Acquire) / 1_000_000,
+                            },
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+                consumer.on_source_switch();
+                notify(
+                    &consumer,
+                    &status,
+                    PlaybackEvent::GapSkipped {
+                        from: position.load(Ordering::Acquire) / 1_000_000,
+                        to: frame.pts_ns / 1_000_000,
+                    },
+                )
+                .await;
+                first = frame.dts_ns;
+                started = tokio::time::Instant::now();
+            }
+            if !matches!(*status.lock(), PlaybackEvent::Playing { .. }) || last_sent.is_none() {
+                notify(
+                    &consumer,
+                    &status,
+                    PlaybackEvent::Playing {
+                        timestamp: frame.pts_ns / 1_000_000,
+                    },
+                )
+                .await;
+            }
             tokio::time::sleep_until(
                 started + Duration::from_nanos(frame.dts_ns.saturating_sub(first)),
             )
@@ -572,19 +522,40 @@ async fn stream(
                 .collect();
             consumer.on_frame(packets, frame.key).await;
             position.store(frame.pts_ns, Ordering::Release);
+            last_sent = Some(frame.dts_ns);
         }
         loop {
             prepared.frames = (&mut next.0).await??;
+            prepared.codec = prepared.disk.lock().codec.unwrap_or(prepared.codec);
             if !prepared.frames.is_empty() {
                 empty_since = None;
                 break;
             }
-            if prepared
-                .session
+            let active = Session::active(&source).or_else(|| prepared.session.clone());
+            if active
                 .as_ref()
                 .is_none_or(|s| s.closed.load(Ordering::Acquire))
             {
+                notify(
+                    &consumer,
+                    &status,
+                    PlaybackEvent::Ended {
+                        timestamp: position.load(Ordering::Acquire) / 1_000_000,
+                    },
+                )
+                .await;
                 return Ok(());
+            }
+            prepared.session = active;
+            if empty_since.is_none() {
+                notify(
+                    &consumer,
+                    &status,
+                    PlaybackEvent::Waiting {
+                        timestamp: position.load(Ordering::Acquire) / 1_000_000,
+                    },
+                )
+                .await;
             }
             let waiting = empty_since.get_or_insert_with(Instant::now);
             ensure!(
@@ -606,6 +577,7 @@ async fn stream(
 #[cfg(test)]
 mod active_file_tests {
     use super::*;
+    use gstreamer as gst;
     #[test]
     fn partial_media_box_is_not_exposed_to_the_demuxer() {
         gst::init().unwrap();
