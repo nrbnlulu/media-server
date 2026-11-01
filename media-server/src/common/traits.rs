@@ -42,6 +42,12 @@ pub trait RtpConsumer: Send + Sync {
     /// Called for each RTP frame. The frame's payload is shared (Arc) across consumers.
     /// Implementations should serialize with `frame.to_bytes()` or access header/payload separately.
     async fn on_new_packet(&self, frame: Arc<RtpPacket>);
+    /// Deliver a complete encoded access unit atomically when supported.
+    async fn on_frame(&self, packets: Vec<Arc<RtpPacket>>, _independent: bool) {
+        for packet in packets {
+            self.on_new_packet(packet).await;
+        }
+    }
     /// Called when codec parameters are available or updated.
     fn update_params(&self, _params: &CodecParameters) {}
     /// Called immediately before forwarding packets from a newly prepared timeline.

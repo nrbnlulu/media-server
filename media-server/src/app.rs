@@ -73,33 +73,18 @@ impl ClientSession {
     }
 
     pub async fn switch_to_live(&self) {
-        let mut state_guard = self.state.lock().await;
-        let mut notify_needed = false;
-        match &*state_guard {
-            ClientSessionState::Dvr(player) => {
-                if let Err(err) = player.terminate().await {
-                    log::error!("Failed to stop pipeline: {}", err);
-                }
-
-                self.stitching_consumer.trigger_source_switch();
-
-                // Re-add stitching consumer to live packetizer
-                // Note: stitching consumer maintains seq continuity automatically
-                self.live_packetizer
-                    .add_consumer(self.stitching_consumer.clone());
-
-                *state_guard = ClientSessionState::Live;
-                notify_needed = true;
+        let mut state = self.state.lock().await;
+        if let ClientSessionState::Dvr(player) = &*state {
+            if let Err(error) = player.terminate().await {
+                log::error!("Failed to stop DVR: {error:#}");
             }
-            ClientSessionState::Live => {}
-        }
-        drop(state_guard);
-
-        if notify_needed {
-            // Notify the client of the mode change
+            let input = self.stitching_consumer.next_input().await;
+            // Queue the new mode before making any new live frames eligible.
             self.publisher
                 .on_session_mode_change(SessionMode::Live)
                 .await;
+            self.live_packetizer.add_consumer(input);
+            *state = ClientSessionState::Live;
         }
     }
 
@@ -121,17 +106,17 @@ impl ClientSession {
                     bail!("No recording found for timestamp {}", timestamp);
                 }
                 // Create DVR player that feeds into the same stitching consumer
-                let player = DvrPlayer::new(
-                    self.source_id.clone(),
-                    timestamp,
-                    self.stitching_consumer.clone(),
-                )
-                .await?;
-                let player = Arc::new(player);
-
-                // Remove from live packetizer FIRST to prevent live packet leaking during DVR startup
                 self.live_packetizer
                     .remove_consumer(self.stitching_consumer.as_ref());
+                let input = self.stitching_consumer.next_input().await;
+                let player = match DvrPlayer::new(self.source_id.clone(), timestamp, input).await {
+                    Ok(player) => Arc::new(player),
+                    Err(error) => {
+                        self.live_packetizer
+                            .add_consumer(self.stitching_consumer.next_input().await);
+                        return Err(error);
+                    }
+                };
 
                 let player_clone = player.clone();
                 match player.play().await {
@@ -150,7 +135,7 @@ impl ClientSession {
                         let _ = player_clone.terminate().await;
                         // Re-add so live stream is restored
                         self.live_packetizer
-                            .add_consumer(self.stitching_consumer.clone());
+                            .add_consumer(self.stitching_consumer.next_input().await);
                         Err(e)
                     }
                 }
@@ -359,7 +344,7 @@ impl GlobalState {
             let client_session =
                 ClientSession::new_live(session_id, source_id, session.clone(), packetizer.clone());
             // Add the stitching consumer to packetizer (not the raw session)
-            packetizer.add_consumer(client_session.stitching_consumer.clone());
+            packetizer.add_consumer(client_session.stitching_consumer.input());
             self.client_sessions.insert(session_id, client_session);
             Ok((session_id, answer_sdp))
         } else {
@@ -392,7 +377,7 @@ impl GlobalState {
                 publisher.clone(),
                 packetizer.clone(),
             );
-            let stitching_consumer = client_session.stitching_consumer.clone();
+            let stitching_consumer = client_session.stitching_consumer.input();
             self.client_sessions.insert(client_id, client_session);
 
             // Add the stitching consumer (which wraps the publisher) to the packetizer

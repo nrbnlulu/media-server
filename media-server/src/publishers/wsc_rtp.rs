@@ -2,10 +2,8 @@ use crate::app::VideoSourceId;
 use crate::common::VideoCodec;
 use crate::common::rtp::RtpPacket;
 use crate::common::traits::{RtpConsumer, RtpVideoPublisher, VideoSource};
-use crate::utils::get_current_unix_timestamp;
 use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket};
-use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
 use media_server_api_models::{ClientSessionId, SessionMode, wsc_rtp as proto};
 use media_server_api_models::{WscRtpClientMessage, WscRtpServerMessage};
@@ -15,7 +13,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::common::rtp::CodecParameters;
@@ -23,7 +20,59 @@ use sdp::description::common::{Address, ConnectionInformation};
 use sdp::description::media::{MediaDescription, MediaName, RangedPort};
 use sdp::description::session::{Origin, SessionDescription, TimeDescription, Timing};
 
-pub type WsSender = SplitSink<WebSocket, Message>;
+/// Stitch at the transport boundary so discarded queue entries do not create
+/// artificial sequence gaps or carry an obsolete playback clock onto the wire.
+struct WireTimeline {
+    stitcher: crate::common::rtp::RtpStitcher,
+    generation: Option<u64>,
+}
+impl WireTimeline {
+    fn new() -> Self {
+        Self {
+            stitcher: crate::common::rtp::RtpStitcher::new(rand::random()),
+            generation: None,
+        }
+    }
+    fn rewrite(&mut self, bytes: &mut [u8], generation: u64) {
+        let Some(header) = crate::common::rtp::RtpHeader::from_bytes(bytes) else {
+            return;
+        };
+        if self.generation != Some(generation) {
+            self.stitcher.trigger_source_switch();
+            self.generation = Some(generation);
+        }
+        let rewritten = self.stitcher.stitch(&RtpPacket::new(header, Arc::from([])));
+        bytes[..12].copy_from_slice(&rewritten.header.to_bytes());
+    }
+}
+type QueuedRtp = (u64, Vec<u8>);
+
+struct Outbound {
+    message: Message,
+    generation: Option<u64>,
+}
+type WsSender = tokio::sync::mpsc::Sender<Outbound>;
+struct ConnectionTasks(Vec<tokio::task::AbortHandle>);
+impl Drop for ConnectionTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+async fn enqueue(
+    sender: &WsSender,
+    message: Message,
+    generation: Option<u64>,
+) -> anyhow::Result<()> {
+    sender
+        .send(Outbound {
+            message,
+            generation,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("WebSocket writer closed"))
+}
 
 pub fn build_unicast_sdp(
     source_id: &VideoSourceId,
@@ -99,13 +148,14 @@ pub struct WscRtpPublisher {
     id: ClientSessionId,
     video_source_id: VideoSourceId,
     /// Channel used to deliver RTP bytes to the active transport (UDP or WebSocket).
-    rtp_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
+    rtp_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<QueuedRtp>>>,
     /// Channel used to deliver SDP updates when codec parameters change.
     sdp_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
     /// Channel used to deliver session mode changes to the WebSocket main loop.
-    control_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<SessionMode>>>,
+    control_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<(u64, SessionMode)>>>,
     /// Cached current SDP so it's available even if update_params was called before the channel was set up.
     current_sdp: Mutex<Option<String>>,
+    generation: AtomicU64,
     holepunch_port: Mutex<Option<u16>>,
     dead: std::sync::atomic::AtomicBool,
 }
@@ -119,6 +169,7 @@ impl WscRtpPublisher {
             sdp_tx: Mutex::new(None),
             control_tx: Mutex::new(None),
             current_sdp: Mutex::new(None),
+            generation: AtomicU64::new(0),
             holepunch_port: Mutex::new(None),
             dead: std::sync::atomic::AtomicBool::new(false),
         }
@@ -288,10 +339,16 @@ impl RtpConsumer for WscRtpPublisher {
         }
         let tx = self.rtp_tx.lock().clone();
         if let Some(tx) = tx
-            && tx.send(packet.to_bytes()).is_err()
+            && tx
+                .send((self.generation.load(Ordering::Acquire), packet.to_bytes()))
+                .is_err()
         {
             log::warn!("Session {}: RTP channel closed", self.id);
         }
+    }
+
+    fn on_source_switch(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     fn update_params(&self, params: &CodecParameters) {
@@ -312,7 +369,9 @@ impl RtpVideoPublisher for WscRtpPublisher {
 
     async fn on_session_mode_change(&self, mode: SessionMode) {
         if let Some(tx) = self.control_tx.lock().as_ref()
-            && tx.send(mode).is_err()
+            && tx
+                .send((self.generation.load(Ordering::Acquire), mode))
+                .is_err()
         {
             log::warn!(
                 "Session {}: failed to send mode change, channel closed",
@@ -326,7 +385,6 @@ async fn handle_wsc_rtp_message(
     session_id: &ClientSessionId,
     sender: &mut WsSender,
     payload: &[u8],
-    last_ping: &Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
     let message = match serde_json::from_slice::<WscRtpClientMessage>(payload) {
         Ok(msg) => msg,
@@ -344,7 +402,6 @@ async fn handle_wsc_rtp_message(
     match message {
         WscRtpClientMessage::Ping => {
             log::trace!("Session {}: received ping", session_id);
-            last_ping.store(get_current_unix_timestamp(), Ordering::Relaxed);
             send_wsc_rtp_message(sender, WscRtpServerMessage::Pong).await
         }
     }
@@ -361,23 +418,62 @@ async fn send_wsc_rtp_message(
             return Err(err.into());
         }
     };
-    sender.send(Message::Text(payload)).await?;
+    enqueue(sender, Message::Text(payload), None).await?;
     Ok(())
 }
 
-async fn last_ping_checker(
-    last_ping: Arc<AtomicU64>,
-    ping_timeout_tx: oneshot::Sender<()>,
+async fn receive_messages<S, E>(
+    mut receiver: S,
+    mut sender: WsSender,
     session_id: ClientSessionId,
-) {
+    timeout: Duration,
+) -> anyhow::Result<()>
+where
+    S: futures::Stream<Item = Result<Message, E>> + Unpin,
+    E: std::fmt::Display,
+{
     loop {
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-        let current_time = get_current_unix_timestamp();
-        let last_ping_time = last_ping.load(Ordering::Relaxed);
-        if (current_time - last_ping_time) >= 5000 {
-            let _ = ping_timeout_tx.send(());
-            log::warn!("Session {}: ping timeout", session_id);
-            return;
+        // Tokio deadlines use a monotonic clock and apply from connection startup.
+        let message = tokio::time::timeout(timeout, receiver.next())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("WebSocket EOF"))?
+            .map_err(|error| anyhow::anyhow!("WebSocket receive failed: {error}"))?;
+        match message {
+            Message::Ping(payload) => enqueue(&sender, Message::Pong(payload), None).await?,
+            Message::Pong(_) => {}
+            Message::Close(_) => return Ok(()),
+            Message::Text(text) => {
+                handle_wsc_rtp_message(&session_id, &mut sender, text.as_bytes()).await?
+            }
+            Message::Binary(bytes) => {
+                handle_wsc_rtp_message(&session_id, &mut sender, &bytes).await?
+            }
+        }
+    }
+}
+
+async fn write_messages<S>(
+    mut wire_sender: S,
+    mut outgoing: tokio::sync::mpsc::Receiver<Outbound>,
+    publisher: Arc<WscRtpPublisher>,
+) where
+    S: futures::Sink<Message> + Unpin,
+{
+    let mut timeline = WireTimeline::new();
+    while let Some(mut output) = outgoing.recv().await {
+        if output
+            .generation
+            .is_some_and(|generation| generation != publisher.generation.load(Ordering::Acquire))
+        {
+            continue;
+        }
+        if let (Some(generation), Message::Binary(bytes)) = (output.generation, &mut output.message)
+        {
+            timeline.rewrite(bytes, generation);
+        }
+        match tokio::time::timeout(Duration::from_secs(5), wire_sender.send(output.message)).await {
+            Ok(Ok(())) => {}
+            _ => break,
         }
     }
 }
@@ -391,16 +487,16 @@ pub async fn handle_incoming_wsc_rtp_websocket(
     let session_id = *publisher.id();
     let source_id = publisher.source_id().clone();
 
-    let (mut sender, mut receiver) = ws.split();
-
-    let last_ping = Arc::new(AtomicU64::new(get_current_unix_timestamp()));
-    let (ping_timeout_tx, mut ping_timeout_rx) = tokio::sync::oneshot::channel();
-
-    let _last_ping_checker_task = tokio::spawn(last_ping_checker(
-        last_ping.clone(),
-        ping_timeout_tx,
+    let (wire_sender, receiver) = ws.split();
+    let (mut sender, outgoing) = tokio::sync::mpsc::channel::<Outbound>(64);
+    let mut writer = tokio::spawn(write_messages(wire_sender, outgoing, publisher.clone()));
+    let mut reader = tokio::spawn(receive_messages(
+        receiver,
+        sender.clone(),
         session_id,
+        Duration::from_secs(5),
     ));
+    let _tasks = ConnectionTasks(vec![writer.abort_handle(), reader.abort_handle()]);
 
     // Try to allocate a UDP port. Skip if client requested WebSocket-only transport.
     let udp_port_result = if force_websocket_transport {
@@ -446,13 +542,21 @@ pub async fn handle_incoming_wsc_rtp_websocket(
 
     // If update_params was already called before the channel existed, the SDP is cached.
     // Use it immediately; otherwise wait up to 5 seconds for the first SDP.
+    let mut last_sdp = None;
     if let Some(sdp) = publisher.get_sdp() {
         log::info!("Session {}: sending cached SDP", session_id);
+        last_sdp = Some(sdp.clone());
         let _ = send_wsc_rtp_message(&mut sender, WscRtpServerMessage::Sdp { sdp }).await;
     } else {
-        match tokio::time::timeout(Duration::from_secs(5), sdp_rx.recv()).await {
+        let initial = tokio::select! {
+            _ = &mut reader => { publisher.shutdown(); return; },
+            _ = &mut writer => { publisher.shutdown(); return; },
+            value = tokio::time::timeout(Duration::from_secs(5), sdp_rx.recv()) => value,
+        };
+        match initial {
             Ok(Some(sdp)) => {
                 log::info!("Session {}: sending SDP", session_id);
+                last_sdp = Some(sdp.clone());
                 let _ = send_wsc_rtp_message(&mut sender, WscRtpServerMessage::Sdp { sdp }).await;
             }
             _ => {
@@ -476,22 +580,23 @@ pub async fn handle_incoming_wsc_rtp_websocket(
     }
 
     // Negotiate UDP (5-second timeout). Falls back to WebSocket if unavailable.
-    // We do not select! over the receiver here to avoid consuming WebSocket messages
-    // (e.g. pings) that should be handled in the main loop.
+    // The independent receiver continues handling pings during negotiation.
     let udp_sock = if let Ok((_, rcv_sock)) = udp_port_result {
-        negotiate_with_timeout(&publisher, rcv_sock, Duration::from_secs(5), &session_id)
-            .await
-            .ok()
+        tokio::select! {
+            _ = &mut reader => { publisher.shutdown(); return; },
+            _ = &mut writer => { publisher.shutdown(); return; },
+            result = negotiate_with_timeout(&publisher, rcv_sock, Duration::from_secs(5), &session_id) => result.ok(),
+        }
     } else {
         None
     };
 
     // Create the RTP channel.
-    let (rtp_tx, mut rtp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (rtp_tx, mut rtp_rx) = tokio::sync::mpsc::unbounded_channel::<QueuedRtp>();
     *publisher.rtp_tx.lock() = Some(rtp_tx);
 
     // Create the control channel for session mode changes.
-    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<SessionMode>();
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, SessionMode)>();
     *publisher.control_tx.lock() = Some(control_tx);
 
     if udp_sock.is_some() {
@@ -508,23 +613,12 @@ pub async fn handle_incoming_wsc_rtp_websocket(
         let _ = send_wsc_rtp_message(&mut sender, WscRtpServerMessage::FallingBackRtpToWs).await;
     }
 
-    let mut last_sdp = None;
-
+    let mut udp_timeline = WireTimeline::new();
     loop {
         tokio::select! {
-            _ = &mut ping_timeout_rx => {
-                log::warn!("Session {}: closed due to ping timeout", session_id);
-                break;
-            }
-            Some(rtp_bytes) = rtp_rx.recv() => {
-                if let Some(ref sock) = udp_sock {
-                    if let Err(err) = sock.send(&rtp_bytes).await {
-                        log::error!("Session {}: error sending RTP packet: {}", session_id, err);
-                    }
-                } else if let Err(err) = sender.send(Message::Binary(rtp_bytes)).await {
-                    log::error!("Session {}: error sending RTP packet: {}", session_id, err);
-                };
-            }
+            biased;
+            _ = &mut reader => break,
+            _ = &mut writer => break,
             Some(sdp) = sdp_rx.recv() => {
                 if last_sdp.as_ref() != Some(&sdp) {
                     log::info!("Session {}: sending SDP update", session_id);
@@ -533,48 +627,185 @@ pub async fn handle_incoming_wsc_rtp_websocket(
                     }
                 }
             }
-            Some(mode) = control_rx.recv() => {
+            Some((generation, mode)) = control_rx.recv() => {
+                if generation != publisher.generation.load(Ordering::Acquire) { continue; }
                 log::info!("Session {}: sending session mode change: {:?}", session_id, mode);
-                let _ = send_wsc_rtp_message(&mut sender, WscRtpServerMessage::SessionMode(mode)).await;
-            }
-            res = receiver.next() => {
-                let msg = match res {
-                    Some(Ok(msg)) => msg,
-                    Some(Err(err)) => {
-                        log::error!("Session {}: error receiving WebSocket message: {}", session_id, err);
-                        break;
-                    }
-                    None => continue,
-                };
-
-                let data: Vec<u8> = match msg {
-                    Message::Text(text) => text.into_bytes(),
-                    Message::Binary(data) => data.to_vec(),
-                    Message::Ping(payload) => {
-                        last_ping.store(get_current_unix_timestamp(), Ordering::Relaxed);
-                        if sender.send(Message::Pong(payload)).await.is_err() {
-                            log::error!("Session {}: error sending Pong message", session_id);
-                        }
-                        continue;
-                    }
-                    Message::Pong(_) => {
-                        last_ping.store(get_current_unix_timestamp(), Ordering::Relaxed);
-                        continue;
-                    }
-                    Message::Close(_) => {
-                        log::info!("Session {}: error closing WebSocket connection", session_id);
-                        break;
-                    }
-                };
-
-                if let Err(err) = handle_wsc_rtp_message(&session_id, &mut sender, &data, &last_ping).await {
-                    log::error!("Session {}: error handling message: {}", session_id, err);
-                    break;
+                if let Ok(payload) = serde_json::to_string(&WscRtpServerMessage::SessionMode(mode)) {
+                    let _ = enqueue(&sender, Message::Text(payload), Some(generation)).await;
                 }
+            }
+            Some((generation, mut rtp_bytes)) = rtp_rx.recv() => {
+                if generation != publisher.generation.load(Ordering::Acquire) { continue; }
+                if let Some(ref sock) = udp_sock {
+                    udp_timeline.rewrite(&mut rtp_bytes, generation);
+                    match tokio::time::timeout(Duration::from_secs(5), sock.send(&rtp_bytes)).await {
+                        Ok(Ok(_)) => {},
+                        _ => { log::warn!("Session {}: UDP send failed or timed out", session_id); break; }
+                    }
+                } else if enqueue(&sender, Message::Binary(rtp_bytes), Some(generation)).await.is_err() { break; }
             }
         }
     }
 
     log::info!("Session {}: closed for stream {}", session_id, source_id);
     publisher.shutdown();
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+    use crate::common::rtp::RtpHeader;
+
+    #[tokio::test]
+    async fn queued_media_retains_its_generation_across_a_switch() {
+        let publisher = WscRtpPublisher::new("test".into());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *publisher.rtp_tx.lock() = Some(tx);
+        let packet = Arc::new(RtpPacket::new(
+            RtpHeader {
+                payload_type: 96,
+                marker: true,
+                seq: 1,
+                timestamp: 100,
+                ssrc: 4,
+            },
+            Arc::from([0x65u8]),
+        ));
+        publisher.on_new_packet(packet.clone()).await;
+        publisher.on_source_switch();
+        publisher.on_new_packet(packet).await;
+        let (old, _) = rx.recv().await.unwrap();
+        let (current, _) = rx.recv().await.unwrap();
+        assert_ne!(old, publisher.generation.load(Ordering::Acquire));
+        assert_eq!(current, publisher.generation.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn writer_discards_obsolete_queue_entries_before_rewriting_rtp() {
+        let publisher = Arc::new(WscRtpPublisher::new("test".into()));
+        let (wire, mut received) = futures::channel::mpsc::unbounded::<Message>();
+        let (out, queue) = tokio::sync::mpsc::channel(8);
+        let writer = tokio::spawn(write_messages(wire, queue, publisher.clone()));
+        let packet = |seq, timestamp| {
+            Message::Binary(
+                RtpPacket::new(
+                    RtpHeader {
+                        payload_type: 96,
+                        marker: true,
+                        seq,
+                        timestamp,
+                        ssrc: 99,
+                    },
+                    Arc::from([0x65u8]),
+                )
+                .to_bytes(),
+            )
+        };
+        enqueue(&out, packet(10, 90000), Some(0)).await.unwrap();
+        let Message::Binary(first) = received.next().await.unwrap() else {
+            panic!("expected RTP");
+        };
+        publisher.on_source_switch();
+        enqueue(&out, packet(200, 900000), Some(0)).await.unwrap();
+        enqueue(&out, packet(500, 3000000), Some(1)).await.unwrap();
+        drop(out);
+        writer.await.unwrap();
+        let Message::Binary(next) = received.next().await.unwrap() else {
+            panic!("expected RTP");
+        };
+        assert!(received.next().await.is_none());
+        let first = RtpHeader::from_bytes(&first).unwrap();
+        let next = RtpHeader::from_bytes(&next).unwrap();
+        assert_eq!(next.seq, first.seq.wrapping_add(1));
+        assert_eq!(next.timestamp, first.timestamp.wrapping_add(3000));
+        assert_eq!(next.ssrc, first.ssrc);
+    }
+    #[test]
+    fn wire_timeline_uses_sent_packets_not_discarded_backlog() {
+        let mut timeline = WireTimeline::new();
+        let packet = |seq, timestamp| {
+            RtpPacket::new(
+                RtpHeader {
+                    payload_type: 96,
+                    marker: true,
+                    seq,
+                    timestamp,
+                    ssrc: 123,
+                },
+                Arc::from([0x65u8]),
+            )
+            .to_bytes()
+        };
+        let mut first = packet(10, 90000);
+        timeline.rewrite(&mut first, 0);
+        // Queued old packets with later timestamps/sequence numbers were discarded.
+        let mut live = packet(500, 5000000);
+        timeline.rewrite(&mut live, 1);
+        let first = RtpHeader::from_bytes(&first).unwrap();
+        let live = RtpHeader::from_bytes(&live).unwrap();
+        assert_eq!(live.seq, first.seq.wrapping_add(1));
+        assert_eq!(live.timestamp, first.timestamp.wrapping_add(3000));
+        assert_eq!(live.ssrc, first.ssrc);
+    }
+    #[tokio::test]
+    async fn heartbeat_is_answered_while_negotiation_is_still_pending() {
+        let (mut tx, rx) = futures::channel::mpsc::unbounded::<Result<Message, std::io::Error>>();
+        let (out, mut incoming) = tokio::sync::mpsc::channel(8);
+        let reader = tokio::spawn(receive_messages(
+            rx,
+            out,
+            Uuid::new_v4(),
+            Duration::from_millis(150),
+        ));
+        let startup = tokio::time::sleep(Duration::from_millis(500));
+        tokio::pin!(startup);
+        for index in 0..6 {
+            let message = if index % 2 == 0 {
+                Message::Text(serde_json::to_string(&WscRtpClientMessage::Ping).unwrap())
+            } else {
+                Message::Ping(vec![index])
+            };
+            tx.send(Ok(message)).await.unwrap();
+            let response = tokio::time::timeout(Duration::from_millis(100), incoming.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match response.message {
+                Message::Text(text) => assert!(matches!(
+                    serde_json::from_str::<WscRtpServerMessage>(&text).unwrap(),
+                    WscRtpServerMessage::Pong
+                )),
+                Message::Pong(payload) => assert_eq!(payload, vec![index]),
+                _ => panic!("unexpected heartbeat response"),
+            }
+            assert!(!reader.is_finished());
+            tokio::time::sleep(Duration::from_millis(35)).await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::ZERO, &mut startup)
+                .await
+                .is_err()
+        );
+        tx.send(Ok(Message::Close(None))).await.unwrap();
+        reader.await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn heartbeat_timeout_and_eof_end_the_receiver() {
+        let (tx, rx) = futures::channel::mpsc::unbounded::<Result<Message, std::io::Error>>();
+        let (out, _incoming) = tokio::sync::mpsc::channel(8);
+        assert!(
+            receive_messages(rx, out.clone(), Uuid::new_v4(), Duration::from_millis(30))
+                .await
+                .is_err()
+        );
+        drop(tx);
+        let (tx, rx) = futures::channel::mpsc::unbounded::<Result<Message, std::io::Error>>();
+        drop(tx);
+        let ended = tokio::time::timeout(
+            Duration::from_millis(50),
+            receive_messages(rx, out, Uuid::new_v4(), Duration::from_secs(5)),
+        )
+        .await;
+        assert!(ended.unwrap().is_err());
+    }
 }

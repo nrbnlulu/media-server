@@ -565,9 +565,12 @@ async fn stream(
             .await;
             let nals = nal_utils::parse_annex_b(&frame.data);
             let timestamp = ((frame.pts_ns as u128 * 90000) / 1_000_000_000) as u32;
-            for packet in packetizer.packetize(&nals, timestamp, &prepared.codec) {
-                consumer.on_new_packet(Arc::new(packet)).await;
-            }
+            let packets = packetizer
+                .packetize(&nals, timestamp, &prepared.codec)
+                .into_iter()
+                .map(Arc::new)
+                .collect();
+            consumer.on_frame(packets, frame.key).await;
             position.store(frame.pts_ns, Ordering::Release);
         }
         loop {

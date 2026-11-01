@@ -8,6 +8,45 @@ The deployed server's exact source revision was not established. During the init
 review, no implementation changes were made. All 25 existing tests passed; they do not cover WSC-RTP
 negotiation or DVR/live transitions.
 
+## Safe DVR/live switching and heartbeat fixes
+
+Implemented generation-scoped playback inputs and complete-access-unit delivery.
+A source switch waits for in-flight frame delivery, invalidates the previous input,
+and gates the new live input until a complete independent H.264 IDR / H.265 IDR/BLA
+frame arrives. The live packetizer prepends cached SPS/PPS or VPS/SPS/PPS and only
+marks a frame eligible for startup once those parameters are available. Old cloned
+live subscriptions cannot feed a newly selected timeline. Failed DVR preparation
+restores live through a fresh gated input. The live mode notification is enqueued
+before subscribing to new live media.
+
+WSC-RTP queues carry their source generation; obsolete media and mode notifications
+are discarded before transport writes. The WebSocket writer checks again after its
+bounded output queue. Sequence numbers/timestamps are stitched at the transport
+boundary, using packets actually selected for output rather than obsolete backlog.
+WebRTC retains the common generation/frame gate and stitching path.
+
+WebSocket receiving now runs independently throughout SDP and UDP negotiation.
+JSON pings and standard WebSocket Ping/Pong are handled during startup; the five-
+second receive inactivity timeout uses Tokio's monotonic clock. EOF and Close end
+the receiver. Connection exit cancels the reader/writer tasks. Writes have a five-
+second deadline, so a stalled socket cannot retain connection tasks indefinitely.
+The initial SDP also initializes deduplication, avoiding an identical first update.
+
+Validation: 41 tests pass, one optional probe ignored; Clippy with warnings denied,
+formatting and whitespace checks pass. Regression tests cover stale generations,
+independent-frame gating, switching during fragmented delivery, parameter sets and
+fragmented H.264/H.265 IDRs, writer-side stale-queue filtering and output continuity,
+startup heartbeats while negotiation is pending, idle timeout and EOF. Tests use
+controlled streams/sinks; this change has not been deployed or checked on a camera
+or real UDP/WebSocket network during this stage.
+
+Remaining limits: already transmitted packets cannot be recalled, and UDP may
+reorder them. The RTP producer queue is still unbounded; general overload policy
+remains separate work. A camera supplying no supported independent decoding point
+will leave live output gated. General codec renegotiation, client transition tagging,
+credential sanitization and the other unresolved findings remain open. The historical
+entries below describe the original behavior. Changes are uncommitted for review.
+
 ## Legacy playback removed
 
 Playback now uses the segmented player directly. The legacy single-file player,
