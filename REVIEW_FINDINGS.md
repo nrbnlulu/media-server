@@ -8,6 +8,14 @@ The deployed server's exact source revision was not established. During the init
 review, no implementation changes were made. All 25 existing tests passed; they do not cover WSC-RTP
 negotiation or DVR/live transitions.
 
+## Legacy playback removed
+
+Playback now uses the segmented player directly. The legacy single-file player,
+backend-selection wrapper, virtual MP4 index and legacy recording filename/lookup
+helpers have been removed. Old loose MP4 recordings are no longer discovered or
+played. Recording data on disk was not deleted. Historical review entries below
+retain the context of the earlier implementation.
+
 ## Completed compatibility fixes — November 1
 
 The implementation now passes all ten generated compatibility cases: closed

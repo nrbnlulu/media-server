@@ -1,6 +1,6 @@
 `dvr-fragmented.mp4` contains 12 seconds of 16×16 black H.264 video at
 30 frames per second, with one-second fragments and no mfra index. It was
-created with the legacy recorder muxer:
+generated with `isofmp4mux` as encoded input for the current recorder tests:
 
 ```sh
 gst-launch-1.0 -q videotestsrc pattern=black num-buffers=360 \

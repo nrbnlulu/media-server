@@ -444,6 +444,20 @@ impl Drop for SegmentedPlayer {
     }
 }
 impl SegmentedPlayer {
+    pub fn available(source: &VideoSourceId, timestamp: u64) -> bool {
+        Session::active(source).is_some_and(|session| session.contains(timestamp))
+            || segments::list(source).is_ok_and(|catalog| {
+                catalog
+                    .iter()
+                    .any(|segment| segment.start_ms() <= timestamp && timestamp <= segment.end_ms())
+            })
+    }
+    pub fn speed(&self) -> f64 {
+        1.0
+    }
+    pub fn set_speed(&self, _speed: f64) {
+        log::warn!("set_speed not fully implemented yet");
+    }
     pub async fn new(
         source: VideoSourceId,
         timestamp: u64,

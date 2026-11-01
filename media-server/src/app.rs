@@ -1,12 +1,11 @@
-use crate::common::VideoCodec;
 use crate::common::rtp::{RtpPacketizer, StitchingConsumer};
 use crate::common::traits::{RtpConsumer, RtpVideoPublisher, VideoSource};
 use crate::domain::dvr::{filesystem, recorder::DvrRecorder};
 use crate::domain::{StreamConfig, StreamInfo, StreamState};
 use crate::publishers::webrtc::WebrtcManager;
 use crate::publishers::wsc_rtp::WscRtpPublisher;
-use crate::sources::dvr_playback::DvrPlayback as DvrPlayer;
 use crate::sources::rtsp::RtspClient;
+use crate::sources::segmented_dvr::SegmentedPlayer as DvrPlayer;
 use anyhow::{Result, anyhow, bail};
 use dashmap::DashMap;
 use gstreamer::glib::clone::Downgrade;
@@ -104,7 +103,7 @@ impl ClientSession {
         }
     }
 
-    pub async fn seek(&self, timestamp: UnixTimestamp, codec: &VideoCodec) -> Result<()> {
+    pub async fn seek(&self, timestamp: UnixTimestamp) -> Result<()> {
         let mut state_guard = self.state.lock().await;
         match *state_guard {
             ClientSessionState::Dvr(ref player) => {
@@ -125,7 +124,6 @@ impl ClientSession {
                 let player = DvrPlayer::new(
                     self.source_id.clone(),
                     timestamp,
-                    *codec,
                     self.stitching_consumer.clone(),
                 )
                 .await?;
@@ -453,11 +451,8 @@ impl GlobalState {
         timestamp: UnixTimestamp,
     ) -> Result<()> {
         if let Some(ref session) = self.client_sessions.get(session_id) {
-            if let Some(source) = self.sources.get(session.source_id()).as_ref() {
-                let codec = source.value().source.codec().await.ok_or(anyhow!(
-                    "source is not ready, no codec...\n try again later"
-                ))?;
-                return session.seek(timestamp, &codec).await;
+            if self.sources.contains_key(session.source_id()) {
+                return session.seek(timestamp).await;
             }
             bail!("Source not found");
         }
