@@ -29,11 +29,13 @@ struct RecordingState {
     waiting_for_keyframe: bool,
     header_buffer: Vec<Vec<u8>>,
     stream_started: bool,
+    pending_stops: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for RecordingState {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
+        self.join_pending_stops();
     }
 }
 
@@ -118,6 +120,7 @@ impl RecordingState {
             appsrc: appsrc_typed,
             header_buffer: Vec::new(),
             stream_started: false,
+            pending_stops: Vec::new(),
             framing_format,
         })
     }
@@ -144,6 +147,16 @@ impl RecordingState {
         nals
     }
 
+    fn join_pending_stops(&mut self) {
+        for worker in self.pending_stops.drain(..) {
+            // These tasks contain only blocking work; waiting here does not
+            // require driving Tokio's async scheduler (including in Drop).
+            if let Err(error) = futures::executor::block_on(worker) {
+                log::error!("DVR segment finalizer failed: {error}");
+            }
+        }
+    }
+
     fn stop(&mut self) -> anyhow::Result<()> {
         let result = (|| -> Result<()> {
             self.appsrc.end_of_stream()?;
@@ -163,24 +176,28 @@ impl RecordingState {
             Ok(())
         })();
         let stopped = self.pipeline.set_state(gst::State::Null);
+        self.join_pending_stops();
+        // A failed finalization keeps its file and active metadata available;
+        // never publish it as complete or advance the completion watermark.
         result?;
         stopped?;
-        if let Some(segment) = self
-            .session
-            .active_files
-            .lock()
-            .iter()
-            .find(|s| s.path == self.file_path)
-        {
+        let mut active = self.session.active_files.lock();
+        if let Some(segment) = active.iter().find(|s| s.path == self.file_path) {
             segment.publish()?;
-            self.session
-                .completed_until
-                .fetch_max(self.last_dts, std::sync::atomic::Ordering::Release);
+            // Background finalizers can complete out of order. Do not mark an
+            // earlier pending/failed segment's footage safe to evict from RAM.
+            if !active
+                .iter()
+                .any(|s| s.path != self.file_path && s.first_ns < segment.first_ns)
+            {
+                self.session
+                    .completed_until
+                    .fetch_max(self.last_dts, std::sync::atomic::Ordering::Release);
+            }
         }
-        self.session
-            .active_files
-            .lock()
-            .retain(|s| s.path != self.file_path);
+        active.retain(|s| s.path != self.file_path);
+        drop(active);
+        self.session.trim_completed();
         self.waiting_for_keyframe = true;
         self.header_buffer.clear();
         self.stream_started = false;
@@ -211,6 +228,7 @@ impl RecordingState {
         dts_ns: u64,
     ) -> Result<()> {
         let independent = segments::independent_frame(data, self.codec);
+        let mut previous = None;
         if independent
             && self
                 .first_dts
@@ -227,8 +245,9 @@ impl RecordingState {
             replacement.packet_timing = self.packet_timing;
             replacement.header_buffer = self.header_buffer.clone();
             replacement.waiting_for_keyframe = false;
-            let mut previous = std::mem::replace(self, replacement);
-            previous.stop()?;
+            let mut old = std::mem::replace(self, replacement);
+            self.pending_stops = std::mem::take(&mut old.pending_stops);
+            previous = Some(old);
         }
         self.first_dts.get_or_insert(dts_ns);
         self.last_dts = dts_ns;
@@ -271,10 +290,32 @@ impl RecordingState {
             key: independent,
             data: Arc::new(data.to_vec()),
         });
-        match self.appsrc.push_buffer(buffer) {
-            Ok(_) => Ok(()),
-            Err(gst::FlowError::Flushing) => Ok(()),
-            Err(e) => bail!("Failed to push buffer: {:?}", e),
+        // Enqueue the new segment's independent frame before starting any
+        // potentially slow/erroring EOS work on the previous segment.
+        let pushed = self.appsrc.push_buffer(buffer);
+        if let Some(mut previous) = previous {
+            // Reap completed workers without delaying packet processing.
+            let mut index = 0;
+            while index < self.pending_stops.len() {
+                if self.pending_stops[index].is_finished() {
+                    if let Err(error) =
+                        futures::executor::block_on(self.pending_stops.remove(index))
+                    {
+                        log::error!("DVR segment finalizer failed: {error}");
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            self.pending_stops.push(tokio::task::spawn_blocking(move || {
+                if let Err(error) = previous.stop() {
+                    log::error!("Failed to finalize DVR segment {:?}; retaining active recording: {error:#}", previous.file_path);
+                }
+            }));
+        }
+        match pushed {
+            Ok(_) | Err(gst::FlowError::Flushing) => Ok(()),
+            Err(error) => bail!("Failed to push buffer: {error:?}"),
         }
     }
 
@@ -838,6 +879,109 @@ mod tests {
         player.terminate().await.unwrap();
         state.stop().unwrap();
     }
+
+    #[tokio::test]
+    async fn rotation_accepts_new_frame_before_waiting_for_previous_eos() {
+        let (_source, session, mut state, _cleanup, frames) = recording(2, VideoCodec::H264);
+        let old_path = state.file_path.clone();
+        let next_pts = frames[0].pts_ns + segments::SEGMENT_NS;
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let recent = session.clone();
+        state.appsrc.static_pad("src").unwrap().add_probe(
+            gst::PadProbeType::EVENT_DOWNSTREAM,
+            move |_, info| {
+                if info
+                    .event()
+                    .is_some_and(|event| matches!(event.view(), gst::EventView::Eos(_)))
+                {
+                    let accepted = recent
+                        .snapshot()
+                        .iter()
+                        .any(|frame| frame.dts_ns == next_pts);
+                    let _ = seen_tx.send(accepted);
+                    let _ = release_rx.lock().recv_timeout(Duration::from_secs(3));
+                }
+                gst::PadProbeReturn::Ok
+            },
+        );
+        let started = Instant::now();
+        state.push_at(&frames[0].data, true, next_pts).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "rotation waited for EOS"
+        );
+        assert!(
+            seen_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "EOS started before the replacement frame was accepted"
+        );
+        assert!(
+            session
+                .active_files
+                .lock()
+                .iter()
+                .any(|segment| segment.path == old_path)
+        );
+        state
+            .push_at(&frames[1].data, false, next_pts + 33_333_000)
+            .unwrap();
+        release_tx.send(()).unwrap();
+        state.stop().unwrap();
+        assert!(old_path.with_extension("json").exists());
+        assert!(session.active_files.lock().is_empty());
+        assert!(state.pending_stops.is_empty());
+    }
+
+    #[tokio::test]
+    async fn previous_stop_failure_does_not_drop_rotation_frame_or_active_metadata() {
+        let (_source, session, mut state, _cleanup, frames) = recording(2, VideoCodec::H264);
+        let old_path = state.file_path.clone();
+        state
+            .pipeline
+            .bus()
+            .unwrap()
+            .post(
+                gst::message::Error::builder(
+                    gst::ResourceError::Write,
+                    "injected finalization failure",
+                )
+                .src(&state.pipeline)
+                .build(),
+            )
+            .unwrap();
+        let next_pts = frames[0].pts_ns + segments::SEGMENT_NS;
+        state.push_at(&frames[0].data, true, next_pts).unwrap();
+        let new_path = state.file_path.clone();
+        assert_ne!(new_path, old_path);
+        assert!(
+            session
+                .snapshot()
+                .iter()
+                .any(|frame| frame.dts_ns == next_pts && frame.key)
+        );
+        state
+            .push_at(&frames[1].data, false, next_pts + 33_333_000)
+            .unwrap();
+        state.stop().unwrap(); // Also joins the failing previous finalizer.
+        assert!(old_path.exists());
+        assert!(!old_path.with_extension("json").exists());
+        assert!(new_path.with_extension("json").exists());
+        assert!(
+            session
+                .active_files
+                .lock()
+                .iter()
+                .any(|segment| segment.path == old_path)
+        );
+        assert_eq!(
+            session
+                .completed_until
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
+
     /// Optional compatibility matrix: creates encoded video locally and runs it
     /// through the same recorder used for cameras. No network/device is required.
     #[tokio::test]

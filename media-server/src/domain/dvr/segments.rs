@@ -131,6 +131,17 @@ impl Session {
         recent.bytes += frame.data.len();
         let newest = frame.pts_ns;
         recent.frames.push_back(frame);
+        self.trim_recent(&mut recent, newest);
+    }
+
+    pub(crate) fn trim_completed(&self) {
+        let mut recent = self.recent.lock();
+        if let Some(newest) = recent.frames.back().map(|frame| frame.pts_ns) {
+            self.trim_recent(&mut recent, newest);
+        }
+    }
+
+    fn trim_recent(&self, recent: &mut Recent, newest: u64) {
         // The duration is a soft target: keep the current GOP until another
         // decoding anchor exists. The byte limit remains a hard bound.
         loop {
