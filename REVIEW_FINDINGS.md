@@ -8,6 +8,107 @@ The deployed server's exact source revision was not established. During the init
 review, no implementation changes were made. All 25 existing tests passed; they do not cover WSC-RTP
 negotiation or DVR/live transitions.
 
+## Compatibility implementation progress
+
+The duration target now preserves a long active GOP within the byte budget.
+Source PTS/DTS are preserved when available, and playback uses DTS for ordering and
+pacing while retaining PTS for RTP and displayed recording time. Production disk
+reads now use a persistent, bounded demuxer instead of collecting whole segments.
+The whole-file collector is restricted to diagnostic/test code.
+
+The closed-GOP B-frame cases now pass for both codecs without timestamp warnings;
+the approximately 80 Mbps H.264 case now passes the recording/read checks and
+sampled seeks. The normal suite has 39 passing tests and two ignored probes.
+Active-file reads and open-GOP safe seeks remain unfinished. In particular, a
+single seek-preroll GOP exceeding 64 MiB still fails explicitly. These results do
+not yet establish complete camera compatibility. See `PLANS/camera-compatibility-fixes.md`.
+
+## Camera compatibility checks — November 1
+
+Baseline: `7fc4168` (the segmented migration is now committed). These checks use
+locally generated moving H.264/H.265 streams through the actual recording pipeline;
+physical camera settings and production recordings were not changed. GStreamer
+1.28.8 and FFmpeg n9.0.2 were used. Playback/recording behavior is unchanged in this
+check; the additions are a reproducible probe and these findings.
+
+**Long/open GOPs and high bitrates cannot yet be marked supported.** The matrix
+exposes failures that the initial short-GOP, low-bitrate tests did not exercise.
+
+| Generated source | Measured result |
+| --- | --- |
+| H.264, closed 20-second GOPs, 62 seconds total | All 620 frames decode correctly after finalization, but temporary DVR history gaps appear while recording. At elapsed 31 seconds, rewinding 15 or 25 seconds fails. |
+| H.264/H.265, closed 45-second GOPs, 92 seconds total | All 920 frames decode after finalization. The recent buffer becomes empty once the current GOP exceeds 30 seconds; even a one-second rewind fails at elapsed 31, 40 and 44 seconds. It fails again before the next keyframe at 90 seconds. |
+| H.264/H.265, closed 2-second GOPs with B frames, 24 seconds total | Independently decoded files retain all 240 frames, but each file produces non-monotonic timestamp warnings. Preserving content alone does not establish correct B-frame timing. |
+| H.264/H.265, open 2-second GOPs with B frames, 24 seconds total | Sequential elementary-stream playback retains all 240 frames and hashes match the source. Independently decoding the three MP4 files produces only 234 frames; H.264 also reports missing references. Seeking/starting at a file boundary is unsafe. Timestamp warnings occur here too. |
+| H.264, closed 1-second GOPs, approximately 39.90 Mbps | All 240 decoded frame hashes match, sampled rewinds succeed, and completed files fit the playback budget. |
+| H.264, closed 1-second GOPs, approximately 79.80 Mbps | Ten-second MP4 files are about 94.8–95.4 MiB. Both full segments fail with `DVR segment exceeds playback memory limit`. The recent buffer retains only about six seconds, so immediate rewind works while older seeks fail. The short final segment remains readable. |
+| H.264, closed 10-second GOPs, approximately 79.80 Mbps | A single GOP exceeds the buffer budget. Recent video becomes empty before the next keyframe, and both full disk segments exceed the read budget. One-second rewinds already fail at elapsed 10 and 20 seconds. |
+
+The bitrate cases use actual CBR filler NALs to reach the measured encoded rates;
+these are byte-volume and storage/playback checks, not a high-resolution decoder
+performance benchmark. All sources use 160×96 moving video at 10 fps. The recorder
+receives access units in decode order with simulated arrival timestamps, reproducing
+its existing PTS=DTS policy. The generator's original bitstream is retained as the
+independent decoding reference.
+
+### Why the failures happen
+
+1. `Session::push` removes the oldest GOP once its first frame is more than thirty
+   seconds old, even if it is the only retained GOP. It then discards delta frames
+   until the next keyframe. Long-GOP footage becomes unavailable despite using very
+   little memory. Even twenty-second GOPs can leave a hole: the recent buffer evicts
+   footage before `splitmuxsink` has finalized the corresponding file. Rotation and
+   finalization need subsequent keyframes/GOP data; ten seconds is not a hard bound.
+2. `read_segment` collects the entire demuxed segment into a `Vec<Frame>` and rejects
+   more than 64 MiB. With ten-second files, that corresponds to roughly 54 Mbps of
+   encoded payload, and the effective bitrate limit is lower for longer files.
+   `max-size-bytes` is currently disabled on the recorder. The separate 64 MiB
+   recent-buffer limit can also remove the active GOP at high bitrates.
+3. A keyframe flag does not guarantee an independently decodable closed GOP. The
+   seek code selects flagged keyframes without retaining predecessor dependencies.
+   The independent-file decode failure does **not** prove that uninterrupted RTP
+   playback fails: concatenating the demuxed elementary streams and keeping decoder
+   references preserved every frame and hash in both open-GOP cases. GStreamer
+   explicitly requires closed GOPs for independent split-file playback:
+   [splitmuxsink documentation](https://gstreamer.freedesktop.org/documentation/multifile/splitmuxsink.html).
+4. The recorder replaces source presentation/decode timestamps with arrival time
+   and assigns PTS=DTS. The closed-GOP B-frame controls isolate this existing timing
+   defect from the additional open-GOP seek/dependency problem. Both need attention.
+
+### Reproduction and follow-up
+
+Run the complete matrix locally:
+
+```sh
+python3 media-server/tests/camera_compatibility_probe.py --output /tmp/dvr-camera-check
+```
+
+This requires the local Rust build dependencies, GStreamer `x264enc`/`x265enc`, and
+FFmpeg. No network or device is required. The optional Rust probe records each
+case, checks seek preparation during recording, and saves finalized MP4 files.
+The Python runner compares independent and continuous decoding against the source
+using frame hashes and checks timestamp warnings. It exits **1** when compatibility
+failures are found; the Rust probe succeeding only means artifact generation worked.
+Use `--decode-only` to recheck existing output, or `--cases` to select cases.
+
+Artifacts are under `/tmp/dvr-camera-check/<case>/`: `results.json`,
+`decode-results.json`, source bitstream and completed segments. The aggregate
+report is `/tmp/dvr-camera-check/summary.json`. These generated video files are
+not committed. The normal workspace suite passes: 37 tests passed, two optional
+probes ignored. Clippy with warnings denied, formatting and whitespace checks pass.
+
+Required fixes before claiming broader camera compatibility:
+
+- Keep the GOP/dependency overlap needed for recent playback until disk footage is
+  actually readable. A soft duration target must coexist with a hard byte budget;
+  GOPs exceeding that budget need a disk-backed path or an explicit supported limit.
+- Read large files incrementally with bounded queues rather than loading an entire
+  segment. Byte-based rotation can reduce typical file sizes, but cannot split a
+  single oversized GOP into independently playable pieces.
+- Preserve source PTS/DTS and implement dependency-aware seek/preroll for open GOPs,
+  or enforce/detect a closed-GOP recording requirement. Treating every flagged
+  keyframe as an independent start point is insufficient.
+
 ## Segmented recording migration — October 29
 
 The previous rewind fix is committed as `f49cbe8`. The migration is implemented

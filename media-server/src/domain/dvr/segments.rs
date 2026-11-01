@@ -19,6 +19,7 @@ const BUFFER_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Clone)]
 pub struct Frame {
     pub pts_ns: u64,
+    pub dts_ns: u64,
     pub key: bool,
     pub data: Arc<Vec<u8>>,
 }
@@ -108,21 +109,31 @@ impl Session {
         recent.bytes += frame.data.len();
         let newest = frame.pts_ns;
         recent.frames.push_back(frame);
-        // Evict complete GOPs. Never leave a delta frame as the first frame.
-        while recent.bytes > BUFFER_BYTES
-            || recent
+        // The duration is a soft target: keep the current GOP until another
+        // decoding anchor exists. The byte limit remains a hard bound.
+        loop {
+            let next_key = recent
+                .frames
+                .iter()
+                .skip(1)
+                .position(|f| f.key)
+                .map(|i| i + 1);
+            let expired = recent
                 .frames
                 .front()
-                .is_some_and(|f| newest.saturating_sub(f.pts_ns) > BUFFER_NS)
-        {
-            if let Some(old) = recent.frames.pop_front() {
-                recent.bytes -= old.data.len();
+                .is_some_and(|f| newest.saturating_sub(f.pts_ns) > BUFFER_NS);
+            if recent.bytes <= BUFFER_BYTES && !(expired && next_key.is_some()) {
+                break;
             }
-            while recent.frames.front().is_some_and(|f| !f.key) {
-                recent.bytes -= recent.frames.pop_front().unwrap().data.len();
+            let remove = next_key.unwrap_or(recent.frames.len());
+            for _ in 0..remove {
+                if let Some(old) = recent.frames.pop_front() {
+                    recent.bytes -= old.data.len();
+                }
             }
         }
     }
+
     pub fn snapshot(&self) -> Vec<Frame> {
         self.recent.lock().frames.iter().cloned().collect()
     }
@@ -131,8 +142,8 @@ impl Session {
     pub fn after(&self, absolute_ns: u64) -> Option<VecDeque<Frame>> {
         let relative = absolute_ns.checked_sub(self.origin_ms * 1_000_000)?;
         let recent = self.recent.lock();
-        let index = recent.frames.partition_point(|f| f.pts_ns < relative);
-        if recent.frames.get(index)?.pts_ns != relative {
+        let index = recent.frames.partition_point(|f| f.dts_ns < relative);
+        if recent.frames.get(index)?.dts_ns != relative {
             return None;
         }
         Some(
@@ -142,6 +153,7 @@ impl Session {
                 .skip(index + 1)
                 .map(|frame| Frame {
                     pts_ns: self.origin_ms * 1_000_000 + frame.pts_ns,
+                    dts_ns: self.origin_ms * 1_000_000 + frame.dts_ns,
                     ..frame.clone()
                 })
                 .collect(),
@@ -220,6 +232,7 @@ mod tests {
         for index in 0..100 {
             session.push(Frame {
                 pts_ns: index * 1_000_000,
+                dts_ns: index * 1_000_000,
                 key: index % 10 == 0,
                 data: data.clone(),
             });
@@ -230,6 +243,31 @@ mod tests {
         assert!(recent.frames.front().unwrap().pts_ns > 0);
         assert_eq!(recent.frames.back().unwrap().pts_ns, 99_000_000);
         drop(recent);
+        std::fs::remove_dir(directory).unwrap();
+    }
+    #[test]
+    fn duration_target_keeps_a_long_active_gop_within_byte_budget() {
+        let source = format!("long-gop-{}", uuid::Uuid::new_v4());
+        let directory = std::env::temp_dir().join(&source);
+        let session =
+            Session::in_directory(&source, 0, VideoCodec::H264, directory.clone()).unwrap();
+        for index in 0..450 {
+            session.push(Frame {
+                pts_ns: index * 100_000_000,
+                dts_ns: index * 100_000_000,
+                key: index == 0,
+                data: Arc::new(vec![1; 100]),
+            });
+        }
+        assert!(session.contains(44_000));
+        assert_eq!(session.snapshot().first().unwrap().pts_ns, 0);
+        session.push(Frame {
+            pts_ns: 45_000_000_000,
+            dts_ns: 45_000_000_000,
+            key: true,
+            data: Arc::new(vec![1; 100]),
+        });
+        assert_eq!(session.snapshot().first().unwrap().pts_ns, 45_000_000_000);
         std::fs::remove_dir(directory).unwrap();
     }
 }

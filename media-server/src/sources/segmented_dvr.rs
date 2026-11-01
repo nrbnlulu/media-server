@@ -22,103 +22,192 @@ const MAX_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
 fn absolute(session: &Session, frame: &Frame) -> Frame {
     Frame {
         pts_ns: session.origin_ms * 1_000_000 + frame.pts_ns,
+        dts_ns: session.origin_ms * 1_000_000 + frame.dts_ns,
         ..frame.clone()
     }
 }
 
-/// Read encoded access units, without decoding or re-encoding the video.
-pub(crate) fn read_segment(segment: Segment) -> Result<Vec<Frame>> {
-    let codec = segment.codec()?;
-    let pipeline = gst::Pipeline::new();
-    struct Stop(gst::Pipeline);
-    impl Drop for Stop {
-        fn drop(&mut self) {
-            let _ = self.0.set_state(gst::State::Null);
-        }
+/// A pull-based demuxer keeps only a bounded appsink queue and one batch in RAM.
+struct SegmentReader {
+    pipeline: gst::Pipeline,
+    sink: gst_app::AppSink,
+    segment: Segment,
+    first_pts: Option<u64>,
+}
+impl Drop for SegmentReader {
+    fn drop(&mut self) {
+        let _ = self.pipeline.set_state(gst::State::Null);
     }
-    let _stop = Stop(pipeline.clone());
-    let src = gst::ElementFactory::make("filesrc")
-        .property("location", segment.path.to_string_lossy().as_ref())
+}
+impl SegmentReader {
+    fn open(segment: Segment) -> Result<Self> {
+        let codec = segment.codec()?;
+        let pipeline = gst::Pipeline::new();
+        let src = gst::ElementFactory::make("filesrc")
+            .property("location", segment.path.to_string_lossy().as_ref())
+            .build()?;
+        let demux = gst::ElementFactory::make("qtdemux").build()?;
+        let parser = gst::ElementFactory::make(match codec {
+            VideoCodec::H264 => "h264parse",
+            VideoCodec::H265 => "h265parse",
+        })
+        .property("config-interval", -1i32)
         .build()?;
-    let demux = gst::ElementFactory::make("qtdemux").build()?;
-    let parser = gst::ElementFactory::make(match codec {
-        VideoCodec::H264 => "h264parse",
-        VideoCodec::H265 => "h265parse",
-    })
-    .property("config-interval", -1i32)
-    .build()?;
-    let caps = gst::Caps::builder(match codec {
-        VideoCodec::H264 => "video/x-h264",
-        VideoCodec::H265 => "video/x-h265",
-    })
-    .field("stream-format", "byte-stream")
-    .field("alignment", "au")
-    .build();
-    let sink = gst_app::AppSink::builder()
-        .caps(&caps)
-        .sync(false)
-        .max_buffers(8)
+        let caps = gst::Caps::builder(match codec {
+            VideoCodec::H264 => "video/x-h264",
+            VideoCodec::H265 => "video/x-h265",
+        })
+        .field("stream-format", "byte-stream")
+        .field("alignment", "au")
         .build();
-    pipeline.add_many([&src, &demux, &parser, sink.upcast_ref()])?;
-    src.link(&demux)?;
-    parser.link(&sink)?;
-    let parser_clone = parser.clone();
-    demux.connect_pad_added(move |_, pad| {
-        if let Some(sink) = parser_clone.static_pad("sink")
-            && !sink.is_linked()
-        {
-            let _ = pad.link(&sink);
-        }
-    });
-    pipeline.set_state(gst::State::Playing)?;
-    let mut frames = Vec::new();
-    let mut bytes = 0;
-    let mut first_pts = None;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(100)) {
-            let buffer = sample
-                .buffer()
-                .ok_or_else(|| anyhow!("Missing DVR sample buffer"))?;
-            let pts = buffer
-                .pts()
-                .ok_or_else(|| anyhow!("Missing DVR sample timestamp"))?
-                .nseconds();
-            let first = *first_pts.get_or_insert(pts);
-            ensure!(
-                pts >= first,
-                "DVR presentation timestamps are not monotonic"
-            );
-            let map = buffer.map_readable()?;
-            bytes += map.len();
-            ensure!(
-                bytes <= MAX_SEGMENT_BYTES,
-                "DVR segment exceeds playback memory limit"
-            );
-            frames.push(Frame {
-                pts_ns: segment.origin_ms * 1_000_000 + segment.first_ns + pts - first,
-                key: !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT),
-                data: Arc::new(map.as_slice().to_vec()),
-            });
-        } else if sink.is_eos() {
-            break;
-        } else {
-            if let Some(message) = pipeline
+        let sink = gst_app::AppSink::builder()
+            .caps(&caps)
+            .sync(false)
+            .max_buffers(8)
+            .build();
+        pipeline.add_many([&src, &demux, &parser, sink.upcast_ref()])?;
+        src.link(&demux)?;
+        parser.link(&sink)?;
+        let parser_clone = parser.clone();
+        demux.connect_pad_added(move |_, pad| {
+            if let Some(sink) = parser_clone.static_pad("sink")
+                && !sink.is_linked()
+            {
+                let _ = pad.link(&sink);
+            }
+        });
+        pipeline.set_state(gst::State::Playing)?;
+        Ok(Self {
+            pipeline,
+            sink,
+            segment,
+            first_pts: None,
+        })
+    }
+    fn next(&mut self) -> Result<Option<Frame>> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(sample) = self
+                .sink
+                .try_pull_sample(gst::ClockTime::from_mseconds(100))
+            {
+                let buffer = sample
+                    .buffer()
+                    .ok_or_else(|| anyhow!("Missing DVR buffer"))?;
+                let pts = buffer
+                    .pts()
+                    .ok_or_else(|| anyhow!("Missing DVR timestamp"))?
+                    .nseconds();
+                let first = *self.first_pts.get_or_insert(pts);
+                let absolute = self.segment.origin_ms as i128 * 1_000_000
+                    + self.segment.first_ns as i128
+                    + pts as i128
+                    - first as i128;
+                let dts = buffer.dts().map(|t| t.nseconds()).unwrap_or(pts);
+                let absolute_dts = self.segment.origin_ms as i128 * 1_000_000
+                    + self.segment.first_ns as i128
+                    + dts as i128
+                    - first as i128;
+                let data = buffer.map_readable()?;
+                ensure!(
+                    data.len() <= MAX_SEGMENT_BYTES,
+                    "Single DVR frame exceeds memory budget"
+                );
+                return Ok(Some(Frame {
+                    pts_ns: u64::try_from(absolute)?,
+                    dts_ns: u64::try_from(absolute_dts)?,
+                    key: !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT),
+                    data: Arc::new(data.as_slice().to_vec()),
+                }));
+            }
+            if let Some(message) = self
+                .pipeline
                 .bus()
                 .and_then(|bus| bus.pop_filtered(&[gst::MessageType::Error]))
                 && let gst::MessageView::Error(error) = message.view()
             {
                 bail!("DVR segment read failed: {}", error.error());
             }
+            if self.sink.is_eos() {
+                return Ok(None);
+            }
             ensure!(Instant::now() < deadline, "DVR segment read timed out");
         }
     }
-    ensure!(!frames.is_empty(), "DVR segment has no video");
-    Ok(frames)
+    fn batch(&mut self) -> Result<VecDeque<Frame>> {
+        let mut frames = VecDeque::new();
+        let mut bytes = 0;
+        while bytes < 4 * 1024 * 1024 && frames.len() < 64 {
+            let Some(frame) = self.next()? else {
+                break;
+            };
+            bytes += frame.data.len();
+            frames.push_back(frame);
+        }
+        Ok(frames)
+    }
 }
 
-async fn disk_frames(segment: Segment) -> Result<Vec<Frame>> {
-    tokio::task::spawn_blocking(move || read_segment(segment)).await?
+// Only test/probe code materializes a whole file to compare all source frames.
+#[cfg(test)]
+pub(crate) fn read_segment(segment: Segment) -> Result<Vec<Frame>> {
+    let mut reader = SegmentReader::open(segment)?;
+    let mut result = Vec::new();
+    while let Some(frame) = reader.next()? {
+        result.push(frame);
+    }
+    ensure!(!result.is_empty(), "DVR segment has no video");
+    Ok(result)
+}
+
+#[derive(Default)]
+struct DiskCursor {
+    reader: Option<SegmentReader>,
+}
+type SharedDisk = Arc<parking_lot::Mutex<DiskCursor>>;
+
+async fn disk_batch(
+    disk: SharedDisk,
+    segment: Segment,
+    target: Option<u64>,
+) -> Result<VecDeque<Frame>> {
+    tokio::task::spawn_blocking(move || {
+        let mut cursor = disk.lock();
+        if cursor
+            .reader
+            .as_ref()
+            .is_none_or(|r| r.segment.path != segment.path)
+        {
+            cursor.reader = Some(SegmentReader::open(segment)?);
+        }
+        let reader = cursor.reader.as_mut().unwrap();
+        if let Some(target) = target {
+            // Select the preceding keyframe while scanning with bounded memory.
+            // Seeking inside a single oversized GOP still needs a streaming
+            // preroll path; reject it explicitly rather than allocating unbounded RAM.
+            let mut preroll = VecDeque::new();
+            let mut bytes = 0;
+            while let Some(frame) = reader.next()? {
+                if frame.key && frame.pts_ns <= target {
+                    preroll.clear();
+                    bytes = 0;
+                }
+                bytes += frame.data.len();
+                ensure!(
+                    bytes <= MAX_SEGMENT_BYTES,
+                    "DVR seek preroll exceeds memory budget"
+                );
+                let reached = frame.pts_ns >= target;
+                preroll.push_back(frame);
+                if reached {
+                    return Ok(preroll);
+                }
+            }
+            bail!("DVR target is beyond recorded video");
+        }
+        reader.batch()
+    })
+    .await?
 }
 
 fn at_keyframe(frames: Vec<Frame>, target_ns: u64) -> Result<VecDeque<Frame>> {
@@ -133,6 +222,7 @@ struct Prepared {
     frames: VecDeque<Frame>,
     session: Option<Arc<Session>>,
     codec: VideoCodec,
+    disk: SharedDisk,
 }
 
 async fn prepare(source: &VideoSourceId, timestamp: u64) -> Result<Prepared> {
@@ -140,6 +230,7 @@ async fn prepare(source: &VideoSourceId, timestamp: u64) -> Result<Prepared> {
         .checked_mul(1_000_000)
         .ok_or_else(|| anyhow!("Invalid timestamp"))?;
     let session = Session::active(source);
+    let disk = Arc::new(parking_lot::Mutex::new(DiskCursor::default()));
     if let Some(recent) = &session
         && recent.contains(timestamp)
     {
@@ -154,6 +245,7 @@ async fn prepare(source: &VideoSourceId, timestamp: u64) -> Result<Prepared> {
         return Ok(Prepared {
             frames,
             codec: recent.codec,
+            disk,
             session,
         });
     }
@@ -164,11 +256,12 @@ async fn prepare(source: &VideoSourceId, timestamp: u64) -> Result<Prepared> {
         .find(|s| s.start_ms() <= timestamp && s.end_ms() >= timestamp)
         .ok_or_else(|| anyhow!("No segmented recording at requested time"))?;
     let codec = segment.codec()?;
-    let frames = at_keyframe(disk_frames(segment).await?, target)?;
+    let frames = disk_batch(disk.clone(), segment, Some(target)).await?;
     Ok(Prepared {
         frames,
         session,
         codec,
+        disk,
     })
 }
 
@@ -179,11 +272,25 @@ async fn next_frames(
     session: Option<&Arc<Session>>,
     last: u64,
     codec: VideoCodec,
+    disk: SharedDisk,
 ) -> Result<VecDeque<Frame>> {
     if let Some(session) = session
         && let Some(frames) = session.after(last)
     {
         return Ok(frames);
+    }
+    let cached = disk.lock().reader.as_ref().map(|r| r.segment.clone());
+    if let Some(segment) = cached {
+        loop {
+            let frames = disk_batch(disk.clone(), segment.clone(), None).await?;
+            if frames.is_empty() {
+                break;
+            }
+            let frames: VecDeque<_> = frames.into_iter().filter(|f| f.dts_ns > last).collect();
+            if !frames.is_empty() {
+                return Ok(frames);
+            }
+        }
     }
     for segment in segments::list(source)? {
         if segment.origin_ms * 1_000_000 + segment.end_ns < last {
@@ -193,8 +300,8 @@ async fn next_frames(
             segment.codec()? == codec,
             "DVR codec changed between recordings"
         );
-        let frames = disk_frames(segment).await?;
-        let frames: VecDeque<_> = frames.into_iter().filter(|f| f.pts_ns > last).collect();
+        let frames = disk_batch(disk.clone(), segment, None).await?;
+        let frames: VecDeque<_> = frames.into_iter().filter(|f| f.dts_ns > last).collect();
         if !frames.is_empty() {
             return Ok(frames);
         }
@@ -303,7 +410,7 @@ async fn stream(
         .frames
         .front()
         .ok_or_else(|| anyhow!("No DVR frames"))?
-        .pts_ns;
+        .dts_ns;
     let started = tokio::time::Instant::now();
     let mut empty_since = None;
     loop {
@@ -311,17 +418,18 @@ async fn stream(
             .frames
             .back()
             .ok_or_else(|| anyhow!("No DVR frames"))?
-            .pts_ns;
+            .dts_ns;
         // Start fetching the next file while the current batch is being paced.
         let next_source = source.clone();
         let session = prepared.session.clone();
         let codec = prepared.codec;
+        let disk = prepared.disk.clone();
         let mut next = Prefetch(tokio::spawn(async move {
-            next_frames(&next_source, session.as_ref(), last, codec).await
+            next_frames(&next_source, session.as_ref(), last, codec, disk).await
         }));
         while let Some(frame) = prepared.frames.pop_front() {
             tokio::time::sleep_until(
-                started + Duration::from_nanos(frame.pts_ns.saturating_sub(first)),
+                started + Duration::from_nanos(frame.dts_ns.saturating_sub(first)),
             )
             .await;
             let nals = nal_utils::parse_annex_b(&frame.data);
@@ -353,8 +461,9 @@ async fn stream(
             let next_source = source.clone();
             let session = prepared.session.clone();
             let codec = prepared.codec;
+            let disk = prepared.disk.clone();
             next = Prefetch(tokio::spawn(async move {
-                next_frames(&next_source, session.as_ref(), last, codec).await
+                next_frames(&next_source, session.as_ref(), last, codec, disk).await
             }));
         }
     }

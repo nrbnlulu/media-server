@@ -15,6 +15,9 @@ use std::sync::Arc;
 
 struct RecordingState {
     session: Arc<Session>,
+    timebase: Option<crate::common::TimeBase>,
+    timestamp_origin: Option<i64>,
+    packet_timing: Option<(u64, u64)>,
     framing_format: FramingFormat,
     file_path: PathBuf,
     start_time: UnixTimestamp,
@@ -154,6 +157,9 @@ impl RecordingState {
             pipeline,
             file_path: session.directory.clone(),
             session,
+            timebase: None,
+            timestamp_origin: None,
+            packet_timing: None,
             codec: *codec,
             waiting_for_keyframe: true,
             start_time,
@@ -219,18 +225,27 @@ impl RecordingState {
         // matches real time even when camera frames arrive in bursts.
         let elapsed_ns = self.session.started.elapsed().as_nanos() as u64;
 
-        self.push_at(data, is_keyframe, elapsed_ns)
+        if let Some((pts, dts)) = self.packet_timing {
+            self.push_timed(data, is_keyframe, pts, dts)
+        } else {
+            self.push_at(data, is_keyframe, elapsed_ns)
+        }
     }
 
     fn push_at(&self, data: &[u8], is_keyframe: bool, elapsed_ns: u64) -> Result<()> {
+        self.push_timed(data, is_keyframe, elapsed_ns, elapsed_ns)
+    }
+
+    fn push_timed(&self, data: &[u8], is_keyframe: bool, pts_ns: u64, dts_ns: u64) -> Result<()> {
         // Use the same microsecond precision in MP4 and memory, allowing exact
         // overlap matching without a timestamp tolerance at handoff.
-        let elapsed_ns = elapsed_ns / 1_000 * 1_000;
+        let pts_ns = pts_ns / 1_000 * 1_000;
+        let dts_ns = dts_ns / 1_000 * 1_000;
         let mut buffer = gst::Buffer::from_slice(data.to_vec());
         {
             let buffer_ref = buffer.get_mut().unwrap();
-            buffer_ref.set_pts(gst::ClockTime::from_nseconds(elapsed_ns));
-            buffer_ref.set_dts(gst::ClockTime::from_nseconds(elapsed_ns));
+            buffer_ref.set_pts(gst::ClockTime::from_nseconds(pts_ns));
+            buffer_ref.set_dts(gst::ClockTime::from_nseconds(dts_ns));
 
             if !is_keyframe {
                 buffer_ref.set_flags(gst::BufferFlags::DELTA_UNIT);
@@ -238,7 +253,8 @@ impl RecordingState {
         }
 
         self.session.push(Frame {
-            pts_ns: elapsed_ns,
+            pts_ns,
+            dts_ns,
             key: is_keyframe,
             data: Arc::new(data.to_vec()),
         });
@@ -460,6 +476,9 @@ impl Drop for DvrRecorder {
 impl FfmpegConsumer for DvrRecorder {
     fn initialize(&self, metadata: &crate::common::FFmpegVideoMetadata) -> anyhow::Result<()> {
         self.initialize_imp(metadata.codec, metadata.extradata.as_ref())?;
+        if let Some(state) = self.recording_state.lock().as_mut() {
+            state.timebase = Some(metadata.timebase.clone());
+        }
         Ok(())
     }
 
@@ -469,6 +488,20 @@ impl FfmpegConsumer for DvrRecorder {
         if let Some(state) = state_guard.as_mut()
             && let Some(data) = packet.data()
         {
+            state.packet_timing = None;
+            if let (Some(timebase), Some(pts), Some(dts)) =
+                (&state.timebase, packet.pts(), packet.dts())
+                && timebase.is_valid()
+            {
+                let origin = *state.timestamp_origin.get_or_insert(dts.min(pts));
+                let convert = |value: i64| -> Result<u64> {
+                    let ns =
+                        (value as i128 - origin as i128) * timebase.num as i128 * 1_000_000_000
+                            / timebase.den as i128;
+                    Ok(u64::try_from(ns)?)
+                };
+                state.packet_timing = Some((convert(pts)?, convert(dts)?));
+            }
             let is_key = packet.is_key();
             let nal_units = state.parse_nal_units(data);
             state.write_nal_data(&nal_units, is_key)?;
@@ -714,5 +747,213 @@ mod tests {
         let pts = origin * 1_000_000 + input[30].pts_ns + 2_000_000_000;
         assert_eq!(timestamp, (pts as u128 * 90000 / 1_000_000_000) as u32);
         player.terminate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recorder_preserves_source_pts_dts_and_timebase() {
+        gst::init().unwrap();
+        let source = format!("timestamp-test-{}", uuid::Uuid::new_v4());
+        let recorder = DvrRecorder::new(&source).unwrap();
+        recorder
+            .initialize(&crate::common::FFmpegVideoMetadata {
+                codec: VideoCodec::H264,
+                extradata: None,
+                timebase: crate::common::TimeBase {
+                    num: 1,
+                    den: 90_000,
+                },
+            })
+            .unwrap();
+        let session = Session::active(&source).unwrap();
+        let _cleanup = Cleanup(session.directory.parent().unwrap().to_path_buf());
+        let frames = fixture_frames(VideoCodec::H264);
+        for (index, (pts, dts)) in [(96_000, 90_000), (93_000, 93_000)].into_iter().enumerate() {
+            let mut packet = ffmpeg::Packet::copy(&frames[index].data);
+            packet.set_pts(Some(pts));
+            packet.set_dts(Some(dts));
+            if index == 0 {
+                packet.set_flags(ffmpeg::packet::Flags::KEY);
+            }
+            recorder.on_new_packet(Arc::new(packet)).await.unwrap();
+        }
+        let frames = session.snapshot();
+        assert_eq!((frames[0].pts_ns, frames[0].dts_ns), (66_666_000, 0));
+        assert_eq!(
+            (frames[1].pts_ns, frames[1].dts_ns),
+            (33_333_000, 33_333_000)
+        );
+        recorder.finalize_recording().unwrap();
+    }
+    /// Optional compatibility matrix: creates encoded video locally and runs it
+    /// through the same recorder used for cameras. No network/device is required.
+    #[tokio::test]
+    #[ignore = "requires x264enc/x265enc; writes temporary compatibility artifacts"]
+    async fn camera_compatibility_stress_probe() {
+        use std::io::Write;
+        gst::init().unwrap();
+        let case = std::env::var("DVR_STRESS_CASE").unwrap_or_else(|_| "long45-h264".into());
+        let (codec, seconds, encoder) = match case.as_str() {
+            "long20-h264" => (
+                VideoCodec::H264,
+                62,
+                "x264enc tune=zerolatency key-int-max=200 option-string=scenecut=0",
+            ),
+            "long45-h264" => (
+                VideoCodec::H264,
+                92,
+                "x264enc tune=zerolatency key-int-max=450 option-string=scenecut=0",
+            ),
+            "long45-h265" => (
+                VideoCodec::H265,
+                92,
+                "x265enc tune=zerolatency key-int-max=450 option-string=pools=1:scenecut=0:open-gop=0",
+            ),
+            "closed-b-h264" => (
+                VideoCodec::H264,
+                24,
+                "x264enc key-int-max=20 bframes=3 option-string=open-gop=0:scenecut=0:b-adapt=0",
+            ),
+            "closed-b-h265" => (
+                VideoCodec::H265,
+                24,
+                "x265enc key-int-max=20 option-string=pools=1:open-gop=0:scenecut=0:bframes=3:b-adapt=0",
+            ),
+            "high40-h264" => (
+                VideoCodec::H264,
+                24,
+                "x264enc tune=zerolatency bitrate=40000 nal-hrd=cbr key-int-max=10 option-string=scenecut=0",
+            ),
+            "high80-gop10-h264" => (
+                VideoCodec::H264,
+                24,
+                "x264enc tune=zerolatency bitrate=80000 nal-hrd=cbr key-int-max=100 option-string=scenecut=0",
+            ),
+            "open-h264" => (
+                VideoCodec::H264,
+                24,
+                "x264enc key-int-max=20 bframes=3 option-string=open-gop=1:scenecut=0:b-adapt=0",
+            ),
+            "open-h265" => (
+                VideoCodec::H265,
+                24,
+                "x265enc key-int-max=20 option-string=pools=1:open-gop=1:scenecut=0:bframes=3:b-adapt=0",
+            ),
+            "high80-h264" => (
+                VideoCodec::H264,
+                24,
+                "x264enc tune=zerolatency bitrate=80000 nal-hrd=cbr key-int-max=10 option-string=scenecut=0",
+            ),
+            _ => panic!("Unknown stress case {case}"),
+        };
+        let root = std::path::PathBuf::from(
+            std::env::var_os("DVR_STRESS_DIR").unwrap_or_else(|| "/tmp/dvr-camera-check".into()),
+        )
+        .join(&case);
+        std::fs::create_dir_all(&root).unwrap();
+        let source = format!("camera-stress-{}", uuid::Uuid::new_v4());
+        let session = Session::new(&source, 1_700_000_000_000, codec).unwrap();
+        let _cleanup = Cleanup(session.directory.parent().unwrap().to_path_buf());
+        let mut recorder = RecordingState::new(
+            session.clone(),
+            &codec,
+            session.origin_ms,
+            FramingFormat::AnnexB,
+        )
+        .unwrap();
+        let parser = match codec {
+            VideoCodec::H264 => "h264parse",
+            VideoCodec::H265 => "h265parse",
+        };
+        let media_type = match codec {
+            VideoCodec::H264 => "h264",
+            VideoCodec::H265 => "h265",
+        };
+        let generator = gst::parse::launch(&format!(
+            "videotestsrc pattern=ball num-buffers={} ! video/x-raw,format=I420,width=160,height=96,framerate=10/1 ! {encoder} ! {parser} config-interval=-1 ! video/x-{media_type},stream-format=byte-stream,alignment=au ! appsink name=output sync=false max-buffers=4", seconds*10
+        )).unwrap().downcast::<gst::Pipeline>().unwrap();
+        let sink = generator
+            .by_name("output")
+            .unwrap()
+            .downcast::<gst_app::AppSink>()
+            .unwrap();
+        generator.set_state(gst::State::Playing).unwrap();
+        let mut raw = std::fs::File::create(root.join(format!("source.{media_type}"))).unwrap();
+        let mut count = 0u64;
+        let mut source_origin = None;
+        let mut bytes = 0usize;
+        let mut checkpoints = Vec::new();
+        loop {
+            let sample = sink.try_pull_sample(gst::ClockTime::from_seconds(10));
+            let Some(sample) = sample else {
+                assert!(sink.is_eos(), "encoder stalled");
+                break;
+            };
+            let buffer = sample.buffer().unwrap();
+            let data = buffer.map_readable().unwrap();
+            let key = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+            raw.write_all(data.as_slice()).unwrap();
+            bytes += data.len();
+            let pts = buffer.pts().unwrap().nseconds();
+            let dts = buffer.dts().map(|t| t.nseconds()).unwrap_or(pts);
+            let origin = *source_origin.get_or_insert(dts.min(pts));
+            recorder
+                .push_timed(data.as_slice(), key, pts - origin, dts - origin)
+                .unwrap();
+            count += 1;
+            if [100, 200, 310, 400, 440, 460, 610, 900].contains(&count) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let recent = session.snapshot();
+                let mut rewinds = std::collections::BTreeMap::new();
+                for seconds_back in [1, 5, 15, 25] {
+                    if count * 100 <= seconds_back * 1000 {
+                        continue;
+                    }
+                    let target_ms = session.origin_ms + count * 100 - seconds_back * 1000;
+                    let seek =
+                        SegmentedPlayer::new(source.clone(), target_ms, new_capture().0).await;
+                    rewinds.insert(
+                        seconds_back.to_string(),
+                        seek.as_ref()
+                            .err()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "ok".into()),
+                    );
+                }
+                checkpoints.push(serde_json::json!({
+                    "elapsed_seconds": count as f64 / 10.0,
+                    "rewind_one_second": rewinds["1"],
+                    "rewinds_seconds": rewinds,
+                    "retained_frames": recent.len(),
+                    "retained_bytes": recent.iter().map(|f| f.data.len()).sum::<usize>(),
+                    "first_retained_ns": recent.first().map(|f| f.pts_ns),
+                    "finalized_segments": segments::list_in(&session.directory).unwrap().len(),
+                }));
+            }
+        }
+        generator.set_state(gst::State::Null).unwrap();
+        assert_eq!(count, seconds * 10, "encoder produced an incomplete source");
+        recorder.stop().unwrap();
+        let mut output = Vec::new();
+        for segment in segments::list_in(&session.directory).unwrap() {
+            let size = std::fs::metadata(&segment.path).unwrap().len();
+            let read = read_segment(segment.clone());
+            output.push(serde_json::json!({
+                "file": segment.path.file_name().unwrap().to_string_lossy(),
+                "first_ns": segment.first_ns, "end_ns": segment.end_ns,
+                "bytes": size,
+                "frames": read.as_ref().ok().map(Vec::len),
+                "read_error": read.as_ref().err().map(ToString::to_string),
+            }));
+            std::fs::copy(&segment.path, root.join(segment.path.file_name().unwrap())).unwrap();
+        }
+        let result = serde_json::json!({"case": case, "input_frames": count, "input_bytes": bytes,
+            "mbps": bytes as f64 * 8.0 / seconds as f64 / 1_000_000.0,
+            "checkpoints": checkpoints, "segments": output});
+        std::fs::write(
+            root.join("results.json"),
+            serde_json::to_vec_pretty(&result).unwrap(),
+        )
+        .unwrap();
+        println!("{}", serde_json::to_string_pretty(&result).unwrap());
     }
 }
