@@ -219,6 +219,10 @@ impl DvrPlayer {
         }
     }
 
+    pub async fn prepare(&self) -> anyhow::Result<()> {
+        self.state.lock().await.prepare().await
+    }
+
     pub async fn play(&self) -> anyhow::Result<()> {
         let state = self.state.lock().await;
         state.prepare().await?;

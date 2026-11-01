@@ -89,6 +89,7 @@ pub struct SpeedRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SessionModeResponse {
     pub is_live: bool,
+    /// Absolute Unix timestamp in milliseconds of the current DVR frame.
     pub current_time_ms: Option<u64>,
     pub speed: f64,
 }

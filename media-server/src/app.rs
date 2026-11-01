@@ -5,7 +5,7 @@ use crate::domain::dvr::{filesystem, recorder::DvrRecorder};
 use crate::domain::{StreamConfig, StreamInfo, StreamState};
 use crate::publishers::webrtc::WebrtcManager;
 use crate::publishers::wsc_rtp::WscRtpPublisher;
-use crate::sources::dvr::DvrPlayer;
+use crate::sources::dvr_playback::DvrPlayback as DvrPlayer;
 use crate::sources::rtsp::RtspClient;
 use anyhow::{Result, anyhow, bail};
 use dashmap::DashMap;
@@ -108,22 +108,15 @@ impl ClientSession {
         let mut state_guard = self.state.lock().await;
         match *state_guard {
             ClientSessionState::Dvr(ref player) => {
-                // Validate timestamp against current recording bounds before seeking
-                let metadata = player.recording_metadata().await;
-                if timestamp < metadata.start_time {
-                    bail!("seek before start");
-                }
-                if let Some(end_time) = metadata.end_time
-                    && timestamp > end_time
-                {
-                    bail!("seek after end");
-                }
                 player.seek_to_timestamp(timestamp, 1.0).await?;
+                self.publisher
+                    .on_session_mode_change(SessionMode::Dvr { timestamp })
+                    .await;
                 Ok(())
             }
             ClientSessionState::Live => {
                 // Validate timestamp before switching mode — don't enter DVR if no recording exists
-                if filesystem::find_recording_for_timestamp(&self.source_id, timestamp).is_none() {
+                if !DvrPlayer::available(&self.source_id, timestamp) {
                     bail!("No recording found for timestamp {}", timestamp);
                 }
                 // Create DVR player that feeds into the same stitching consumer
@@ -479,7 +472,7 @@ impl GlobalState {
                 speed: 1.0,
             }),
             ClientSessionState::Dvr(player) => {
-                let current_time = player.current_time_ms().await;
+                let current_time = Some(player.current_timestamp().await);
                 Ok(media_server_api_models::SessionModeResponse {
                     is_live: false,
                     current_time_ms: current_time,

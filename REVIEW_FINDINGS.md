@@ -8,6 +8,86 @@ The deployed server's exact source revision was not established. During the init
 review, no implementation changes were made. All 25 existing tests passed; they do not cover WSC-RTP
 negotiation or DVR/live transitions.
 
+## Segmented recording migration — October 29
+
+The previous rewind fix is committed as `f49cbe8`. The migration is implemented
+in the working tree and left uncommitted for review. New recordings use segmented
+MP4; existing single-file recordings continue through the legacy player and its
+virtual-index adapter. Existing recording bytes have not been converted.
+
+New recording layout:
+
+```text
+dvr/<source hash>/segments-<session epoch>-<uuid>/
+  0000000000.mp4
+  0000000000.json
+  0000000001.mp4
+  0000000001.json
+  ...
+```
+
+`splitmuxsink` rotates at approximately ten seconds, aligned to camera keyframes,
+using asynchronous finalization. A JSON sidecar is atomically published only after
+the corresponding MP4 is closed. It records the codec, session epoch and precise
+segment timestamp range. Disk playback uses standard `qtdemux` and codec parsers;
+new recordings do not use the custom MP4 index or parse MP4 boxes in application
+code. A short encoded-video buffer covers the active segment and overlaps completed
+files. It is bounded by thirty seconds and 64 MiB per source, evicting complete
+GOPs so a retained buffer starts at a keyframe.
+
+The custom application logic is the segment catalog, recent buffer and playback
+coordinator. Completed segments are read with bounded memory and the next batch
+is prepared while the current batch plays. One RTP packetizer and one absolute
+media clock span the disk files and memory. Both storage paths use microsecond
+precision, allowing an exact overlap-frame match rather than a timestamp tolerance.
+Explicit seeks prepare their replacement first, then stop and await the previous
+sender before switching. Seeks can cross segments and select legacy recordings.
+
+Native validation also found two control-time defects: subsequent seeks did not
+send a new DVR mode event, and the mode API returned a file-relative position where
+the Linux client expects a Unix timestamp. Successful seeks now notify the client,
+and the mode response reports the current frame's absolute timestamp.
+
+Validation:
+
+- `cargo test --workspace --locked`: 37 passed, one existing optional recording
+  probe ignored. `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  formatting and whitespace checks passed.
+- H.264 and H.265 recorder round trips preserve every generated frame timestamp
+  through multiple finalized files. The test includes a nonzero, sub-millisecond
+  starting offset.
+- Playback verifies every expected frame timestamp, RTP sequence continuity and
+  unchanged SSRC across file boundaries and disk-to-memory handoff. Further tests
+  cover recent frames arriving during playback, failed seeks, restart without the
+  memory buffer and GOP-aligned byte-budget eviction.
+- The native Linux example played the camera through the isolated server. Five-,
+  fifteen- and forty-five-second rewinds were accepted in approximately 2–9 ms.
+  The forty-five-second rewind continued for another thirty-eight seconds across
+  disk files into recent footage. Repeated seek labels were checked again after
+  the control-time fix: the UI and camera clock agree. Return-to-live worked.
+
+The isolated server remains at `http://localhost:8010`, with test recordings under
+`/tmp/segmented-dvr-review/recordings`. The native client is back in live mode.
+Production was not replaced and its DVR directory was not modified.
+
+Limits and follow-up work:
+
+- The unfinished MP4 and in-memory tail are not recovered after a crash. Completed,
+  cataloged files remain playable; the unfinished file is retained but excluded
+  from playback. The lost tail can exceed ten seconds if keyframes are far apart.
+- Independent segments require suitable closed GOPs from the camera. Rotation
+  follows existing keyframes and does not re-encode or change camera settings.
+- Catalog discovery currently scans segment sidecars. A large-history catalog
+  should be indexed before scaling to very long retention or many simultaneous
+  historical viewers. Automatic retention deletion is not implemented.
+- Playback rejects a segment exceeding its 64 MiB read budget. Very high bitrate
+  streams or unusually long GOPs need an adjusted segment-size policy.
+- Codec changes between recording sessions require renegotiation; playback stops
+  on a codec change. A player opened without an active recording does not subscribe
+  to recordings started later. General source reconnect/gap policy remains work.
+- Arrival-time PTS/DTS and the other original WSC-RTP/live-transition findings below
+  remain separate issues.
+
 ## Recent rewind fix — October 29
 
 Implemented and validated against the long active recording and the native Linux
