@@ -18,6 +18,8 @@ struct RecordingState {
     timebase: Option<crate::common::TimeBase>,
     timestamp_origin: Option<i64>,
     packet_timing: Option<(u64, u64)>,
+    first_dts: Option<u64>,
+    last_dts: u64,
     framing_format: FramingFormat,
     file_path: PathBuf,
     start_time: UnixTimestamp,
@@ -32,7 +34,6 @@ struct RecordingState {
 impl Drop for RecordingState {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
-        self.session.close();
     }
 }
 
@@ -76,74 +77,23 @@ impl RecordingState {
         };
         parser.set_property_from_str("config-interval", "-1");
 
-        let path = session.directory.join("%010d.mp4");
-        let sink = gst::ElementFactory::make("splitmuxsink")
-            .property("location", path.to_string_lossy().as_ref())
-            .property("max-size-time", segments::SEGMENT_NS)
-            .property("max-size-bytes", 0u64)
-            .property("async-finalize", true)
-            .property(
-                "muxer-properties",
-                gst::Structure::builder("properties")
-                    .field("trak-timescale", 1_000_000u32)
-                    .build(),
-            )
+        let index = session
+            .next_file
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = session.directory.join(format!("{index:010}.mp4"));
+        let mux = gst::ElementFactory::make("mp4mux")
+            .property("fragment-duration", 1000u32)
+            .property("trak-timescale", 1_000_000u32)
             .build()?;
-        let pending = Arc::new(Mutex::new(
-            std::collections::HashMap::<String, Segment>::new(),
-        ));
-        let starts = pending.clone();
-        let catalog = session.clone();
-        sink.connect("format-location-full", false, move |values| {
-            let id = values[1].get::<u32>().expect("fragment ID");
-            let sample = values[2]
-                .get::<gst::Sample>()
-                .expect("first fragment sample");
-            let first_ns = sample
-                .buffer()
-                .and_then(|b| b.pts())
-                .map(|t| t.nseconds())
-                .unwrap_or(0);
-            let location = catalog.directory.join(format!("{id:010}.mp4"));
-            let location_string = location.to_string_lossy().into_owned();
-            starts.lock().insert(
-                location_string.clone(),
-                Segment {
-                    origin_ms: catalog.origin_ms,
-                    first_ns,
-                    end_ns: first_ns,
-                    codec: match catalog.codec {
-                        VideoCodec::H264 => "h264",
-                        VideoCodec::H265 => "h265",
-                    }
-                    .into(),
-                    path: location,
-                },
-            );
-            Some(location_string.to_value())
-        });
-        pipeline
-            .bus()
-            .ok_or_else(|| anyhow::anyhow!("No recorder bus"))?
-            .set_sync_handler(move |_, message| {
-                if let Some(structure) = message.structure()
-                    && structure.name() == "splitmuxsink-fragment-closed"
-                    && let Ok(location) = structure.get::<String>("location")
-                    && let Some(mut segment) = pending.lock().remove(&location)
-                {
-                    segment.end_ns = structure
-                        .get::<gst::ClockTime>("running-time")
-                        .map(|t| t.nseconds())
-                        .unwrap_or(segment.first_ns);
-                    if let Err(error) = segment.publish() {
-                        log::error!("Failed to publish DVR segment {location}: {error:#}");
-                    }
-                }
-                gst::BusSyncReply::Pass
-            });
-        pipeline.add_many([&appsrc, &parser, &sink])?;
+        let sink = gst::ElementFactory::make("filesink")
+            .property("location", path.to_string_lossy().as_ref())
+            .property("sync", false)
+            .build()?;
+        sink.set_property_from_str("buffer-mode", "unbuffered");
+        pipeline.add_many([&appsrc, &parser, &mux, &sink])?;
         appsrc.link(&parser)?;
-        parser.link(&sink)?;
+        parser.link(&mux)?;
+        mux.link(&sink)?;
 
         pipeline
             .set_state(gst::State::Playing)
@@ -155,7 +105,9 @@ impl RecordingState {
 
         Ok(Self {
             pipeline,
-            file_path: session.directory.clone(),
+            file_path: path,
+            first_dts: None,
+            last_dts: 0,
             session,
             timebase: None,
             timestamp_origin: None,
@@ -211,16 +163,31 @@ impl RecordingState {
             Ok(())
         })();
         let stopped = self.pipeline.set_state(gst::State::Null);
-        self.session.close();
         result?;
         stopped?;
+        if let Some(segment) = self
+            .session
+            .active_files
+            .lock()
+            .iter()
+            .find(|s| s.path == self.file_path)
+        {
+            segment.publish()?;
+            self.session
+                .completed_until
+                .fetch_max(self.last_dts, std::sync::atomic::Ordering::Release);
+        }
+        self.session
+            .active_files
+            .lock()
+            .retain(|s| s.path != self.file_path);
         self.waiting_for_keyframe = true;
         self.header_buffer.clear();
         self.stream_started = false;
         Ok(())
     }
 
-    fn push_buffer_to_appsrc(&self, data: &[u8], is_keyframe: bool) -> Result<()> {
+    fn push_buffer_to_appsrc(&mut self, data: &[u8], is_keyframe: bool) -> Result<()> {
         // Use wall-clock elapsed time as PTS/DTS so that playback duration
         // matches real time even when camera frames arrive in bursts.
         let elapsed_ns = self.session.started.elapsed().as_nanos() as u64;
@@ -232,11 +199,39 @@ impl RecordingState {
         }
     }
 
-    fn push_at(&self, data: &[u8], is_keyframe: bool, elapsed_ns: u64) -> Result<()> {
+    fn push_at(&mut self, data: &[u8], is_keyframe: bool, elapsed_ns: u64) -> Result<()> {
         self.push_timed(data, is_keyframe, elapsed_ns, elapsed_ns)
     }
 
-    fn push_timed(&self, data: &[u8], is_keyframe: bool, pts_ns: u64, dts_ns: u64) -> Result<()> {
+    fn push_timed(
+        &mut self,
+        data: &[u8],
+        is_keyframe: bool,
+        pts_ns: u64,
+        dts_ns: u64,
+    ) -> Result<()> {
+        let independent = segments::independent_frame(data, self.codec);
+        if independent
+            && self
+                .first_dts
+                .is_some_and(|first| dts_ns.saturating_sub(first) >= segments::SEGMENT_NS)
+        {
+            let mut replacement = Self::new(
+                self.session.clone(),
+                &self.codec,
+                self.start_time,
+                self.framing_format.clone(),
+            )?;
+            replacement.timebase = self.timebase.clone();
+            replacement.timestamp_origin = self.timestamp_origin;
+            replacement.packet_timing = self.packet_timing;
+            replacement.header_buffer = self.header_buffer.clone();
+            replacement.waiting_for_keyframe = false;
+            let mut previous = std::mem::replace(self, replacement);
+            previous.stop()?;
+        }
+        self.first_dts.get_or_insert(dts_ns);
+        self.last_dts = dts_ns;
         // Use the same microsecond precision in MP4 and memory, allowing exact
         // overlap matching without a timestamp tolerance at handoff.
         let pts_ns = pts_ns / 1_000 * 1_000;
@@ -252,10 +247,28 @@ impl RecordingState {
             }
         }
 
+        {
+            let mut active = self.session.active_files.lock();
+            if let Some(segment) = active.iter_mut().find(|s| s.path == self.file_path) {
+                segment.end_ns = segment.end_ns.max(pts_ns);
+            } else {
+                active.push(Segment {
+                    origin_ms: self.session.origin_ms,
+                    first_ns: pts_ns,
+                    end_ns: pts_ns,
+                    codec: match self.codec {
+                        VideoCodec::H264 => "h264",
+                        VideoCodec::H265 => "h265",
+                    }
+                    .into(),
+                    path: self.file_path.clone(),
+                });
+            }
+        }
         self.session.push(Frame {
             pts_ns,
             dts_ns,
-            key: is_keyframe,
+            key: independent,
             data: Arc::new(data.to_vec()),
         });
         match self.appsrc.push_buffer(buffer) {
@@ -360,6 +373,7 @@ impl DvrRecorder {
         let mut state_guard = self.recording_state.lock();
         if let Some(mut state) = state_guard.take() {
             log::info!("already initialized; restarting...");
+            state.session.close();
             if let Err(err) = state.stop() {
                 log::error!("Failed to stop recording: {}", err);
             }
@@ -437,7 +451,9 @@ impl DvrRecorder {
 
         if let Some(mut state) = state_guard.take() {
             let path = state.file_path.clone();
-            state.stop()?;
+            let result = state.stop();
+            state.session.close();
+            result?;
             return Ok(Some(path));
         }
 
@@ -589,7 +605,7 @@ mod tests {
         let source = format!("segmented-test-{}", uuid::Uuid::new_v4());
         let session = Session::new(&source, 1_700_000_000_000, codec).unwrap();
         let cleanup = Cleanup(session.directory.parent().unwrap().to_path_buf());
-        let state = RecordingState::new(
+        let mut state = RecordingState::new(
             session.clone(),
             &codec,
             session.origin_ms,
@@ -704,7 +720,7 @@ mod tests {
     #[tokio::test]
     async fn recent_rewind_follows_new_frames_and_finalized_files_survive_restart() {
         let (source, session, mut state, _cleanup, input) = recording(2, VideoCodec::H264);
-        assert!(segments::list(&source).unwrap().is_empty());
+        assert!(segments::list_in(&session.directory).unwrap().is_empty());
         let (capture, mut rx) = new_capture();
         let player = SegmentedPlayer::new(source.clone(), session.origin_ms + 500, capture)
             .await
@@ -783,6 +799,44 @@ mod tests {
             (33_333_000, 33_333_000)
         );
         recorder.finalize_recording().unwrap();
+    }
+
+    #[tokio::test]
+    async fn playback_reads_active_fragments_after_cache_eviction_and_follows_growth() {
+        let (source, session, mut state, _cleanup, input) = recording(2, VideoCodec::H264);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        session.clear_recent_for_test();
+        assert!(segments::list_in(&session.directory).unwrap().is_empty());
+        let (capture, mut rx) = new_capture();
+        let player = SegmentedPlayer::new(source, session.origin_ms + 1000, capture)
+            .await
+            .unwrap();
+        assert_eq!(
+            player.current_timestamp().await,
+            session.origin_ms + input[0].pts_ns / 1_000_000
+        );
+        player.play().await.unwrap();
+        for index in 0..80 {
+            let (_, timestamp) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let original = &input[index % input.len()];
+            let pts = session.origin_ms * 1_000_000
+                + original.pts_ns
+                + (index / input.len()) as u64 * 2_000_000_000;
+            assert_eq!(timestamp, (pts as u128 * 90000 / 1_000_000_000) as u32);
+            if index == 9 {
+                for frame in &input {
+                    state
+                        .push_at(&frame.data, frame.key, frame.pts_ns + 2_000_000_000)
+                        .unwrap();
+                }
+                session.clear_recent_for_test();
+            }
+        }
+        player.terminate().await.unwrap();
+        state.stop().unwrap();
     }
     /// Optional compatibility matrix: creates encoded video locally and runs it
     /// through the same recorder used for cameras. No network/device is required.

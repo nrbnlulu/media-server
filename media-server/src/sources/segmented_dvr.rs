@@ -27,12 +27,98 @@ fn absolute(session: &Session, frame: &Frame) -> Frame {
     }
 }
 
+// Expose only complete top-level MP4 boxes through the last complete mdat.
+// This is a bounded byte view, not a synthetic MP4 index or footer.
+fn readable_len(path: &std::path::Path) -> Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    if path.with_extension("json").exists() {
+        return Ok(length);
+    }
+    let mut offset = 0u64;
+    let mut complete = 0;
+    while length.saturating_sub(offset) >= 8 {
+        file.seek(SeekFrom::Start(offset))?;
+        let mut header = [0u8; 8];
+        file.read_exact(&mut header)?;
+        let short = u32::from_be_bytes(header[..4].try_into()?);
+        let (size, minimum) = if short == 1 {
+            if length - offset < 16 {
+                break;
+            }
+            let mut extended = [0u8; 8];
+            file.read_exact(&mut extended)?;
+            (u64::from_be_bytes(extended), 16)
+        } else {
+            (short as u64, 8)
+        };
+        if size < minimum || size > length - offset {
+            break;
+        }
+        offset += size;
+        if &header[4..] == b"mdat" {
+            complete = offset;
+        }
+    }
+    ensure!(
+        complete > 0,
+        "Active DVR file has no complete media fragment yet"
+    );
+    Ok(complete)
+}
+
+fn snapshot_source(path: &std::path::Path, size: u64) -> Result<gst::Element> {
+    use std::io::{Read, Seek, SeekFrom};
+    let file = Arc::new(parking_lot::Mutex::new(std::fs::File::open(path)?));
+    let seek_file = file.clone();
+    let source = gst_app::AppSrc::builder()
+        .stream_type(gst_app::AppStreamType::RandomAccess)
+        .format(gst::Format::Bytes)
+        .size(i64::try_from(size)?)
+        .build();
+    source.set_callbacks(
+        gst_app::AppSrcCallbacks::builder()
+            .seek_data(move |_, offset| {
+                offset <= size && seek_file.lock().seek(SeekFrom::Start(offset)).is_ok()
+            })
+            .need_data(move |source, requested| {
+                let result = (|| -> Result<Vec<u8>> {
+                    let mut file = file.lock();
+                    let remaining = size.saturating_sub(file.stream_position()?);
+                    let mut data =
+                        vec![0; remaining.min(requested as u64).min(1024 * 1024) as usize];
+                    file.read_exact(&mut data)?;
+                    Ok(data)
+                })();
+                match result {
+                    Ok(data) if data.is_empty() => {
+                        let _ = source.end_of_stream();
+                    }
+                    Ok(data) => {
+                        let _ = source.push_buffer(gst::Buffer::from_mut_slice(data));
+                    }
+                    Err(error) => gst::element_error!(
+                        source,
+                        gst::ResourceError::Read,
+                        ("DVR read failed"),
+                        ["{error:#}"]
+                    ),
+                }
+            })
+            .build(),
+    );
+    Ok(source.upcast())
+}
+
 /// A pull-based demuxer keeps only a bounded appsink queue and one batch in RAM.
 struct SegmentReader {
     pipeline: gst::Pipeline,
     sink: gst_app::AppSink,
     segment: Segment,
     first_pts: Option<u64>,
+    opened_len: u64,
+    exhausted: bool,
 }
 impl Drop for SegmentReader {
     fn drop(&mut self) {
@@ -43,9 +129,14 @@ impl SegmentReader {
     fn open(segment: Segment) -> Result<Self> {
         let codec = segment.codec()?;
         let pipeline = gst::Pipeline::new();
-        let src = gst::ElementFactory::make("filesrc")
-            .property("location", segment.path.to_string_lossy().as_ref())
-            .build()?;
+        let opened_len = readable_len(&segment.path)?;
+        let src = if segment.path.with_extension("json").exists() {
+            gst::ElementFactory::make("filesrc")
+                .property("location", segment.path.to_string_lossy().as_ref())
+                .build()?
+        } else {
+            snapshot_source(&segment.path, opened_len)?
+        };
         let demux = gst::ElementFactory::make("qtdemux").build()?;
         let parser = gst::ElementFactory::make(match codec {
             VideoCodec::H264 => "h264parse",
@@ -65,6 +156,9 @@ impl SegmentReader {
             .sync(false)
             .max_buffers(8)
             .build();
+        if sink.find_property("max-bytes").is_some() {
+            sink.set_property("max-bytes", 4 * 1024 * 1024u64);
+        }
         pipeline.add_many([&src, &demux, &parser, sink.upcast_ref()])?;
         src.link(&demux)?;
         parser.link(&sink)?;
@@ -80,8 +174,10 @@ impl SegmentReader {
         Ok(Self {
             pipeline,
             sink,
+            opened_len,
             segment,
             first_pts: None,
+            exhausted: false,
         })
     }
     fn next(&mut self) -> Result<Option<Frame>> {
@@ -116,7 +212,7 @@ impl SegmentReader {
                 return Ok(Some(Frame {
                     pts_ns: u64::try_from(absolute)?,
                     dts_ns: u64::try_from(absolute_dts)?,
-                    key: !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT),
+                    key: segments::independent_frame(data.as_slice(), self.segment.codec()?),
                     data: Arc::new(data.as_slice().to_vec()),
                 }));
             }
@@ -129,6 +225,7 @@ impl SegmentReader {
                 bail!("DVR segment read failed: {}", error.error());
             }
             if self.sink.is_eos() {
+                self.exhausted = true;
                 return Ok(None);
             }
             ensure!(Instant::now() < deadline, "DVR segment read timed out");
@@ -173,37 +270,36 @@ async fn disk_batch(
 ) -> Result<VecDeque<Frame>> {
     tokio::task::spawn_blocking(move || {
         let mut cursor = disk.lock();
-        if cursor
-            .reader
-            .as_ref()
-            .is_none_or(|r| r.segment.path != segment.path)
-        {
+        if cursor.reader.as_ref().is_none_or(|r| {
+            r.segment.path != segment.path
+                || (r.exhausted
+                    && readable_len(&segment.path).is_ok_and(|length| length != r.opened_len))
+        }) {
             cursor.reader = Some(SegmentReader::open(segment)?);
         }
         let reader = cursor.reader.as_mut().unwrap();
         if let Some(target) = target {
-            // Select the preceding keyframe while scanning with bounded memory.
-            // Seeking inside a single oversized GOP still needs a streaming
-            // preroll path; reject it explicitly rather than allocating unbounded RAM.
-            let mut preroll = VecDeque::new();
-            let mut bytes = 0;
+            let mut anchor = None;
             while let Some(frame) = reader.next()? {
                 if frame.key && frame.pts_ns <= target {
-                    preroll.clear();
-                    bytes = 0;
+                    anchor = Some(frame.dts_ns);
                 }
-                bytes += frame.data.len();
-                ensure!(
-                    bytes <= MAX_SEGMENT_BYTES,
-                    "DVR seek preroll exceeds memory budget"
-                );
-                let reached = frame.pts_ns >= target;
-                preroll.push_back(frame);
-                if reached {
-                    return Ok(preroll);
+                if frame.dts_ns > target {
+                    break;
                 }
             }
-            bail!("DVR target is beyond recorded video");
+            let anchor =
+                anchor.ok_or_else(|| anyhow!("No independent decoding point in segment"))?;
+            let segment = reader.segment.clone();
+            *reader = SegmentReader::open(segment)?;
+            while let Some(frame) = reader.next()? {
+                if frame.dts_ns == anchor {
+                    let mut frames = VecDeque::from([frame]);
+                    frames.extend(reader.batch()?);
+                    return Ok(frames);
+                }
+            }
+            bail!("DVR decoding point disappeared");
         }
         reader.batch()
     })
@@ -233,15 +329,15 @@ async fn prepare(source: &VideoSourceId, timestamp: u64) -> Result<Prepared> {
     let disk = Arc::new(parking_lot::Mutex::new(DiskCursor::default()));
     if let Some(recent) = &session
         && recent.contains(timestamp)
-    {
-        let frames = at_keyframe(
+        && let Ok(frames) = at_keyframe(
             recent
                 .snapshot()
                 .iter()
                 .map(|f| absolute(recent, f))
                 .collect(),
             target,
-        )?;
+        )
+    {
         return Ok(Prepared {
             frames,
             codec: recent.codec,
@@ -249,14 +345,34 @@ async fn prepare(source: &VideoSourceId, timestamp: u64) -> Result<Prepared> {
             session,
         });
     }
+
     let catalog = segments::list(source)?;
-    let segment = catalog
-        .into_iter()
-        .rev()
-        .find(|s| s.start_ms() <= timestamp && s.end_ms() >= timestamp)
+    let index = catalog
+        .iter()
+        .rposition(|s| s.start_ms() <= timestamp && s.end_ms() >= timestamp)
         .ok_or_else(|| anyhow!("No segmented recording at requested time"))?;
-    let codec = segment.codec()?;
-    let frames = disk_batch(disk.clone(), segment, Some(target)).await?;
+    let selected = &catalog[index];
+    let codec = selected.codec()?;
+    let mut prepared_frames = None;
+    for segment in catalog[..=index].iter().rev() {
+        if segment.origin_ms != selected.origin_ms || segment.codec()? != codec {
+            break;
+        }
+        // Search earlier files when an open-GOP file has no independent start.
+        *disk.lock() = DiskCursor::default();
+        match disk_batch(disk.clone(), segment.clone(), Some(target)).await {
+            Ok(frames) => {
+                prepared_frames = Some(frames);
+                break;
+            }
+            Err(error) if error.to_string() == "No independent decoding point in segment" => {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let frames =
+        prepared_frames.ok_or_else(|| anyhow!("No retained independent decoding point"))?;
     Ok(Prepared {
         frames,
         session,
@@ -334,6 +450,7 @@ impl SegmentedPlayer {
         consumer: Arc<dyn RtpConsumer>,
     ) -> Result<Self> {
         let prepared = prepare(&source, timestamp).await?;
+        let actual_ns = prepared.frames.front().unwrap().pts_ns;
         Ok(Self {
             source,
             consumer,
@@ -341,7 +458,7 @@ impl SegmentedPlayer {
                 task: None,
                 prepared: Some(prepared),
             }),
-            position_ns: Arc::new(AtomicU64::new(timestamp * 1_000_000)),
+            position_ns: Arc::new(AtomicU64::new(actual_ns)),
         })
     }
     fn spawn(&self, prepared: Prepared) -> tokio::task::JoinHandle<()> {
@@ -382,7 +499,7 @@ impl SegmentedPlayer {
         }
         self.consumer.on_source_switch();
         self.position_ns
-            .store(timestamp * 1_000_000, Ordering::Release);
+            .store(prepared.frames.front().unwrap().pts_ns, Ordering::Release);
         state.task = Some(self.spawn(prepared));
         Ok(())
     }
@@ -466,5 +583,38 @@ async fn stream(
                 next_frames(&next_source, session.as_ref(), last, codec, disk).await
             }));
         }
+    }
+}
+
+#[cfg(test)]
+mod active_file_tests {
+    use super::*;
+    #[test]
+    fn partial_media_box_is_not_exposed_to_the_demuxer() {
+        gst::init().unwrap();
+        let bytes = include_bytes!("../../tests/fixtures/dvr-fragmented.mp4");
+        let path = std::env::temp_dir().join(format!("partial-mp4-{}.mp4", uuid::Uuid::new_v4()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(path.clone());
+        std::fs::write(&path, &bytes[..bytes.len() - 7]).unwrap();
+        let segment = Segment {
+            origin_ms: 0,
+            first_ns: 0,
+            end_ns: 12_000_000_000,
+            codec: "h264".into(),
+            path: path.clone(),
+        };
+        let prefix = readable_len(&path).unwrap();
+        assert!(prefix < (bytes.len() - 7) as u64);
+        let frames = read_segment(segment.clone()).unwrap();
+        assert_eq!(frames.len(), 330);
+        std::fs::write(&path, bytes).unwrap();
+        assert!(readable_len(&path).unwrap() > prefix);
+        assert_eq!(read_segment(segment).unwrap().len(), 360);
     }
 }

@@ -8,6 +8,45 @@ The deployed server's exact source revision was not established. During the init
 review, no implementation changes were made. All 25 existing tests passed; they do not cover WSC-RTP
 negotiation or DVR/live transitions.
 
+## Completed compatibility fixes — November 1
+
+The implementation now passes all ten generated compatibility cases: closed
+20/45-second GOPs; closed/open H.264/H.265 with B frames; approximately 40/80 Mbps
+H.264; and approximately 80 Mbps with ten-second GOPs. The following sections retain
+the earlier findings/progress as history; this section describes the current code.
+
+Source PTS/DTS are preserved, disk playback is bounded, and seek preroll no longer
+requires keeping a whole GOP in memory. Independent decoding anchors are detected
+from NAL types (H.264 IDR; H.265 IDR/BLA). Seeks search preceding files when needed,
+stream from the selected anchor, and notify the client of the actual earlier time.
+
+The recorder now writes fragmented MP4 directly and rotates at independent decoding
+points after the nominal ten-second duration. The prototype established that merely
+enabling fragmentation inside splitmuxsink was insufficient: its GOP lookahead
+withheld output. Direct mp4mux plus unbuffered filesink makes internal fragments
+readable during recording. Active-file metadata is discoverable; the demuxer sees
+only bytes through the last complete mdat box. This byte snapshot adds no synthetic
+index or footer. Playback refreshes it after readable growth. Recent-buffer eviction
+retains dependency overlap until completed files are available, subject to the hard
+memory budget; active fragments provide disk fallback after forced cache eviction.
+
+Validation: 41 normal tests passed, two optional probes ignored; all ten compatibility
+cases pass decoded frame hashes, sampled seek preparation and timestamp checks.
+Clippy with warnings denied, formatting and whitespace checks pass. Additional tests
+exclude a deliberately truncated final mdat and verify active-file playback across
+RAM eviction and later appends, checking every emitted frame timestamp. These are
+local generated-stream checks; the updated implementation was not deployed or
+retested on a physical camera/native GUI during this stage.
+
+Limits: a seek can visibly start much earlier, especially when IDR/BLA frames are
+rare. Such cameras also produce longer files. The current finite growing-file
+snapshots reopen and scan when exhausted, which may be costly for very long files;
+this is bounded in memory, not constant-cost I/O. A single access unit is limited
+to 64 MiB. If RAM is exhausted before its disk fragment is complete, that newest
+footage cannot yet be sought. Exact-target hidden preroll requires client support.
+Crash recovery and retention remain separate tasks. Implementation details are in
+`PLANS/camera-compatibility-fixes.md`. Changes remain uncommitted for review.
+
 ## Compatibility implementation progress
 
 The duration target now preserves a long active GOP within the byte budget.

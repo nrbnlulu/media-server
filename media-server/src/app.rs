@@ -110,7 +110,9 @@ impl ClientSession {
             ClientSessionState::Dvr(ref player) => {
                 player.seek_to_timestamp(timestamp, 1.0).await?;
                 self.publisher
-                    .on_session_mode_change(SessionMode::Dvr { timestamp })
+                    .on_session_mode_change(SessionMode::Dvr {
+                        timestamp: player.current_timestamp().await,
+                    })
                     .await;
                 Ok(())
             }
@@ -140,7 +142,9 @@ impl ClientSession {
 
                         // Notify the client of the mode change
                         self.publisher
-                            .on_session_mode_change(SessionMode::Dvr { timestamp })
+                            .on_session_mode_change(SessionMode::Dvr {
+                                timestamp: player.current_timestamp().await,
+                            })
                             .await;
                         Ok(())
                     }

@@ -8,13 +8,29 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
 pub const SEGMENT_NS: u64 = 10_000_000_000;
 const BUFFER_NS: u64 = 30_000_000_000;
 const BUFFER_BYTES: usize = 64 * 1024 * 1024;
+
+/// Conservative random-access points: H.264 IDR and H.265 IDR/BLA.
+/// CRA/recovery-point pictures can require leading-picture/dependency handling.
+pub fn independent_frame(data: &[u8], codec: VideoCodec) -> bool {
+    crate::common::nal_utils::parse_annex_b(data)
+        .iter()
+        .any(|nal| {
+            if nal.is_empty() {
+                return false;
+            }
+            match codec {
+                VideoCodec::H264 => nal[0] & 0x1f == 5,
+                VideoCodec::H265 => nal.len() >= 2 && (16..=20).contains(&((nal[0] >> 1) & 0x3f)),
+            }
+        })
+}
 
 #[derive(Clone)]
 pub struct Frame {
@@ -65,6 +81,9 @@ pub struct Session {
     recent: Mutex<Recent>,
     pub closed: AtomicBool,
     pub started: std::time::Instant,
+    pub next_file: AtomicU64,
+    pub completed_until: AtomicU64,
+    pub active_files: Mutex<Vec<Segment>>,
 }
 
 fn sessions() -> &'static Mutex<HashMap<VideoSourceId, Weak<Session>>> {
@@ -92,6 +111,9 @@ impl Session {
             recent: Mutex::new(Recent::default()),
             closed: AtomicBool::new(false),
             started: std::time::Instant::now(),
+            next_file: AtomicU64::new(0),
+            completed_until: AtomicU64::new(0),
+            active_files: Mutex::new(Vec::new()),
         });
         sessions()
             .lock()
@@ -122,7 +144,10 @@ impl Session {
                 .frames
                 .front()
                 .is_some_and(|f| newest.saturating_sub(f.pts_ns) > BUFFER_NS);
-            if recent.bytes <= BUFFER_BYTES && !(expired && next_key.is_some()) {
+            let on_disk = next_key.is_some_and(|index| {
+                self.completed_until.load(Ordering::Acquire) >= recent.frames[index - 1].dts_ns
+            });
+            if recent.bytes <= BUFFER_BYTES && !(expired && on_disk) {
                 break;
             }
             let remove = next_key.unwrap_or(recent.frames.len());
@@ -134,6 +159,10 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn clear_recent_for_test(&self) {
+        *self.recent.lock() = Recent::default();
+    }
     pub fn snapshot(&self) -> Vec<Frame> {
         self.recent.lock().frames.iter().cloned().collect()
     }
@@ -214,6 +243,15 @@ pub fn list(source: &VideoSourceId) -> Result<Vec<Segment>> {
             }
         }
     }
+    if let Some(session) = Session::active(source) {
+        for segment in session.active_files.lock().iter() {
+            if !result.iter().any(|s| s.path == segment.path)
+                && segment.path.metadata().is_ok_and(|m| m.len() > 0)
+            {
+                result.push(segment.clone());
+            }
+        }
+    }
     result.sort_by_key(Segment::start_ms);
     Ok(result)
 }
@@ -265,6 +303,16 @@ mod tests {
             pts_ns: 45_000_000_000,
             dts_ns: 45_000_000_000,
             key: true,
+            data: Arc::new(vec![1; 100]),
+        });
+        assert_eq!(session.snapshot().first().unwrap().pts_ns, 0);
+        session
+            .completed_until
+            .store(44_900_000_000, Ordering::Release);
+        session.push(Frame {
+            pts_ns: 45_100_000_000,
+            dts_ns: 45_100_000_000,
+            key: false,
             data: Arc::new(vec![1; 100]),
         });
         assert_eq!(session.snapshot().first().unwrap().pts_ns, 45_000_000_000);
