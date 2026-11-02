@@ -150,6 +150,18 @@ pub fn recover(root: &Path) -> Result<usize> {
             }
         }
     }
+    // Warm each stream after recovery, so playback does not pay the initial scan.
+    let streams: std::collections::BTreeSet<_> = directories(root)?
+        .into_iter()
+        .filter_map(|directory| directory.parent().map(Path::to_owned))
+        .collect();
+    for stream in streams {
+        if let Err(error) = segments::list_stream(&stream) {
+            // Preserve startup behavior: a bad catalog fails playback for its
+            // stream, but does not prevent unrelated cameras from starting.
+            log::warn!("Could not preload DVR catalog {stream:?}: {error:#}");
+        }
+    }
     Ok(count)
 }
 
@@ -172,7 +184,7 @@ pub fn retain(root: &Path, now_ms: u64, seconds: u64) -> Result<usize> {
             if leases.contains_key(&segment.path) {
                 continue;
             }
-            std::fs::remove_file(segment.path.with_extension("json"))?;
+            segments::withdraw(&segment)?;
             if let Err(error) = std::fs::remove_file(&segment.path) {
                 // Keep it discoverable for a later cleanup attempt if deletion
                 // fails after withdrawing its catalog entry.

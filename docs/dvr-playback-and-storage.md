@@ -88,3 +88,49 @@ gap/end policy above. Quarantined and unindexed files are never silently deleted
 
 The DVR root defaults to `dvr`; `--dvr-dir` changes it consistently for recording,
 playback, recovery and retention. Paths are relative to the working directory.
+
+## In-memory recording catalog
+
+After recovery, completed segment metadata is loaded into a process-local catalog.
+Playback reuses cached directory membership and segment metadata instead of
+rescanning directories, opening JSON files and checking every MP4 on each lookup.
+Finalization publishes the JSON marker and updates the catalog under the same
+write lock; retention withdraws both and restores both if media deletion fails.
+New recording sessions are registered as their segments finalize. Active recording
+files still use the existing live session state and readiness checks.
+
+JSON and pending descriptors remain the persistent format; no storage migration is
+needed. Changes made outside the server (including editing or deleting sidecars)
+require a restart to refresh metadata. An unreadable catalog is logged during
+startup and still fails playback lookup for that stream. Catalog memory grows
+with the number of retained segments. Lookups still clone and sort full metadata
+snapshots; this change removes repeated filesystem work, rather than introducing
+a binary-search seek API. Retention still enumerates recording directories and
+checks deletion protections, but reuses cached segment metadata.
+
+Reproduce the catalog benchmark with:
+
+```sh
+cargo test -p media-server --release benchmark_catalog_lookup -- --ignored --nocapture
+```
+
+The benchmark compares the previous directory scan/JSON parse/MP4 existence check
+with the cached completed-catalog snapshot, verifies matching entries and ordering,
+and reports initial load time plus p50/p95 lookup latency. Each size uses 50 paired
+lookups with warm filesystem caches, across sessions containing up to 1,000
+segments each. Tiny placeholder MP4 files are sufficient because neither path
+decodes media. Results measure metadata lookup only, excluding active recordings,
+video decoding, end-to-end seek latency, and finalization/retention throughput.
+
+Measured locally on 2026-11-02, Intel Core i7-12700KF, Linux/Btrfs,
+Rust 1.97.0, release profile (times in milliseconds):
+
+| Segments | Sessions | Initial load | Scan p50 | Cached p50 | Scan p95 | Cached p95 | Median speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | 1 | 0.408 | 0.180 | 0.00576 | 0.210 | 0.00767 | 31.3x |
+| 1,000 | 1 | 2.676 | 1.871 | 0.05693 | 1.965 | 0.05945 | 32.9x |
+| 10,000 | 10 | 28.531 | 26.257 | 0.75074 | 27.628 | 0.84569 | 35.0x |
+
+These are single-process microbenchmark results, not a production throughput
+claim. Both paths benefit from warm OS caches; results vary with filesystem,
+hardware, catalog size and concurrent server activity.

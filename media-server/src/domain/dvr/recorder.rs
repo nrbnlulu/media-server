@@ -1111,7 +1111,15 @@ mod tests {
             assert!(player.set_speed(speed).is_err());
         }
         player.set_speed(1.0).unwrap();
-        std::fs::write(state.file_path.with_extension("json"), b"invalid catalog").unwrap();
+        // Catalog metadata is cached now. Publish a following segment, then
+        // remove its media so advancing playback exercises a real I/O failure.
+        let mut missing = segments::list_in(&session.directory).unwrap()[0].clone();
+        missing.first_ns = missing.end_ns + 1;
+        missing.end_ns = missing.first_ns + segments::SEGMENT_NS;
+        missing.path = session.directory.join("missing.mp4");
+        std::fs::write(&missing.path, b"media").unwrap();
+        missing.publish().unwrap();
+        std::fs::remove_file(&missing.path).unwrap();
         player.play().await.unwrap();
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(matches!(
