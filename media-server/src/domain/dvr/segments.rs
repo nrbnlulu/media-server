@@ -556,7 +556,7 @@ mod tests {
             let index95 = percentile(&mut lookups, 95) as f64 / 1000.0;
             println!(
                 "{count},{},{initial},{scan50:.2},{scan95:.2},{index50:.2},{index95:.2},{:.1}x",
-                (count + 999) / 1000,
+                count.div_ceil(1000),
                 scan50 / index50
             );
         }
