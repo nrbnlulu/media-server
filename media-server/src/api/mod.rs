@@ -30,6 +30,7 @@ use crate::app::GlobalState;
         handlers::set_session_speed,
         handlers::switch_session_to_live,
         handlers::get_session_mode,
+        handlers::session_events,
     ),
     components(
         schemas(
@@ -109,6 +110,10 @@ pub fn create_router(state: Arc<GlobalState>) -> Router {
         .route(
             "/client-session-control/:session_id/mode",
             get(handlers::get_session_mode),
+        )
+        .route(
+            "/client-session-control/:session_id/events",
+            get(handlers::session_events),
         )
         .route("/debug/webrtc-client", get(handlers::webrtc_client))
         .with_state(state)

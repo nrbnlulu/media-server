@@ -83,6 +83,7 @@ pub struct SeekRequest {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SpeedRequest {
+    /// Forward DVR rate, finite and between 0.25 and 4.0 inclusive.
     pub speed: f64,
 }
 

@@ -107,6 +107,7 @@ pub struct Session {
     pub directory: PathBuf,
     recent: Mutex<Recent>,
     pub closed: AtomicBool,
+    last_arrival: Mutex<Option<std::time::Instant>>,
     pub started: std::time::Instant,
     pub next_file: AtomicU64,
     pub first_dts: AtomicU64,
@@ -138,6 +139,7 @@ impl Session {
             directory,
             recent: Mutex::new(Recent::default()),
             closed: AtomicBool::new(false),
+            last_arrival: Mutex::new(None),
             started: std::time::Instant::now(),
             next_file: AtomicU64::new(0),
             first_dts: AtomicU64::new(u64::MAX),
@@ -166,6 +168,7 @@ impl Session {
         recent.bytes += frame.data.len();
         let newest = frame.pts_ns;
         recent.frames.push_back(frame);
+        *self.last_arrival.lock() = Some(std::time::Instant::now());
         self.trim_recent(&mut recent, newest);
     }
 
@@ -208,6 +211,15 @@ impl Session {
     #[cfg(test)]
     pub(crate) fn clear_recent_for_test(&self) {
         *self.recent.lock() = Recent::default();
+    }
+    /// Live head and its arrival time, without cloning the retained GOP buffer.
+    pub fn latest_decode_time(&self) -> Option<(u64, std::time::Instant)> {
+        let recent = self.recent.lock();
+        let frame = recent.frames.back()?;
+        Some((
+            self.origin_ms * 1_000_000 + frame.dts_ns,
+            (*self.last_arrival.lock())?,
+        ))
     }
     pub fn snapshot(&self) -> Vec<Frame> {
         self.recent.lock().frames.iter().cloned().collect()

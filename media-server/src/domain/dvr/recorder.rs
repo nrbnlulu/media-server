@@ -760,7 +760,7 @@ mod tests {
         }
         assert!(player.current_timestamp().await >= session.origin_ms + 21000);
         player
-            .seek_to_timestamp(session.origin_ms + 40000, 1.0)
+            .seek_to_timestamp(session.origin_ms + 40000)
             .await
             .unwrap();
         while rx.try_recv().is_ok() {}
@@ -773,7 +773,7 @@ mod tests {
         assert_eq!(timestamp, expected);
         assert!(
             player
-                .seek_to_timestamp(session.origin_ms + 100000, 1.0)
+                .seek_to_timestamp(session.origin_ms + 100000)
                 .await
                 .is_err()
         );
@@ -1097,6 +1097,69 @@ mod tests {
         assert!(seek.current_timestamp().await >= second.origin_ms);
     }
     #[tokio::test]
+    async fn accelerated_playback_requests_live_only_at_a_fresh_active_head() {
+        let (source, session, mut state, _cleanup, _) = recording(2, VideoCodec::H264);
+        let (capture, _rx) = new_capture();
+        let player = SegmentedPlayer::new(source, session.origin_ms + 500, capture)
+            .await
+            .unwrap();
+        player.set_speed(4.0).unwrap();
+        player.play().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), player.catch_up_requested())
+            .await
+            .unwrap();
+        assert!(player.take_catch_up());
+        assert!(!player.take_catch_up(), "a request is consumed once");
+        player.set_speed(1.0).unwrap();
+        assert!(!player.take_catch_up());
+        player.terminate().await.unwrap();
+        state.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn playback_speed_scales_rtp_and_survives_seek() {
+        let (source, session, mut state, _cleanup, input) = recording(2, VideoCodec::H264);
+        state.stop().unwrap();
+        session.close();
+        let (capture, mut rx) = new_capture();
+        let player = SegmentedPlayer::new(source, session.origin_ms + 500, capture)
+            .await
+            .unwrap();
+        player.set_speed(4.0).unwrap();
+        player.play().await.unwrap();
+        let (_, first) = rx.recv().await.unwrap();
+        for frame in input.iter().skip(1).take(15) {
+            let (_, ts) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let delta = (frame.pts_ns - input[0].pts_ns) as f64 / 4.0 * 90000.0 / 1e9;
+            assert!((ts.wrapping_sub(first) as f64 - delta).abs() < 2.0);
+        }
+        assert!(
+            !player.take_catch_up(),
+            "finite recordings cannot catch up to live"
+        );
+        player
+            .seek_to_timestamp(session.origin_ms + 500)
+            .await
+            .unwrap();
+        assert_eq!(player.speed(), 4.0);
+        assert!(
+            player
+                .seek_to_timestamp(session.origin_ms + 100000)
+                .await
+                .is_err()
+        );
+        assert_eq!(player.speed(), 4.0);
+        for invalid in [0.0, 5.0, f64::NAN] {
+            assert!(player.set_speed(invalid).is_err());
+            assert_eq!(player.speed(), 4.0);
+        }
+        player.terminate().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn playback_reports_io_failure_and_rejects_unsupported_speed() {
         use media_server_api_models::PlaybackEvent;
         let (source, session, mut state, _cleanup, _input) = recording(1, VideoCodec::H264);
@@ -1107,7 +1170,7 @@ mod tests {
         let player = SegmentedPlayer::new(source, session.origin_ms + 500, capture.clone())
             .await
             .unwrap();
-        for speed in [0.0, -1.0, 2.0, f64::NAN, f64::INFINITY] {
+        for speed in [0.0, -1.0, 0.24, 4.01, f64::NAN, f64::INFINITY] {
             assert!(player.set_speed(speed).is_err());
         }
         player.set_speed(1.0).unwrap();
