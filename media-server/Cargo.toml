@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+clap = { version = "4.6", features = ["derive"] }
 tokio = { version = "1.35", features = ["full"] }
 tokio-util = "0.7"
 axum = { version = "0.7", features = ["ws"] }
@@ -47,7 +48,6 @@ hex = "0.4"
 async-stream = "0.3.6"
 media-server-api-models = { workspace = true }
 parking_lot = "0.12.5"
-envy = "0.4.2"
 rtp = { path = "../crates/rtp" }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

@@ -47,3 +47,4 @@ ___
 
 - all plan files u write whould be stored under <project_root>/PLANS/<your_plan_name>.md
 
+- never commit with co-authorship credits.

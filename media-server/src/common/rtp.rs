@@ -9,7 +9,7 @@ use futures::future::join_all;
 use media_server_api_models::ClientSessionId;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 pub use rtp::{RtpHeader, RtpPacket};
 
@@ -264,9 +264,7 @@ impl RtpPacketizer {
 #[async_trait]
 impl FfmpegConsumer for RtpPacketizer {
     fn initialize(&self, metadata: &FFmpegVideoMetadata) -> anyhow::Result<()> {
-        if self.is_initialized.load(Ordering::Relaxed) {
-            bail!("RtpPacketizer is already initialized");
-        }
+        let reinitializing = self.is_initialized.load(Ordering::Acquire);
 
         let ffmpeg_extradata = metadata
             .extradata
@@ -312,6 +310,9 @@ impl FfmpegConsumer for RtpPacketizer {
         if let Some(params) = self.get_codec_params() {
             let consumers = self.consumers.lock().clone();
             for consumer in &consumers {
+                if reinitializing {
+                    consumer.on_source_switch();
+                }
                 consumer.update_params(&params);
             }
         }
@@ -372,6 +373,7 @@ impl FfmpegConsumer for RtpPacketizer {
                 if params_changed {
                     let consumers = self.consumers.lock().clone();
                     for consumer in consumers {
+                        consumer.on_source_switch();
                         consumer.update_params(&config.codec_params);
                     }
                 }
@@ -383,23 +385,43 @@ impl FfmpegConsumer for RtpPacketizer {
         if let Some(nal_units) = nal_units
             && !nal_units.is_empty()
         {
-            let rtp_frames = self.packetize(&nal_units, timestamp, &codec);
-            let consumers = self.consumers.lock().clone();
-
-            if consumers.is_empty() {
-                return Ok(());
-            }
-
-            // Send frames directly to consumers without spawning tasks
-            // This reduces overhead significantly for real-time streaming
-            for frame in rtp_frames {
-                let arc_frame = Arc::new(frame);
-                let mut tasks = Vec::new();
-                for consumer in &consumers {
-                    tasks.push(consumer.on_new_packet(arc_frame.clone()));
+            let mut independent = nal_units.iter().any(|nal| match codec {
+                VideoCodec::H264 => nal.first().is_some_and(|b| b & 0x1f == 5),
+                VideoCodec::H265 => nal.len() >= 2 && (16..=20).contains(&((nal[0] >> 1) & 0x3f)),
+            });
+            let mut units = nal_units;
+            if independent && let Some(params) = self.get_codec_params() {
+                let headers: Vec<Vec<u8>> = match params {
+                    CodecParameters::H264 { sps, pps, .. } => {
+                        [sps, pps].into_iter().flatten().collect()
+                    }
+                    CodecParameters::H265 { vps, sps, pps, .. } => {
+                        [vps, sps, pps].into_iter().flatten().collect()
+                    }
+                };
+                if headers.len()
+                    == match codec {
+                        VideoCodec::H264 => 2,
+                        VideoCodec::H265 => 3,
+                    }
+                {
+                    units.splice(0..0, headers);
+                } else {
+                    independent = false;
                 }
-                join_all(tasks).await;
             }
+            let packets: Vec<_> = self
+                .packetize(&units, timestamp, &codec)
+                .into_iter()
+                .map(Arc::new)
+                .collect();
+            let consumers = self.consumers.lock().clone();
+            join_all(
+                consumers
+                    .iter()
+                    .map(|consumer| consumer.on_frame(packets.clone(), independent)),
+            )
+            .await;
         }
         Ok(())
     }
@@ -545,6 +567,9 @@ pub struct StitchingConsumer {
     id: ClientSessionId,
     stitcher: RtpStitcher,
     inner: Arc<dyn RtpConsumer>,
+    generation: AtomicU64,
+    delivery: tokio::sync::Mutex<()>,
+    generation_guard: Mutex<()>,
 }
 
 impl StitchingConsumer {
@@ -553,9 +578,29 @@ impl StitchingConsumer {
             id: *inner.id(),
             stitcher: RtpStitcher::new(rand::random()),
             inner,
+            generation: AtomicU64::new(0),
+            delivery: tokio::sync::Mutex::new(()),
+            generation_guard: Mutex::new(()),
         }
     }
 
+    pub fn input(self: &Arc<Self>) -> Arc<dyn RtpConsumer> {
+        Arc::new(SwitchInput {
+            parent: self.clone(),
+            generation: self.generation.load(Ordering::Acquire),
+            waiting: AtomicBool::new(true),
+            codec: Mutex::new(None),
+            codec_error: AtomicBool::new(false),
+        })
+    }
+    pub async fn next_input(self: &Arc<Self>) -> Arc<dyn RtpConsumer> {
+        let _delivery = self.delivery.lock().await;
+        let _generation = self.generation_guard.lock();
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.trigger_source_switch();
+        self.inner.on_source_switch();
+        self.input()
+    }
     /// Manually trigger a source switch adjustment on the next packet.
     pub fn trigger_source_switch(&self) {
         self.stitcher.trigger_source_switch();
@@ -572,8 +617,96 @@ impl StitchingConsumer {
     }
 }
 
+struct SwitchInput {
+    parent: Arc<StitchingConsumer>,
+    generation: u64,
+    waiting: AtomicBool,
+    codec: Mutex<Option<VideoCodec>>,
+    codec_error: AtomicBool,
+}
+#[async_trait]
+impl RtpConsumer for SwitchInput {
+    fn accepts_codec(&self, codec: VideoCodec) -> bool {
+        self.parent.inner.accepts_codec(codec)
+    }
+    async fn on_playback_event(&self, event: media_server_api_models::PlaybackEvent) {
+        let _delivery = self.parent.delivery.lock().await;
+        if self.generation == self.parent.generation.load(Ordering::Acquire) {
+            self.parent.inner.on_playback_event(event).await;
+        }
+    }
+    fn playback_event(&self) -> Option<media_server_api_models::PlaybackEvent> {
+        self.parent.inner.playback_event()
+    }
+    fn id(&self) -> &ClientSessionId {
+        &self.parent.id
+    }
+    async fn on_new_packet(&self, _packet: Arc<RtpPacket>) {
+        // Switching inputs require complete access units; partial packet delivery
+        // cannot safely establish an independent frame boundary.
+    }
+    async fn on_frame(&self, packets: Vec<Arc<RtpPacket>>, independent: bool) {
+        let _delivery = self.parent.delivery.lock().await;
+        if self.generation != self.parent.generation.load(Ordering::Acquire) {
+            return;
+        }
+        let codec = *self.codec.lock();
+        if let Some(codec) = codec
+            && !self.parent.inner.accepts_codec(codec)
+        {
+            if !self.codec_error.swap(true, Ordering::AcqRel) {
+                self.parent
+                    .inner
+                    .on_playback_event(
+                        media_server_api_models::PlaybackEvent::RenegotiationRequired {
+                            codec: codec.mime_type().into(),
+                            message: "Create a new WebRTC offer/session for this codec".into(),
+                        },
+                    )
+                    .await;
+            }
+            return;
+        }
+        if self.waiting.load(Ordering::Acquire) {
+            if !independent || packets.last().is_none_or(|p| !p.header.marker) {
+                return;
+            }
+            self.waiting.store(false, Ordering::Release);
+        }
+        for packet in packets {
+            let stitched = self.parent.stitcher.stitch(&packet);
+            self.parent.inner.on_new_packet(Arc::new(stitched)).await;
+        }
+    }
+    fn update_params(&self, params: &CodecParameters) {
+        let _generation = self.parent.generation_guard.lock();
+        if self.generation == self.parent.generation.load(Ordering::Acquire) {
+            *self.codec.lock() = Some(params.codec());
+            self.codec_error.store(false, Ordering::Release);
+            self.parent.inner.update_params(params);
+        }
+    }
+    fn on_source_switch(&self) {
+        let _generation = self.parent.generation_guard.lock();
+        if self.generation == self.parent.generation.load(Ordering::Acquire) {
+            self.waiting.store(true, Ordering::Release);
+            self.parent.trigger_source_switch();
+            self.parent.inner.on_source_switch();
+        }
+    }
+}
+
 #[async_trait]
 impl RtpConsumer for StitchingConsumer {
+    fn accepts_codec(&self, codec: VideoCodec) -> bool {
+        self.inner.accepts_codec(codec)
+    }
+    async fn on_playback_event(&self, event: media_server_api_models::PlaybackEvent) {
+        self.inner.on_playback_event(event).await;
+    }
+    fn playback_event(&self) -> Option<media_server_api_models::PlaybackEvent> {
+        self.inner.playback_event()
+    }
     fn id(&self) -> &ClientSessionId {
         &self.id
     }
@@ -585,6 +718,10 @@ impl RtpConsumer for StitchingConsumer {
 
     fn update_params(&self, params: &CodecParameters) {
         self.inner.update_params(params);
+    }
+
+    fn on_source_switch(&self) {
+        self.trigger_source_switch();
     }
 
     async fn finalize(&self) -> anyhow::Result<()> {
@@ -768,6 +905,166 @@ impl CodecParameters {
 mod tests {
     use super::*;
 
+    struct SwitchCapture {
+        id: ClientSessionId,
+        packets: Mutex<Vec<RtpPacket>>,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        block: AtomicBool,
+    }
+    #[async_trait]
+    impl RtpConsumer for SwitchCapture {
+        fn id(&self) -> &ClientSessionId {
+            &self.id
+        }
+        async fn on_new_packet(&self, packet: Arc<RtpPacket>) {
+            self.packets.lock().push((*packet).clone());
+            if self.block.swap(false, Ordering::AcqRel) {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+        }
+    }
+    fn switch_capture() -> Arc<SwitchCapture> {
+        Arc::new(SwitchCapture {
+            id: uuid::Uuid::new_v4(),
+            packets: Mutex::new(Vec::new()),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            block: AtomicBool::new(false),
+        })
+    }
+    fn access_unit(timestamp: u32, marker: bool) -> Vec<Arc<RtpPacket>> {
+        vec![Arc::new(RtpPacket::new(
+            RtpHeader {
+                payload_type: 96,
+                marker,
+                seq: 20,
+                timestamp,
+                ssrc: 100,
+            },
+            Arc::from([0x65u8]),
+        ))]
+    }
+
+    #[tokio::test]
+    async fn live_packetizer_supplies_parameters_and_a_complete_fragmented_idr() {
+        for codec in [VideoCodec::H264, VideoCodec::H265] {
+            let capture = switch_capture();
+            let stitch = Arc::new(StitchingConsumer::new(capture.clone()));
+            let packetizer = RtpPacketizer::new(100, 96);
+            let params = match codec {
+                VideoCodec::H264 => CodecParameters::H264 {
+                    sps: Some(vec![0x67, 1]),
+                    pps: Some(vec![0x68, 1]),
+                    nal_length_size: None,
+                },
+                VideoCodec::H265 => CodecParameters::H265 {
+                    vps: Some(vec![0x40, 1]),
+                    sps: Some(vec![0x42, 1]),
+                    pps: Some(vec![0x44, 1]),
+                    nal_length_size: None,
+                },
+            };
+            *packetizer.stream_metadata.lock() = Some(SrcStreamState {
+                codec,
+                codec_params: params,
+                timebase: TimeBase { num: 1, den: 90000 },
+                parsed_extradata: nal_utils::ParsedExtraData {
+                    framing_format: nal_utils::FramingFormat::AnnexB,
+                    nals: Vec::new(),
+                },
+            });
+            packetizer.is_initialized.store(true, Ordering::Release);
+            packetizer.add_consumer(stitch.input());
+            let mut nal = vec![1; 4000];
+            nal[0] = match codec {
+                VideoCodec::H264 => 0x65,
+                VideoCodec::H265 => 0x26,
+            };
+            let mut packet = ffmpeg::Packet::copy(&nal_utils::build_annex_b(&[nal]));
+            packet.set_pts(Some(90000));
+            packetizer.on_new_packet(Arc::new(packet)).await.unwrap();
+            let packets = capture.packets.lock();
+            let headers = if codec == VideoCodec::H264 { 2 } else { 3 };
+            assert!(packets.len() > headers + 1);
+            assert!(packets.last().unwrap().header.marker);
+            assert!(
+                packets[..packets.len() - 1]
+                    .iter()
+                    .all(|p| !p.header.marker)
+            );
+            assert_eq!(
+                packets[0].payload[0],
+                if codec == VideoCodec::H264 {
+                    0x67
+                } else {
+                    0x40
+                }
+            );
+            assert!(
+                packets
+                    .iter()
+                    .all(|p| p.header.timestamp == packets[0].header.timestamp)
+            );
+        }
+    }
+    #[tokio::test]
+    async fn switch_rejects_stale_inputs_and_waits_for_complete_independent_frame() {
+        let capture = switch_capture();
+        let stitch = Arc::new(StitchingConsumer::new(capture.clone()));
+        let old = stitch.input();
+        old.on_frame(access_unit(90000, true), true).await;
+        let live = stitch.next_input().await;
+        old.on_frame(access_unit(9000000, true), true).await;
+        live.on_frame(access_unit(400000, true), false).await;
+        live.on_frame(access_unit(410000, false), true).await;
+        assert_eq!(capture.packets.lock().len(), 1);
+        live.on_frame(access_unit(420000, true), true).await;
+        live.on_frame(access_unit(423000, true), false).await;
+        let packets = capture.packets.lock();
+        assert_eq!(packets.len(), 3);
+        for pair in packets.windows(2) {
+            assert_eq!(pair[1].header.seq, pair[0].header.seq.wrapping_add(1));
+            assert_eq!(
+                pair[1].header.timestamp,
+                pair[0].header.timestamp.wrapping_add(3000)
+            );
+            assert_eq!(pair[1].header.ssrc, pair[0].header.ssrc);
+        }
+    }
+    #[tokio::test]
+    async fn switching_waits_until_an_inflight_fragmented_frame_finishes() {
+        let capture = switch_capture();
+        let stitch = Arc::new(StitchingConsumer::new(capture.clone()));
+        let old = stitch.input();
+        capture.block.store(true, Ordering::Release);
+        let mut packets = access_unit(90000, false);
+        packets.extend(access_unit(90000, true));
+        let send = tokio::spawn(async move {
+            old.on_frame(packets, true).await;
+            old
+        });
+        capture.started.notified().await;
+        let switching = {
+            let stitch = stitch.clone();
+            tokio::spawn(async move { stitch.next_input().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!switching.is_finished());
+        capture.release.notify_one();
+        let old = send.await.unwrap();
+        let live = switching.await.unwrap();
+        old.on_frame(access_unit(100000, true), true).await;
+        live.on_frame(access_unit(500000, true), true).await;
+        let packets = capture.packets.lock();
+        assert_eq!(packets.len(), 3);
+        assert!(!packets[0].header.marker);
+        assert!(packets[1].header.marker);
+        assert_eq!(packets[0].header.timestamp, packets[1].header.timestamp);
+        assert_eq!(packets[2].header.timestamp, 93000);
+    }
+
     #[test]
     fn test_small_nal_single_packet() {
         let packetizer = RtpPacketizer::new(12345, 96);
@@ -803,6 +1100,41 @@ mod tests {
         assert!(frames[frames.len() - 1].header.marker); // Marker bit set
     }
 
+    #[test]
+    fn packetizer_reinitializes_for_codec_changes_without_losing_valid_state_on_error() {
+        let packetizer = RtpPacketizer::new(100, 96);
+        let mut metadata = FFmpegVideoMetadata {
+            codec: VideoCodec::H264,
+            timebase: TimeBase { num: 1, den: 90000 },
+            extradata: Some(vec![
+                1, 100, 0, 30, 255, 225, 0, 4, 0x67, 0x42, 0, 30, 1, 0, 4, 0x68, 0xce, 0x3c, 0x80,
+            ]),
+        };
+        packetizer.initialize(&metadata).unwrap();
+        assert_eq!(
+            packetizer.get_codec_params().unwrap().codec(),
+            VideoCodec::H264
+        );
+        let mut hvcc = vec![
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 30, 0xf0, 0, 0xfc, 0xfc, 0xf8, 0xf8, 0, 0, 3, 3,
+        ];
+        push_h265_array(&mut hvcc, 32, &[0x40, 1, 0x0c]);
+        push_h265_array(&mut hvcc, 33, &[0x42, 1, 1, 0x60]);
+        push_h265_array(&mut hvcc, 34, &[0x44, 1, 0xc0]);
+        metadata.codec = VideoCodec::H265;
+        metadata.extradata = Some(hvcc);
+        packetizer.initialize(&metadata).unwrap();
+        assert_eq!(
+            packetizer.get_codec_params().unwrap().codec(),
+            VideoCodec::H265
+        );
+        metadata.extradata = None;
+        assert!(packetizer.initialize(&metadata).is_err());
+        assert_eq!(
+            packetizer.get_codec_params().unwrap().codec(),
+            VideoCodec::H265
+        );
+    }
     #[test]
     fn test_update_from_h264_extradata() {
         let sps = vec![0x67, 0x42, 0x00, 0x1e];

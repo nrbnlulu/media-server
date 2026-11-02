@@ -1,2 +1,2 @@
-pub mod dvr;
 pub mod rtsp;
+pub mod segmented_dvr;

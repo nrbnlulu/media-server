@@ -218,6 +218,7 @@ pub async fn wsc_rtp(
             publisher,
             source,
             query.force_websocket_transport,
+            query.playback_events,
         )
         .await;
         if let Err(e) = state.delete_wsc_rtp_session(&session_id).await {
@@ -321,37 +322,14 @@ pub async fn create_dvr_webrtc_session(
         req.timestamp
     );
 
-    // First create a live session
-    let create_req = CreateWebRtcSessionRequest {
-        offer: req.offer.clone(),
-    };
-
     let (session_id, answer) = state
-        .clone()
-        .create_websocket_session(create_req, source_id.clone())
+        .create_dvr_webrtc_session(
+            CreateWebRtcSessionRequest { offer: req.offer },
+            source_id,
+            req.timestamp,
+        )
         .await
-        .map_err(|e| {
-            log::error!(
-                "Failed to create WebRTC DVR session for stream {}: {}",
-                source_id,
-                e
-            );
-            ApiError::BadRequest(e.to_string())
-        })?;
-
-    // Now seek to the requested timestamp
-    state
-        .seek_session(&session_id, req.timestamp)
-        .await
-        .map_err(|e| {
-            log::error!(
-                "Failed to seek DVR session {} to timestamp {}: {}",
-                session_id,
-                req.timestamp,
-                e
-            );
-            ApiError::BadRequest(e.to_string())
-        })?;
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
 
     Ok((
         StatusCode::CREATED,

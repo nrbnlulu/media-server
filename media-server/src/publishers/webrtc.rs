@@ -128,7 +128,9 @@ impl WebrtcManager {
         } else {
             bail!("No local description available");
         };
-        let session = Arc::new(WebRtcSession::new(source_id, track, session_id, conn));
+        let session = Arc::new(WebRtcSession::new(
+            source_id, track, session_id, conn, codec,
+        ));
         self.sessions.insert(session_id, session.clone());
 
         Ok((session, answer_sdp))
@@ -146,6 +148,8 @@ pub struct WebRtcSession {
     conn: RTCPeerConnection,
     session_id: ClientSessionId,
     source_id: VideoSourceId,
+    codec: crate::common::VideoCodec,
+    playback: parking_lot::Mutex<Option<media_server_api_models::PlaybackEvent>>,
 }
 
 impl WebRtcSession {
@@ -154,12 +158,15 @@ impl WebRtcSession {
         track: Arc<TrackLocalStaticRTP>,
         session_id: ClientSessionId,
         conn: RTCPeerConnection,
+        codec: crate::common::VideoCodec,
     ) -> Self {
         Self {
             track,
             conn,
             session_id,
             source_id,
+            codec,
+            playback: parking_lot::Mutex::new(None),
         }
     }
 
@@ -170,6 +177,15 @@ impl WebRtcSession {
 
 #[async_trait]
 impl RtpConsumer for WebRtcSession {
+    fn accepts_codec(&self, codec: crate::common::VideoCodec) -> bool {
+        codec == self.codec
+    }
+    async fn on_playback_event(&self, event: media_server_api_models::PlaybackEvent) {
+        *self.playback.lock() = Some(event);
+    }
+    fn playback_event(&self) -> Option<media_server_api_models::PlaybackEvent> {
+        self.playback.lock().clone()
+    }
     fn id(&self) -> &ClientSessionId {
         self.session_id()
     }
@@ -198,7 +214,9 @@ impl RtpVideoPublisher for WebRtcSession {
         &self.source_id
     }
 
-    async fn on_session_mode_change(&self, _mode: media_server_api_models::SessionMode) {
-        // WebRTC sessions use REST APIs for mode changes, no action needed
+    async fn on_session_mode_change(&self, mode: media_server_api_models::SessionMode) {
+        if matches!(mode, media_server_api_models::SessionMode::Live) {
+            *self.playback.lock() = None;
+        }
     }
 }
