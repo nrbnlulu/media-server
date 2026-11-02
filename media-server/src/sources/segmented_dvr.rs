@@ -13,7 +13,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -234,7 +234,11 @@ pub struct SegmentedPlayer {
     consumer: Arc<dyn RtpConsumer>,
     state: tokio::sync::Mutex<Playback>,
     position_ns: Arc<AtomicU64>,
+    decode_position: Arc<AtomicU64>,
     status: Arc<parking_lot::Mutex<PlaybackEvent>>,
+    rate: tokio::sync::watch::Sender<f64>,
+    caught_up: Arc<AtomicBool>,
+    catch_up_ready: Arc<tokio::sync::Notify>,
 }
 impl Drop for SegmentedPlayer {
     fn drop(&mut self) {
@@ -257,14 +261,42 @@ impl SegmentedPlayer {
                 .is_ok_and(|catalog| catalog.iter().any(|segment| timestamp <= segment.end_ms()))
     }
     pub fn speed(&self) -> f64 {
-        1.0
+        *self.rate.borrow()
     }
     pub fn set_speed(&self, speed: f64) -> Result<()> {
         ensure!(
-            speed == 1.0,
-            "unsupported playback speed: only 1.0 is supported"
+            speed.is_finite() && (0.25..=4.0).contains(&speed),
+            "unsupported playback speed: expected a finite rate between 0.25 and 4.0"
         );
+        self.caught_up.store(false, Ordering::Release);
+        self.rate.send_replace(speed);
         Ok(())
+    }
+    pub async fn catch_up_requested(&self) {
+        self.catch_up_ready.notified().await;
+    }
+    pub fn take_catch_up(&self) -> bool {
+        if !self.caught_up.swap(false, Ordering::AcqRel) || self.speed() <= 1.0 {
+            return false;
+        }
+        Session::active(&self.source).is_some_and(|active| {
+            !active.closed.load(Ordering::Acquire)
+                && active.latest_decode_time().is_some_and(|(head, arrived)| {
+                    arrived.elapsed() < Duration::from_secs(1)
+                        && head.abs_diff(self.decode_position.load(Ordering::Acquire))
+                            <= 100_000_000
+                })
+        })
+    }
+    pub async fn require_live_codec(&self, codec: VideoCodec) {
+        let event = PlaybackEvent::RenegotiationRequired {
+            codec: codec.mime_type().into(),
+            message: "Create a new WebRTC offer/session for the live codec".into(),
+        };
+        if *self.status.lock() != event {
+            self.terminate().await.ok();
+            notify(&self.consumer, &self.status, event).await;
+        }
     }
     pub fn playback_event(&self) -> PlaybackEvent {
         self.status.lock().clone()
@@ -278,6 +310,9 @@ impl SegmentedPlayer {
         check_codec(&consumer, prepared.codec).await?;
         let actual_ns = prepared.frames.front().unwrap().pts_ns;
         Ok(Self {
+            rate: tokio::sync::watch::channel(1.0).0,
+            caught_up: Arc::new(AtomicBool::new(false)),
+            catch_up_ready: Arc::new(tokio::sync::Notify::new()),
             source,
             consumer,
             state: tokio::sync::Mutex::new(Playback {
@@ -285,6 +320,7 @@ impl SegmentedPlayer {
                 prepared: Some(prepared),
             }),
             position_ns: Arc::new(AtomicU64::new(actual_ns)),
+            decode_position: Arc::new(AtomicU64::new(0)),
             status: Arc::new(parking_lot::Mutex::new(PlaybackEvent::Playing {
                 timestamp: actual_ns / 1_000_000,
             })),
@@ -295,6 +331,10 @@ impl SegmentedPlayer {
         let consumer = self.consumer.clone();
         let position = self.position_ns.clone();
         let status = self.status.clone();
+        let rate = self.rate.subscribe();
+        let caught_up = self.caught_up.clone();
+        let catch_up_ready = self.catch_up_ready.clone();
+        let decode_position = self.decode_position.clone();
         tokio::spawn(async move {
             if let Err(error) = stream(
                 source,
@@ -302,6 +342,10 @@ impl SegmentedPlayer {
                 position.clone(),
                 status.clone(),
                 prepared,
+                rate,
+                caught_up,
+                decode_position,
+                catch_up_ready,
             )
             .await
             {
@@ -333,8 +377,7 @@ impl SegmentedPlayer {
         }
         Ok(())
     }
-    pub async fn seek_to_timestamp(&self, timestamp: u64, speed: f64) -> Result<()> {
-        self.set_speed(speed)?;
+    pub async fn seek_to_timestamp(&self, timestamp: u64) -> Result<()> {
         let mut state = self.state.lock().await;
         let prepared = prepare(&self.source, timestamp).await?;
         check_codec(&self.consumer, prepared.codec).await?;
@@ -342,6 +385,7 @@ impl SegmentedPlayer {
             task.abort();
             let _ = task.await;
         }
+        self.caught_up.store(false, Ordering::Release);
         self.consumer.on_source_switch();
         let timestamp = prepared.frames.front().unwrap().pts_ns / 1_000_000;
         self.position_ns
@@ -352,6 +396,56 @@ impl SegmentedPlayer {
     }
     pub async fn current_timestamp(&self) -> u64 {
         self.position_ns.load(Ordering::Acquire) / 1_000_000
+    }
+}
+
+/// Maps source decode/presentation time onto a continuous 90 kHz transport clock.
+struct PlaybackClock {
+    origin: u64,
+    rtp_base: u32,
+    source: f64,
+    output: f64,
+    wall: tokio::time::Instant,
+    rate: f64,
+}
+impl PlaybackClock {
+    fn new(source: u64, rate: f64) -> Self {
+        Self {
+            origin: source,
+            rtp_base: ((source as u128 * 90000) / 1_000_000_000) as u32,
+            source: 0.0,
+            output: ((source as u128 * 90000) % 1_000_000_000) as f64 / 90000.0,
+            wall: tokio::time::Instant::now(),
+            rate,
+        }
+    }
+    fn deadline(&self, dts: u64) -> tokio::time::Instant {
+        self.wall
+            + Duration::from_secs_f64(
+                (((dts as i128 - self.origin as i128) as f64 - self.source) / self.rate / 1e9)
+                    .max(0.0),
+            )
+    }
+    fn timestamp(&self, pts: u64) -> u32 {
+        let ticks = ((self.output
+            + ((pts as i128 - self.origin as i128) as f64 - self.source) / self.rate)
+            * 90000.0
+            / 1e9)
+            .floor() as i128;
+        self.rtp_base
+            .wrapping_add(ticks.rem_euclid(1i128 << 32) as u32)
+    }
+    fn set_rate(&mut self, rate: f64) {
+        let elapsed = self.wall.elapsed().as_secs_f64() * 1e9;
+        self.source += elapsed * self.rate;
+        self.output += elapsed;
+        self.wall = tokio::time::Instant::now();
+        self.rate = rate;
+    }
+    fn resume(&mut self, dts: u64) {
+        self.output += ((dts as i128 - self.origin as i128) as f64 - self.source) / self.rate;
+        self.source = (dts as i128 - self.origin as i128) as f64;
+        self.wall = tokio::time::Instant::now();
     }
 }
 
@@ -399,6 +493,10 @@ async fn stream(
     position: Arc<AtomicU64>,
     status: Arc<parking_lot::Mutex<PlaybackEvent>>,
     mut prepared: Prepared,
+    mut rate: tokio::sync::watch::Receiver<f64>,
+    caught_up: Arc<AtomicBool>,
+    decode_position: Arc<AtomicU64>,
+    catch_up_ready: Arc<tokio::sync::Notify>,
 ) -> Result<()> {
     let packetizer = RtpPacketizer::new(rand::random(), 96);
     let first = prepared
@@ -406,8 +504,8 @@ async fn stream(
         .front()
         .ok_or_else(|| anyhow!("No DVR frames"))?
         .dts_ns;
-    let mut first = first;
-    let mut started = tokio::time::Instant::now();
+    let mut clock = PlaybackClock::new(first, *rate.borrow());
+
     let mut last_sent = None;
     let mut configured = None;
     let mut configured_params = None;
@@ -496,8 +594,7 @@ async fn stream(
                     },
                 )
                 .await;
-                first = frame.dts_ns;
-                started = tokio::time::Instant::now();
+                clock.resume(frame.dts_ns);
             }
             if !matches!(*status.lock(), PlaybackEvent::Playing { .. }) || last_sent.is_none() {
                 notify(
@@ -509,12 +606,23 @@ async fn stream(
                 )
                 .await;
             }
-            tokio::time::sleep_until(
-                started + Duration::from_nanos(frame.dts_ns.saturating_sub(first)),
-            )
-            .await;
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(clock.deadline(frame.dts_ns)) => break,
+                    changed = rate.changed() => {
+                        if changed.is_err() { return Ok(()); }
+                        clock.set_rate(*rate.borrow_and_update());
+                    }
+                }
+            }
+            // Bound recovery after downstream stalls; never drain an overdue batch in a burst.
+            if tokio::time::Instant::now().saturating_duration_since(clock.deadline(frame.dts_ns))
+                > Duration::from_millis(100)
+            {
+                clock.resume(frame.dts_ns);
+            }
             let nals = nal_utils::parse_annex_b(&frame.data);
-            let timestamp = ((frame.pts_ns as u128 * 90000) / 1_000_000_000) as u32;
+            let timestamp = clock.timestamp(frame.pts_ns);
             let packets = packetizer
                 .packetize(&nals, timestamp, &prepared.codec)
                 .into_iter()
@@ -523,12 +631,28 @@ async fn stream(
             consumer.on_frame(packets, frame.key).await;
             position.store(frame.pts_ns, Ordering::Release);
             last_sent = Some(frame.dts_ns);
+            decode_position.store(frame.dts_ns, Ordering::Release);
+            if *rate.borrow() > 1.0
+                && let Some(active) = Session::active(&source)
+                && !active.closed.load(Ordering::Acquire)
+                && let Some((head, arrived)) = active.latest_decode_time()
+            {
+                if arrived.elapsed() < Duration::from_secs(1)
+                    && head.abs_diff(frame.dts_ns) <= 100_000_000
+                {
+                    if !caught_up.swap(true, Ordering::AcqRel) {
+                        catch_up_ready.notify_one();
+                    }
+                }
+            }
         }
         loop {
             prepared.frames = (&mut next.0).await??;
             prepared.codec = prepared.disk.lock().codec.unwrap_or(prepared.codec);
             if !prepared.frames.is_empty() {
-                empty_since = None;
+                if empty_since.take().is_some() {
+                    clock.resume(prepared.frames.front().unwrap().dts_ns);
+                }
                 break;
             }
             let active = Session::active(&source).or_else(|| prepared.session.clone());
@@ -605,5 +729,58 @@ mod active_file_tests {
         std::fs::write(&path, bytes).unwrap();
         assert!(readable_len(&path).unwrap() > prefix);
         assert_eq!(read_segment(segment).unwrap().len(), 360);
+    }
+}
+
+#[cfg(test)]
+mod speed_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn rates_scale_deadlines_and_rtp_but_preserve_composition_offsets() {
+        let origin = 1_800_000_000_123_456_789;
+        for rate in [0.25, 0.5, 1.0, 2.0, 4.0] {
+            let clock = PlaybackClock::new(origin, rate);
+            assert_eq!(
+                clock.deadline(origin + 1_000_000_000) - clock.wall,
+                Duration::from_secs_f64(1.0 / rate)
+            );
+            let delta = clock
+                .timestamp(origin + 1_000_000_000)
+                .wrapping_sub(clock.timestamp(origin));
+            assert_eq!(delta, (90000.0 / rate) as u32);
+            assert_eq!(
+                clock
+                    .timestamp(origin)
+                    .wrapping_sub(clock.timestamp(origin - 100_000_000)),
+                (9000.0 / rate) as u32
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_changes_recompute_pending_deadline_without_timestamp_jump() {
+        let mut clock = PlaybackClock::new(0, 0.5);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let before = clock.timestamp(250_000_000);
+        clock.set_rate(4.0);
+        assert_eq!(clock.timestamp(250_000_000), before);
+        assert_eq!(
+            clock.deadline(1_250_000_000) - tokio::time::Instant::now(),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_x_retains_original_timestamp_mapping_including_wrap() {
+        for origin in [0, 47_721_858_000_000, 1_800_000_000_123_456_789] {
+            let clock = PlaybackClock::new(origin, 1.0);
+            for offset in [0, 33_333_333, 66_666_666, 5_000_000_000] {
+                assert_eq!(
+                    clock.timestamp(origin + offset),
+                    (((origin + offset) as u128 * 90000) / 1_000_000_000) as u32
+                );
+            }
+        }
     }
 }

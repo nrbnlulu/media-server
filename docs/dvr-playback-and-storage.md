@@ -50,8 +50,38 @@ required codec. `POST /streams/{source_id}/webrtc/dvr` negotiates using the sele
 recording's codec, not the current live stream's codec. This implementation does not
 exchange unsolicited offers or replace a negotiated track in place.
 
-Only speed `1.0` is supported. Other rates, including zero, negative, NaN and infinite
-values, fail with an unsupported-speed error (HTTP 400 on the REST speed endpoint).
+Forward DVR playback supports finite rates from `0.25` through `4.0` via
+`POST /client-session-control/{id}/speed` with `{"speed": 2.0}`. Zero, negative,
+non-finite and out-of-range rates fail with HTTP 400. Speed changes preserve the
+current decode sequence; DVR seeks preserve the selected speed. Live mode is 1x.
+
+Accelerated DVR playback automatically returns to live/1x when it comes within
+100 ms of a fresh active recording head. Finite recordings still end in DVR mode;
+an offline source does not trigger catch-up. The live handoff waits for an
+independent frame. WebRTC requires a compatible negotiated live codec.
+
+WSC-RTP clients receive the existing `session_mode` live notification even without
+opting into playback events. WebRTC clients can subscribe to
+`GET /client-session-control/{id}/events` (SSE). Each `session_mode` event contains
+`is_live`, `speed`, `current_time_ms` and `reason`; automatic catch-up uses
+`"reason": "caught_up"`. A successful live handoff reports `is_live: true`,
+`speed: 1.0` and `current_time_ms: null` before live media becomes eligible.
+
+```javascript
+const events = new EventSource(`/client-session-control/${sessionId}/events`);
+events.addEventListener("session_mode", ({ data }) => {
+  const mode = JSON.parse(data);
+  updateLiveIndicator(mode.is_live);
+  updateSpeedSelector(mode.speed);
+});
+// Close events when the viewer/session is disposed.
+```
+
+SSE sends the latest mode/speed snapshot immediately on connection and reconnect.
+It coalesces updates for slow clients without blocking media delivery; consumers
+should treat events as authoritative state rather than a history of transitions.
+The snapshot timestamp is the position at the latest control transition; use
+`GET /client-session-control/{id}/mode` for the current DVR frame position.
 
 ## Crash recovery
 

@@ -48,6 +48,7 @@ struct ClientSession {
     live_packetizer: Arc<RtpPacketizer>,
     stitching_consumer: Arc<StitchingConsumer>,
     state: tokio::sync::Mutex<ClientSessionState>,
+    events: tokio::sync::watch::Sender<serde_json::Value>,
 }
 
 impl ClientSession {
@@ -60,31 +61,76 @@ impl ClientSession {
         source_id: VideoSourceId,
         publisher: Arc<dyn RtpVideoPublisher>,
         live_packetizer: Arc<RtpPacketizer>,
-    ) -> Self {
+    ) -> Arc<Self> {
         let stitching_consumer = Arc::new(StitchingConsumer::new(publisher.clone()));
-        Self {
+        let session = Arc::new(Self {
+            events: tokio::sync::watch::channel(serde_json::json!({"is_live": true, "speed": 1.0, "current_time_ms": null, "reason": "initial"})).0,
             id,
             source_id,
             publisher,
             stitching_consumer,
             live_packetizer,
             state: tokio::sync::Mutex::new(ClientSessionState::Live),
-        }
+        });
+        let weak = Arc::downgrade(&session);
+        let mut changes = session.events.subscribe();
+        tokio::spawn(async move {
+            loop {
+                let Some(session) = weak.upgrade() else {
+                    break;
+                };
+                let player = match &*session.state.lock().await {
+                    ClientSessionState::Dvr(player) => Some(player.clone()),
+                    ClientSessionState::Live => None,
+                };
+                drop(session);
+                tokio::select! {
+                    changed = changes.changed() => {
+                        if changed.is_err() { break; }
+                    }
+                    _ = async {
+                        if let Some(player) = player { player.catch_up_requested().await; }
+                        else { std::future::pending::<()>().await; }
+                    } => {}
+                }
+                let Some(session) = weak.upgrade() else {
+                    break;
+                };
+                let mut state = session.state.lock().await;
+                if let ClientSessionState::Dvr(player) = &*state
+                    && player.take_catch_up()
+                    && let Some(params) = session.live_packetizer.get_codec_params()
+                {
+                    if session.publisher.accepts_codec(params.codec()) {
+                        session.go_live(&mut state, "caught_up").await;
+                    } else {
+                        player.require_live_codec(params.codec()).await;
+                    }
+                }
+            }
+        });
+        session
     }
 
     pub async fn switch_to_live(&self) {
         let mut state = self.state.lock().await;
-        if let ClientSessionState::Dvr(player) = &*state {
+        self.go_live(&mut state, "manual").await;
+    }
+
+    async fn go_live(&self, state: &mut ClientSessionState, reason: &str) {
+        if let ClientSessionState::Dvr(player) = state {
             if let Err(error) = player.terminate().await {
                 log::error!("Failed to stop DVR: {error:#}");
             }
             let input = self.stitching_consumer.next_input().await;
-            // Queue the new mode before making any new live frames eligible.
             self.publisher
                 .on_session_mode_change(SessionMode::Live)
                 .await;
-            self.live_packetizer.add_consumer(input);
             *state = ClientSessionState::Live;
+            self.events.send_replace(serde_json::json!({
+                "is_live": true, "speed": 1.0, "current_time_ms": null, "reason": reason
+            }));
+            self.live_packetizer.add_consumer(input);
         }
     }
 
@@ -92,12 +138,13 @@ impl ClientSession {
         let mut state_guard = self.state.lock().await;
         match *state_guard {
             ClientSessionState::Dvr(ref player) => {
-                player.seek_to_timestamp(timestamp, 1.0).await?;
+                player.seek_to_timestamp(timestamp).await?;
                 self.publisher
                     .on_session_mode_change(SessionMode::Dvr {
                         timestamp: player.current_timestamp().await,
                     })
                     .await;
+                self.events.send_replace(serde_json::json!({"is_live": false, "speed": player.speed(), "current_time_ms": player.current_timestamp().await, "reason": "seek"}));
                 Ok(())
             }
             ClientSessionState::Live => {
@@ -129,6 +176,7 @@ impl ClientSession {
                                 timestamp: player.current_timestamp().await,
                             })
                             .await;
+                        self.events.send_replace(serde_json::json!({"is_live": false, "speed": player.speed(), "current_time_ms": player.current_timestamp().await, "reason": "seek"}));
                         Ok(())
                     }
                     Err(e) => {
@@ -159,7 +207,7 @@ impl ClientSession {
 }
 pub struct GlobalState {
     sources: DashMap<VideoSourceId, SourceWrapper>,
-    client_sessions: DashMap<ClientSessionId, ClientSession>,
+    client_sessions: DashMap<ClientSessionId, Arc<ClientSession>>,
     wsc_publishers: DashMap<ClientSessionId, Arc<WscRtpPublisher>>,
     extra_shutdown_tasks: Vec<tokio::task::JoinHandle<()>>,
     webrtc_manager: WebrtcManager,
@@ -485,11 +533,22 @@ impl GlobalState {
         }
     }
 
+    pub fn session_events(
+        &self,
+        id: ClientSessionId,
+    ) -> Result<tokio::sync::watch::Receiver<serde_json::Value>> {
+        self.client_sessions
+            .get(&id)
+            .map(|s| s.events.subscribe())
+            .ok_or_else(|| anyhow!("Session not found"))
+    }
+
     pub async fn set_session_speed(&self, session_id: ClientSessionId, speed: f64) -> Result<()> {
         if let Some(ref session) = self.client_sessions.get(&session_id) {
             let state_guard = session.state.lock().await;
             if let ClientSessionState::Dvr(ref player) = *state_guard {
                 player.set_speed(speed)?;
+                session.events.send_replace(serde_json::json!({"is_live": false, "speed": speed, "current_time_ms": player.current_timestamp().await, "reason": "speed_changed"}));
                 return Ok(());
             }
             bail!("Speed control only available in DVR mode");
@@ -550,5 +609,84 @@ impl GlobalState {
 
         log::info!("Cleanup complete");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod speed_transition_tests {
+    use super::*;
+    use crate::common::{VideoCodec, rtp::RtpPacket};
+    use crate::domain::dvr::segments::{Frame, Session};
+    use async_trait::async_trait;
+
+    struct Publisher {
+        id: ClientSessionId,
+        source: String,
+        modes: parking_lot::Mutex<Vec<SessionMode>>,
+    }
+    #[async_trait]
+    impl RtpConsumer for Publisher {
+        fn id(&self) -> &ClientSessionId {
+            &self.id
+        }
+        async fn on_new_packet(&self, _: Arc<RtpPacket>) {}
+    }
+    #[async_trait]
+    impl RtpVideoPublisher for Publisher {
+        fn source_id(&self) -> &VideoSourceId {
+            &self.source
+        }
+        async fn on_session_mode_change(&self, mode: SessionMode) {
+            self.modes.lock().push(mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn catch_up_handoff_notifies_live_one_x_and_reconnect_gets_snapshot() {
+        let source = format!("catch-up-{}", uuid::Uuid::new_v4());
+        let directory = std::env::temp_dir().join(&source);
+        let recording =
+            Session::in_directory(&source, 1000, VideoCodec::H264, directory.clone()).unwrap();
+        recording.push(Frame {
+            pts_ns: 0,
+            dts_ns: 0,
+            key: true,
+            data: Vec::new().into(),
+        });
+        let publisher = Arc::new(Publisher {
+            id: uuid::Uuid::new_v4(),
+            source: source.clone(),
+            modes: Default::default(),
+        });
+        let session = ClientSession::new_live(
+            publisher.id,
+            source.clone(),
+            publisher.clone(),
+            Arc::new(RtpPacketizer::new(1, 96)),
+        );
+        let player = Arc::new(
+            DvrPlayer::new(source, 1000, session.stitching_consumer.input())
+                .await
+                .unwrap(),
+        );
+        player.set_speed(4.0).unwrap();
+        let mut events = session.events.subscribe();
+        let mut state = session.state.lock().await;
+        *state = ClientSessionState::Dvr(player);
+        session.go_live(&mut state, "caught_up").await;
+        assert!(matches!(*state, ClientSessionState::Live));
+        assert!(events.has_changed().unwrap());
+        let value = events.borrow_and_update().clone();
+        assert_eq!(value["is_live"], true);
+        assert_eq!(value["speed"], 1.0);
+        assert_eq!(value["reason"], "caught_up");
+        assert!(value["current_time_ms"].is_null());
+        assert_eq!(*session.events.subscribe().borrow(), value);
+        session.go_live(&mut state, "caught_up").await;
+        assert_eq!(publisher.modes.lock().len(), 1);
+        drop(state);
+        drop(session);
+        drop(recording);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

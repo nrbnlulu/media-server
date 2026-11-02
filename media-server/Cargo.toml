@@ -55,5 +55,6 @@ tracing-appender = "0.2.5"
 tracing-log = "0.2.0"
 
 [dev-dependencies]
+tokio = { version = "1.35", features = ["test-util"] }
 tungstenite = { version = "0.21", features = ["native-tls"] }
 ctrlc = "3.4"

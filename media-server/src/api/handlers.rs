@@ -433,7 +433,7 @@ pub async fn client_session_seek_session(
     responses(
         (status = 200, description = "Speed changed successfully", body = SessionModeResponse),
         (status = 404, description = "Session not found", body = ErrorResponse),
-        (status = 400, description = "Speed control only available in DVR mode", body = ErrorResponse)
+        (status = 400, description = "DVR mode required; speed must be finite and between 0.25 and 4.0", body = ErrorResponse)
     ),
     tag = "client-session-control"
 )]
@@ -516,4 +516,31 @@ pub async fn get_session_mode(
         .map_err(|e| ApiError::NotFound(e.to_string()))?;
 
     Ok(Json(mode))
+}
+
+/// Current session state followed by mode/speed changes. Reconnect for a fresh snapshot.
+#[utoipa::path(get, path = "/client-session-control/{session_id}/events",
+    params(("session_id" = Uuid, Path, description = "Session identifier")),
+    responses((status = 200, description = "Session mode events (text/event-stream)"),
+              (status = 404, description = "Session not found")), tag = "client-session-control")]
+pub async fn session_events(
+    State(state): State<Arc<GlobalState>>,
+    Path(session_id): Path<Uuid>,
+) -> Result<
+    axum::response::Sse<
+        impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    >,
+    ApiError,
+> {
+    let mut events = state
+        .session_events(session_id)
+        .map_err(|e| ApiError::NotFound(e.to_string()))?;
+    let stream = async_stream::stream! {
+        loop {
+            let value = events.borrow_and_update().clone();
+            yield Ok(axum::response::sse::Event::default().event("session_mode").data(value.to_string()));
+            if events.changed().await.is_err() { break; }
+        }
+    };
+    Ok(axum::response::Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))
 }
