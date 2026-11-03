@@ -158,6 +158,34 @@ pub async fn get_stream(
 }
 
 #[utoipa::path(
+    post,
+    path = "/streams/{source_id}/recording",
+    params(
+        ("source_id" = String, Path, description = "Stream unique identifier")
+    ),
+    responses(
+        (status = 200, description = "Recording is enabled for the stream (idempotent)", body = StreamResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+        (status = 400, description = "Failed to start recording", body = ErrorResponse)
+    ),
+    tag = "Streams"
+)]
+pub async fn start_recording(
+    State(state): State<Arc<GlobalState>>,
+    Path(source_id): Path<VideoSourceId>,
+) -> Result<Json<StreamResponse>, ApiError> {
+    state
+        .get_stream(&source_id)
+        .await
+        .map_err(|_| ApiError::NotFound(format!("Stream {} not found", source_id)))?;
+    state
+        .start_recording(&source_id)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    get_stream(State(state), Path(source_id)).await
+}
+
+#[utoipa::path(
     delete,
     path = "/streams/{source_id}",
     params(

@@ -17,9 +17,11 @@ use tokio::sync::broadcast;
 
 struct SourceWrapper {
     source: Arc<dyn VideoSource>,
+    rtsp_client: Arc<RtspClient>,
     task: tokio::task::JoinHandle<()>,
     rtp_packetizer: Arc<RtpPacketizer>,
-    recorder: Option<Arc<DvrRecorder>>,
+    /// Held across recorder startup so concurrent enable requests serialize.
+    recorder: Arc<tokio::sync::Mutex<Option<Arc<DvrRecorder>>>>,
 }
 
 pub type VideoSourceId = String;
@@ -218,17 +220,9 @@ impl GlobalState {
 
         let mut recorder = None;
         if config.should_record {
-            filesystem::ensure_stream_dvr_dir(&source_id)?;
-            match DvrRecorder::new(&source_id) {
-                Ok(res) => {
-                    let recorder_arc = Arc::new(res);
-                    rtsp_client.add_consumer(recorder_arc.clone()).await;
-                    recorder.replace(recorder_arc);
-                }
-                Err(e) => {
-                    log::error!("Failed to create recorder for stream {}: {}", source_id, e);
-                }
-            };
+            if let Some(started) = Self::start_recorder(&source_id, &rtsp_client).await {
+                recorder = Some(started);
+            }
         }
         let rtsp_client_clone = rtsp_client.clone();
         let handle = tokio::spawn(async move {
@@ -238,15 +232,57 @@ impl GlobalState {
         self.sources.insert(
             source_id.clone(),
             SourceWrapper {
-                source: rtsp_client,
+                source: rtsp_client.clone(),
+                rtsp_client,
                 task: handle,
                 rtp_packetizer,
-                recorder,
+                recorder: Arc::new(tokio::sync::Mutex::new(recorder)),
             },
         );
 
         log::info!("Stream {} created and started", source_id);
         Ok(source_id)
+    }
+
+    async fn start_recorder(
+        source_id: &VideoSourceId,
+        rtsp_client: &RtspClient,
+    ) -> Option<Arc<DvrRecorder>> {
+        let result = async {
+            filesystem::ensure_stream_dvr_dir(source_id)?;
+            let recorder = Arc::new(DvrRecorder::new(source_id)?);
+            rtsp_client.add_consumer(recorder.clone()).await?;
+            anyhow::Ok(recorder)
+        }
+        .await;
+        match result {
+            Ok(recorder) => Some(recorder),
+            Err(e) => {
+                log::error!("Failed to create recorder for stream {}: {}", source_id, e);
+                None
+            }
+        }
+    }
+
+    /// Enables DVR recording on a running stream. Idempotent.
+    pub async fn start_recording(&self, source_id: &VideoSourceId) -> Result<()> {
+        // Clone out of the map so no DashMap guard is held across awaits.
+        let (rtsp_client, recorder_slot) = {
+            let source = self
+                .sources
+                .get(source_id)
+                .ok_or_else(|| anyhow!("Stream {} not found", source_id))?;
+            (source.rtsp_client.clone(), source.recorder.clone())
+        };
+        let mut slot = recorder_slot.lock().await;
+        if slot.is_some() {
+            return Ok(());
+        }
+        let recorder = Self::start_recorder(source_id, &rtsp_client)
+            .await
+            .ok_or_else(|| anyhow!("Failed to start recording for stream {}", source_id))?;
+        *slot = Some(recorder);
+        Ok(())
     }
 
     pub async fn delete_stream(&self, source_id: &VideoSourceId) -> Result<()> {
@@ -267,16 +303,14 @@ impl GlobalState {
 
         let state = source.source.state().await;
 
-        let recording_start_time = match source.recorder.as_ref() {
-            Some(recorder) => recorder.start_time(),
-            None => None,
-        };
+        let recorder = source.recorder.lock().await;
+        let recording_start_time = recorder.as_ref().and_then(|r| r.start_time());
 
         Ok(StreamInfo {
             source_id: source_id.clone(),
             rtsp_inputs: source.source.inputs().to_vec(),
             state,
-            should_record: source.source.config().should_record,
+            should_record: recorder.is_some(),
             restart_interval_secs: source.source.config().restart_interval_secs,
             recording_start_time,
         })

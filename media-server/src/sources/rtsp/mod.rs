@@ -1,7 +1,7 @@
 use crate::app::VideoSourceId;
 use crate::common::TimeBase;
-use crate::common::traits::{FfmpegConsumer, VideoSource};
 use crate::common::traits::Resolution;
+use crate::common::traits::{FfmpegConsumer, VideoSource};
 use crate::common::{FFmpegVideoMetadata, VideoCodec};
 use crate::domain::{StreamConfig, StreamState};
 use anyhow::{Result, bail};
@@ -50,6 +50,8 @@ pub struct RtspClient {
     state_tx: broadcast::Sender<StreamState>,
     shutdown_sig: Arc<AtomicBool>,
     consumers: TokioMutex<Vec<Arc<dyn FfmpegConsumer>>>,
+    /// Metadata of the current live stream, replayed to consumers that join late.
+    metadata: TokioMutex<Option<FFmpegVideoMetadata>>,
 }
 
 impl RtspClient {
@@ -66,6 +68,7 @@ impl RtspClient {
             codec: Arc::new(TokioMutex::new(None)),
             state_tx,
             consumers: TokioMutex::new(consumers),
+            metadata: TokioMutex::new(None),
             shutdown_sig: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -73,8 +76,18 @@ impl RtspClient {
         &self.config.source_id
     }
 
-    pub async fn add_consumer(&self, consumer: Arc<dyn FfmpegConsumer>) {
-        self.consumers.lock().await.push(consumer);
+    /// Adds a consumer. If the stream is already initialized, the consumer is
+    /// initialized with the stream metadata immediately instead of waiting for
+    /// the next (re)connection.
+    pub async fn add_consumer(&self, consumer: Arc<dyn FfmpegConsumer>) -> Result<()> {
+        // Hold the consumers lock while reading metadata so a concurrent
+        // metadata update cannot slip between the two.
+        let mut consumers = self.consumers.lock().await;
+        if let Some(metadata) = self.metadata.lock().await.as_ref() {
+            consumer.initialize(metadata)?;
+        }
+        consumers.push(consumer);
+        Ok(())
     }
 
     pub async fn get_codec(&self) -> Option<VideoCodec> {
@@ -181,6 +194,7 @@ impl RtspClient {
                     current_codec = Some(metadata.codec);
                     live_timebase = Some(ffmpeg::Rational::new(metadata.timebase.num, metadata.timebase.den));
                     let consumers = self.consumers.lock().await;
+                    *self.metadata.lock().await = Some(metadata.clone());
                     for consumer in consumers.iter() {
                         if let Err(err) = consumer.initialize(&metadata) {
                             log::error!("Failed to initialize consumer: {}", err);
@@ -772,6 +786,67 @@ impl VideoSource for RtspClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CountingConsumer {
+        initialized: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl FfmpegConsumer for CountingConsumer {
+        fn initialize(&self, _metadata: &FFmpegVideoMetadata) -> anyhow::Result<()> {
+            self.initialized.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn on_new_packet(&self, _packet: Arc<ffmpeg::Packet>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn finalize(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_client() -> RtspClient {
+        let config = StreamConfig {
+            source_id: "test".to_string(),
+            rtsp_inputs: vec![VideoSourceInput {
+                label: "main".to_string(),
+                url: url::Url::parse("rtsp://127.0.0.1:554/stream").unwrap(),
+                priority: 0,
+            }],
+            username: None,
+            password: None,
+            should_record: false,
+            restart_interval_secs: None,
+        };
+        let (tx, _) = broadcast::channel(4);
+        RtspClient::new(config, tx, vec![]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn late_consumer_is_initialized_when_stream_already_has_metadata() {
+        let client = test_client();
+        *client.metadata.lock().await = Some(FFmpegVideoMetadata {
+            codec: VideoCodec::H264,
+            extradata: None,
+            timebase: TimeBase { num: 1, den: 90000 },
+            resolution: None,
+        });
+        let consumer = Arc::new(CountingConsumer {
+            initialized: Default::default(),
+        });
+        client.add_consumer(consumer.clone()).await.unwrap();
+        assert_eq!(consumer.initialized.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn late_consumer_waits_for_metadata_when_stream_not_initialized() {
+        let client = test_client();
+        let consumer = Arc::new(CountingConsumer {
+            initialized: Default::default(),
+        });
+        client.add_consumer(consumer.clone()).await.unwrap();
+        assert_eq!(consumer.initialized.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn ffmpeg_init_succeeds() {

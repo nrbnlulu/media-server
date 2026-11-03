@@ -21,6 +21,7 @@ use crate::app::GlobalState;
         handlers::list_streams,
         handlers::get_stream,
         handlers::delete_stream,
+        handlers::start_recording,
         handlers::create_webrtc_session,
         handlers::create_dvr_webrtc_session,
         handlers::list_webrtc_sessions,
@@ -76,6 +77,10 @@ pub fn create_router(state: Arc<GlobalState>) -> Router {
         .route("/streams", get(handlers::list_streams))
         .route("/streams/:source_id", get(handlers::get_stream))
         .route("/streams/:source_id", delete(handlers::delete_stream))
+        .route(
+            "/streams/:source_id/recording",
+            post(handlers::start_recording),
+        )
         .route("/streams/:source_id/wsc-rtp", get(handlers::wsc_rtp))
         .route(
             "/streams/:source_id/webrtc",
