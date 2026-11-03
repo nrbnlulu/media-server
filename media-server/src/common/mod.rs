@@ -54,6 +54,8 @@ pub struct FFmpegVideoMetadata {
     pub codec: VideoCodec,
     pub extradata: Option<Vec<u8>>,
     pub timebase: TimeBase,
+    /// Output frame size reported by the demuxer, if known.
+    pub resolution: Option<traits::Resolution>,
 }
 
 impl fmt::Debug for FFmpegVideoMetadata {
@@ -62,6 +64,7 @@ impl fmt::Debug for FFmpegVideoMetadata {
             .field("codec", &self.codec)
             .field("extradata", &self.extradata)
             .field("timebase", &self.timebase)
+            .field("resolution", &self.resolution)
             .finish()
     }
 }

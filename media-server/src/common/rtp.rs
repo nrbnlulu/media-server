@@ -1,5 +1,5 @@
 use crate::common::nal_utils::{self, H264NalType, H265NalType};
-use crate::common::traits::{FfmpegConsumer, RtpConsumer};
+use crate::common::traits::{FfmpegConsumer, Resolution, RtpConsumer};
 use crate::common::{FFmpegVideoMetadata, TimeBase, VideoCodec};
 use anyhow::{anyhow, bail};
 use axum::async_trait;
@@ -282,6 +282,7 @@ impl FfmpegConsumer for RtpPacketizer {
         .ok_or_else(|| anyhow!("failed to parse extradata"))?;
 
         let mut codec_params = CodecParameters::new(&metadata.codec);
+        codec_params.set_resolution(metadata.resolution);
 
         // Set the NAL length size if it's AVCC
         if let nal_utils::FramingFormat::Avcc { length_size } = parsed_extradata.framing_format {
@@ -737,6 +738,8 @@ pub enum CodecParameters {
         /// Picture Parameter Set, can be changed mid-stream, contains some metadata for the codec.
         pps: Option<Vec<u8>>,
         nal_length_size: Option<usize>,
+        /// Output frame size, advertised in the SDP so decoders can be configured up front.
+        resolution: Option<Resolution>,
     },
     H265 {
         /// Video Parameter Set, unique to h265, some metadata stuff.
@@ -746,6 +749,8 @@ pub enum CodecParameters {
         /// Picture Parameter Set, can be changed mid-stream, contains some metadata for the codec.
         pps: Option<Vec<u8>>,
         nal_length_size: Option<usize>,
+        /// Output frame size, advertised in the SDP so decoders can be configured up front.
+        resolution: Option<Resolution>,
     },
 }
 
@@ -756,12 +761,14 @@ impl CodecParameters {
                 sps: None,
                 pps: None,
                 nal_length_size: None,
+                resolution: None,
             },
             VideoCodec::H265 => CodecParameters::H265 {
                 vps: None,
                 sps: None,
                 pps: None,
                 nal_length_size: None,
+                resolution: None,
             },
         }
     }
@@ -770,6 +777,22 @@ impl CodecParameters {
         match self {
             CodecParameters::H264 { .. } => VideoCodec::H264,
             CodecParameters::H265 { .. } => VideoCodec::H265,
+        }
+    }
+
+    pub fn set_resolution(&mut self, value: Option<Resolution>) {
+        match self {
+            CodecParameters::H264 { resolution, .. } | CodecParameters::H265 { resolution, .. } => {
+                *resolution = value
+            }
+        }
+    }
+
+    pub fn resolution(&self) -> Option<Resolution> {
+        match self {
+            CodecParameters::H264 { resolution, .. } | CodecParameters::H265 { resolution, .. } => {
+                *resolution
+            }
         }
     }
 
@@ -958,12 +981,14 @@ mod tests {
                     sps: Some(vec![0x67, 1]),
                     pps: Some(vec![0x68, 1]),
                     nal_length_size: None,
+                    resolution: None,
                 },
                 VideoCodec::H265 => CodecParameters::H265 {
                     vps: Some(vec![0x40, 1]),
                     sps: Some(vec![0x42, 1]),
                     pps: Some(vec![0x44, 1]),
                     nal_length_size: None,
+                    resolution: None,
                 },
             };
             *packetizer.stream_metadata.lock() = Some(SrcStreamState {
@@ -1106,6 +1131,7 @@ mod tests {
         let mut metadata = FFmpegVideoMetadata {
             codec: VideoCodec::H264,
             timebase: TimeBase { num: 1, den: 90000 },
+            resolution: None,
             extradata: Some(vec![
                 1, 100, 0, 30, 255, 225, 0, 4, 0x67, 0x42, 0, 30, 1, 0, 4, 0x68, 0xce, 0x3c, 0x80,
             ]),
@@ -1153,6 +1179,7 @@ mod tests {
                 sps: Some(sps),
                 pps: Some(pps),
                 nal_length_size: Some(4),
+                resolution: None,
             }
         );
     }
@@ -1182,6 +1209,7 @@ mod tests {
                 sps: Some(sps),
                 pps: Some(pps),
                 nal_length_size: Some(4),
+                resolution: None,
             }
         );
     }

@@ -837,6 +837,7 @@ mod tests {
             .initialize(&crate::common::FFmpegVideoMetadata {
                 codec: VideoCodec::H264,
                 extradata: None,
+                resolution: None,
                 timebase: crate::common::TimeBase {
                     num: 1,
                     den: 90_000,

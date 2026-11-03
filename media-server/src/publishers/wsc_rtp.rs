@@ -137,9 +137,15 @@ pub fn build_unicast_sdp(
         },
         ..Default::default()
     };
-    media = media
-        .with_codec(96, codec_name.to_string(), 90000, 0, fmtp)
-        .with_property_attribute("sendonly".to_string());
+    media = media.with_codec(96, codec_name.to_string(), 90000, 0, fmtp);
+    if let Some(resolution) = params.resolution() {
+        // Lets decoders be configured before any in-band parameter set arrives.
+        media = media.with_value_attribute(
+            "framesize".to_string(),
+            format!("96 {}-{}", resolution.width, resolution.height),
+        );
+    }
+    media = media.with_property_attribute("sendonly".to_string());
     session.media_descriptions.push(media);
     session.marshal().replace("\r\n", "\n")
 }
@@ -698,6 +704,21 @@ pub async fn handle_incoming_wsc_rtp_websocket(
 mod transition_tests {
     use super::*;
     use crate::common::rtp::RtpHeader;
+    use crate::common::traits::Resolution;
+
+    #[test]
+    fn sdp_advertises_frame_size_only_when_known() {
+        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let mut params = CodecParameters::new(&VideoCodec::H265);
+        assert!(!build_unicast_sdp(&"cam".into(), addr, &params).contains("framesize"));
+
+        params.set_resolution(Some(Resolution {
+            width: 1920,
+            height: 1080,
+        }));
+        let sdp = build_unicast_sdp(&"cam".into(), addr, &params);
+        assert!(sdp.contains("a=framesize:96 1920-1080\n"), "{sdp}");
+    }
 
     #[tokio::test]
     async fn queued_media_retains_its_generation_across_a_switch() {

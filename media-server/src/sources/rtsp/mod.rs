@@ -1,6 +1,7 @@
 use crate::app::VideoSourceId;
 use crate::common::TimeBase;
 use crate::common::traits::{FfmpegConsumer, VideoSource};
+use crate::common::traits::Resolution;
 use crate::common::{FFmpegVideoMetadata, VideoCodec};
 use crate::domain::{StreamConfig, StreamState};
 use anyhow::{Result, bail};
@@ -349,6 +350,7 @@ impl RtspClient {
                 codec: detected_codec,
                 extradata: extradata.clone(),
                 timebase,
+                resolution: extract_resolution(&parameters),
             };
             // Try to send metadata - it's ok if the receiver already has it (channel full)
             if let Err(e) = metadata_tx.try_send(video_metadata) {
@@ -712,6 +714,20 @@ fn extract_extradata(params: &ffmpeg::codec::Parameters) -> Option<Vec<u8>> {
         }
         Some(std::slice::from_raw_parts(data, size as usize).to_vec())
     }
+}
+
+fn extract_resolution(params: &ffmpeg::codec::Parameters) -> Option<Resolution> {
+    let (width, height) = unsafe {
+        let ptr = params.as_ptr();
+        if ptr.is_null() {
+            return None;
+        }
+        ((*ptr).width, (*ptr).height)
+    };
+    Some(Resolution {
+        width: u32::try_from(width).ok().filter(|w| *w > 0)?,
+        height: u32::try_from(height).ok().filter(|h| *h > 0)?,
+    })
 }
 
 #[async_trait]
