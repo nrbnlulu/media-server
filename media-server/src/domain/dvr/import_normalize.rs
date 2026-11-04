@@ -105,8 +105,6 @@ pub fn normalize(
     origin_ms: u64,
     cancel: &CancellationToken,
 ) -> Result<ImportResult> {
-    ffmpeg::init()?;
-    gstreamer::init()?;
     let mut demux = open_media(input, cancel)?;
     let stream = demux
         .streams()
@@ -302,8 +300,13 @@ pub(crate) mod tests {
     use super::*;
     use gstreamer::{self as gst, prelude::*};
 
-    pub(crate) fn fixture(path: &Path, hevc: bool, bframes: bool) {
+    pub(crate) fn init_media() {
+        ffmpeg::init().unwrap();
         gst::init().unwrap();
+    }
+
+    pub(crate) fn fixture(path: &Path, hevc: bool, bframes: bool) {
+        init_media();
         let encoder = if hevc {
             "x265enc key-int-max=10 option-string=pools=1:frame-threads=1:open-gop=0"
         } else if bframes {
@@ -407,6 +410,7 @@ pub(crate) mod tests {
     }
     #[tokio::test]
     async fn non_video_and_unsupported_codec_are_reported_without_output() {
+        init_media();
         let root = std::env::temp_dir().join(format!("ms-no-video-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let ppm = root.join("image.ppm");

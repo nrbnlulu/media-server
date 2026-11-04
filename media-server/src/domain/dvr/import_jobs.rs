@@ -617,6 +617,7 @@ mod tests {
     }
     #[tokio::test]
     async fn no_footage_and_corrupt_media_do_not_publish_or_leave_staging() {
+        import_normalize::tests::init_media();
         for data in [b"<html>no recording</html>".to_vec(), vec![1, 2, 3, 4]] {
             let root = root();
             let manager = ImportManager::new(root.clone()).unwrap();
