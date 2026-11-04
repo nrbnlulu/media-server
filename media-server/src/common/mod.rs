@@ -68,3 +68,21 @@ impl fmt::Debug for FFmpegVideoMetadata {
             .finish()
     }
 }
+
+pub(crate) fn extract_extradata(params: &ffmpeg::codec::Parameters) -> Option<Vec<u8>> {
+    unsafe {
+        let ptr = params.as_ptr();
+        if ptr.is_null() {
+            return None;
+        }
+        let size = (*ptr).extradata_size;
+        if size <= 0 {
+            return None;
+        }
+        let data = (*ptr).extradata;
+        if data.is_null() {
+            return None;
+        }
+        Some(std::slice::from_raw_parts(data, size as usize).to_vec())
+    }
+}

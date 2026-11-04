@@ -131,6 +131,18 @@ impl Session {
         codec: VideoCodec,
         directory: PathBuf,
     ) -> Result<Arc<Self>> {
+        let session = Self::detached(origin_ms, codec, directory)?;
+        sessions()
+            .lock()
+            .insert(source.clone(), Arc::downgrade(&session));
+        Ok(session)
+    }
+    /// An importer must not expose partially written footage through the live-session registry.
+    pub(crate) fn detached(
+        origin_ms: u64,
+        codec: VideoCodec,
+        directory: PathBuf,
+    ) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&directory)?;
         let session = Arc::new(Self {
             origin_ms,
@@ -144,9 +156,6 @@ impl Session {
             completed_until: AtomicU64::new(0),
             active_files: Mutex::new(Vec::new()),
         });
-        sessions()
-            .lock()
-            .insert(source.clone(), Arc::downgrade(&session));
         Ok(session)
     }
     pub fn active(source: &VideoSourceId) -> Option<Arc<Self>> {
@@ -300,6 +309,48 @@ impl Catalog {
                 .or_insert_with(|| vec![segment.clone()]);
         }
     }
+}
+
+/// Forget a private import tree after cleanup; it must never leave stale catalog paths.
+pub(crate) fn forget_stream(root: &Path) {
+    let mut catalog = catalog().write();
+    catalog.streams.remove(root);
+    catalog
+        .directories
+        .retain(|path, _| !path.starts_with(root));
+}
+
+/// Publish a finalized import with the catalog locked across its directory rename.
+pub(crate) fn promote_stream(staging: &Path, destination: &Path) -> Result<()> {
+    let mut catalog = catalog().write();
+    catalog.streams.remove(destination);
+    catalog
+        .directories
+        .retain(|path, _| !path.starts_with(destination));
+    if destination.exists() {
+        ensure!(
+            std::fs::symlink_metadata(destination)?.file_type().is_dir(),
+            "Import destination must be a regular directory"
+        );
+        // Retention leaves empty session directories. Remove only empty directories;
+        // never recursively replace existing footage or an unrecognized file.
+        for entry in std::fs::read_dir(destination)? {
+            let entry = entry?;
+            ensure!(
+                entry.file_type()?.is_dir()
+                    && entry.file_name().to_string_lossy().starts_with("segments-"),
+                "Import destination contains an unrecognized entry"
+            );
+            std::fs::remove_dir(entry.path())?;
+        }
+        std::fs::remove_dir(destination)?;
+    }
+    std::fs::rename(staging, destination)?;
+    catalog.streams.remove(staging);
+    catalog
+        .directories
+        .retain(|path, _| !path.starts_with(staging));
+    Ok(())
 }
 
 pub fn list_in(directory: &Path) -> Result<Vec<Segment>> {

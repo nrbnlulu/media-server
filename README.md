@@ -94,3 +94,87 @@ or optional test probes are not server startup configuration.
 Streams and per-client choices are configured through the HTTP/WebSocket API.
 For example, `force_websocket_transport=true` and `playback_events=true` are
 per-connection query parameters, not process-wide startup flags.
+
+## Pre-alarm HTTP imports
+
+Enable the internal import API with a file containing a nonempty bearer token:
+
+```sh
+cd media-server
+cargo run -- --imports-token-file /run/secrets/media-import-token \
+  --prealarm-dir /var/lib/media/prealarm --prealarm-retention-secs 2592000
+```
+
+The imported recording root defaults to `prealarm`; live DVR still defaults to
+`dvr`. These roots must be separate and non-nested. Recovery runs on both roots.
+Pre-alarm retention defaults to 30 days; `--prealarm-retention-secs 0` disables
+its periodic deletion independently of live DVR retention.
+
+Import routes are absent unless `--imports-token-file` is configured. Every
+import request, including the WebSocket upgrade, requires
+`Authorization: Bearer <token>`. These internal credentials do not replace the
+separate authentication work needed for browser playback and the existing API.
+
+| Method | Path | Behavior |
+| --- | --- | --- |
+| POST | `/imports` | Prepare a background HTTP import; returns 202 and its status |
+| GET | `/imports/{import_id}` | Current status, progress, error code and result |
+| DELETE | `/imports/{import_id}` | Cancel an attempt and wait for its cleanup |
+| GET | `/imports/ws` | WebSocket carrying status/progress events for all imports |
+| POST | `/prealarm/exists` | Given `{"ids":["prealarm:incident:source"]}`, return the IDs still present |
+
+A POST body has this shape (credentials below are placeholders):
+
+```json
+{
+  "import_id": "incident-source-job",
+  "media_source_id": "prealarm:incident:source",
+  "kind": "http",
+  "url": "http://camera/dataloader.cgi?dw=sd&filename=recording&starttime=...&endtime=...",
+  "creds": {"username": "device-user", "password": "device-password"},
+  "from_ms": 1700000300000,
+  "to_ms": 1700000319000,
+  "clock_offset_ms": 300000,
+  "http_response_profile": "milesight_camera"
+}
+```
+
+`from_ms` and `to_ms` are device-clock UTC milliseconds. The server timeline
+starts at `from_ms - clock_offset_ms`; positive offset means the device is ahead.
+HTTP vendor export/keyframe rounding still limits the accuracy of absolute
+capture-time alignment. Results contain `actual_start_ms`, `actual_end_ms` and
+`codec` (`h264` or `h265`), derived from the finalized DVR sidecars.
+
+The response profile defaults to `standard` for NVR exports. Use
+`milesight_camera` only for native `/dataloader.cgi` exports: the tested firmware
+inserts a second HTTP status line inside its response headers. That profile
+ignores invalid header lines, with a regression test reproducing the real
+response. Redirects are not followed, credentials stay separate from URLs, and
+TLS validation remains enabled.
+
+Imports have a 120-second requested-window limit, 512 MiB download limit,
+120-second HTTP deadline and 180-second overall deadline. At most four jobs run
+at once, with one per device endpoint. Unknown Content-Length means unknown
+percentage. Progress is emitted at most approximately once a second; status
+transitions are emitted immediately. On WebSocket lag/disconnect, reconcile
+known jobs with GET. Job status is in memory; completed media is rediscovered
+from its sidecars after restart.
+
+Reposting an unfinished ID cancels and cleans the previous attempt before
+starting another. A completed, still-present source is reused without fetching
+the vendor URL again. Private staging trees are published atomically, and failed
+attempts are removed. Owned staging trees abandoned by a crash become eligible
+for cleanup after one hour, on startup, or on a pre-alarm maintenance tick.
+
+Only H.264/H.265 video is retained. Audio is discarded. Imports start at a usable
+IDR with codec parameters, preserve valid PTS/DTS, repair missing/broken decode
+timestamps using codec/nominal frame rate, and fail if no usable rate exists.
+All normalized frames must be readable through the DVR reader before publication.
+Imported fragmented MP4 uses a finalized layout to preserve reordered frames;
+live recording retains its existing layout for reads while files are growing.
+
+The `prealarm:` namespace is reserved and cannot be registered as a live RTSP
+source. This stage supplies imports and verifies seek/end behavior through the
+DVR player. Public playback-only WebRTC/WSC-RTP registration, browser playback
+authorization, generic ONVIF replay and backend job/database integration remain
+separate work; importing a clip does not expose it through anonymous live routes.

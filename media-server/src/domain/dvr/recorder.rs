@@ -13,7 +13,14 @@ use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-struct RecordingState {
+#[derive(Clone, Copy)]
+enum RecordingLayout {
+    Live,
+    Import,
+}
+
+pub(crate) struct RecordingState {
+    layout: RecordingLayout,
     session: Arc<Session>,
     timebase: Option<crate::common::TimeBase>,
     timestamp_origin: Option<i64>,
@@ -40,11 +47,41 @@ impl Drop for RecordingState {
 }
 
 impl RecordingState {
-    fn new(
+    pub(crate) fn new(
         session: Arc<Session>,
         codec: &VideoCodec,
         start_time: UnixTimestamp,
         framing_format: FramingFormat,
+    ) -> Result<Self> {
+        Self::with_layout(
+            session,
+            codec,
+            start_time,
+            framing_format,
+            RecordingLayout::Live,
+        )
+    }
+
+    pub(crate) fn for_import(
+        session: Arc<Session>,
+        codec: &VideoCodec,
+        start_time: UnixTimestamp,
+    ) -> Result<Self> {
+        Self::with_layout(
+            session,
+            codec,
+            start_time,
+            FramingFormat::AnnexB,
+            RecordingLayout::Import,
+        )
+    }
+
+    fn with_layout(
+        session: Arc<Session>,
+        codec: &VideoCodec,
+        start_time: UnixTimestamp,
+        framing_format: FramingFormat,
+        layout: RecordingLayout,
     ) -> Result<Self> {
         let pipeline = gst::Pipeline::new();
 
@@ -87,6 +124,12 @@ impl RecordingState {
             .property("fragment-duration", 1000u32)
             .property("trak-timescale", 1_000_000u32)
             .build()?;
+        if matches!(layout, RecordingLayout::Import) {
+            // Imported files remain hidden until finalized. The final moov keeps
+            // reordered pictures beyond the last decode timestamp readable;
+            // live files retain the layout that supports reads while growing.
+            mux.set_property_from_str("fragment-mode", "first-moov-then-finalise");
+        }
         let sink = gst::ElementFactory::make("filesink")
             .property("location", path.to_string_lossy().as_ref())
             .property("sync", false)
@@ -106,6 +149,7 @@ impl RecordingState {
             .map_err(|_| anyhow::anyhow!("Failed to cast to AppSrc"))?;
 
         Ok(Self {
+            layout,
             pipeline,
             file_path: path,
             first_dts: None,
@@ -157,7 +201,7 @@ impl RecordingState {
         }
     }
 
-    fn stop(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn stop(&mut self) -> anyhow::Result<()> {
         let result = (|| -> Result<()> {
             self.appsrc.end_of_stream()?;
             let bus = self
@@ -220,7 +264,7 @@ impl RecordingState {
         self.push_timed(data, is_keyframe, elapsed_ns, elapsed_ns)
     }
 
-    fn push_timed(
+    pub(crate) fn push_timed(
         &mut self,
         data: &[u8],
         is_keyframe: bool,
@@ -234,11 +278,12 @@ impl RecordingState {
                 .first_dts
                 .is_some_and(|first| dts_ns.saturating_sub(first) >= segments::SEGMENT_NS)
         {
-            let mut replacement = Self::new(
+            let mut replacement = Self::with_layout(
                 self.session.clone(),
                 &self.codec,
                 self.start_time,
                 self.framing_format.clone(),
+                self.layout,
             )?;
             replacement.timebase = self.timebase.clone();
             replacement.timestamp_origin = self.timestamp_origin;

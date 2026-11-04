@@ -190,6 +190,9 @@ impl GlobalState {
 
     pub async fn create_rtsp_stream(&self, config: StreamConfig) -> Result<VideoSourceId> {
         let source_id = config.source_id.clone();
+        if source_id.starts_with("prealarm:") {
+            bail!("The prealarm: source prefix is reserved for authenticated imports");
+        }
 
         if self.sources.contains_key(&source_id) {
             bail!("Stream {} already exists", source_id);
@@ -219,10 +222,10 @@ impl GlobalState {
         )?);
 
         let mut recorder = None;
-        if config.should_record {
-            if let Some(started) = Self::start_recorder(&source_id, &rtsp_client).await {
-                recorder = Some(started);
-            }
+        if config.should_record
+            && let Some(started) = Self::start_recorder(&source_id, &rtsp_client).await
+        {
+            recorder = Some(started);
         }
         let rtsp_client_clone = rtsp_client.clone();
         let handle = tokio::spawn(async move {
@@ -584,5 +587,26 @@ impl GlobalState {
 
         log::info!("Cleanup complete");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod import_namespace_tests {
+    use super::*;
+    #[tokio::test]
+    async fn live_registration_cannot_expose_an_imported_source() {
+        let state = GlobalState::new().await.unwrap();
+        let result = state
+            .create_rtsp_stream(StreamConfig {
+                source_id: "prealarm:incident:source".into(),
+                rtsp_inputs: vec![],
+                username: None,
+                password: None,
+                should_record: true,
+                restart_interval_secs: None,
+            })
+            .await;
+        assert!(result.unwrap_err().to_string().contains("reserved"));
+        assert!(state.list_streams().await.is_empty());
     }
 }
