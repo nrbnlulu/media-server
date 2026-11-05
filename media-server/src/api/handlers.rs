@@ -229,22 +229,25 @@ pub async fn wsc_rtp(
         }
     };
 
-    // Get the source for this stream to pass to the WebSocket handler
-    let source_result = state.get_source(&source_id).await;
-    let source = match source_result {
-        Ok(src) => src,
-        Err(_) => {
-            // If we can't get the source, return a 404 error response
-            return (StatusCode::NOT_FOUND, "Stream not found").into_response();
-        }
-    };
-
-    ws.on_upgrade(move |socket| async move {
+    let active_source = state
+        .get_source(&source_id)
+        .await
+        .ok()
+        .and_then(|source| source.active_input());
+    let failed_state = state.clone();
+    let failed_id = *publisher.id();
+    ws.on_failed_upgrade(move |_| {
+        tokio::spawn(async move {
+            let _ = failed_state.delete_wsc_rtp_session(&failed_id).await;
+        });
+    })
+    .on_upgrade(move |socket| async move {
         let session_id = *publisher.id();
         handle_incoming_wsc_rtp_websocket(
             socket,
             publisher,
-            source,
+            active_source,
+            state.clone(),
             query.force_websocket_transport,
             query.playback_events,
         )

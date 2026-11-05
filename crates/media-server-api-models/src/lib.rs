@@ -39,6 +39,7 @@ pub struct StreamResponse {
     pub state: String,
     pub should_record: bool,
     pub restart_interval_secs: Option<u64>,
+    /// Earliest retained DVR time, including finalized media before recorder restart.
     pub recording_start_time: Option<UnixTimestamp>,
 }
 

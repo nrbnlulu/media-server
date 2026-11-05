@@ -1,5 +1,6 @@
 use crate::app::VideoSourceId;
 use crate::common::TimeBase;
+use crate::common::extract_extradata;
 use crate::common::traits::Resolution;
 use crate::common::traits::{FfmpegConsumer, VideoSource};
 use crate::common::{FFmpegVideoMetadata, VideoCodec};
@@ -709,24 +710,6 @@ fn run_fallback_pipeline(
                 return;
             }
         }
-    }
-}
-
-fn extract_extradata(params: &ffmpeg::codec::Parameters) -> Option<Vec<u8>> {
-    unsafe {
-        let ptr = params.as_ptr();
-        if ptr.is_null() {
-            return None;
-        }
-        let size = (*ptr).extradata_size;
-        if size <= 0 {
-            return None;
-        }
-        let data = (*ptr).extradata;
-        if data.is_null() {
-            return None;
-        }
-        Some(std::slice::from_raw_parts(data, size as usize).to_vec())
     }
 }
 

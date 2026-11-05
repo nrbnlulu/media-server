@@ -19,6 +19,7 @@ Cargo.lock
 # Recordings
 recordings/
 *.mp4
+!media-server/tests/fixtures/import-h264-no-sps-timing.mp4
 *.mkv
 *.avi
 
