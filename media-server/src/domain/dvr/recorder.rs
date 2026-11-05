@@ -271,6 +271,17 @@ impl RecordingState {
         pts_ns: u64,
         dts_ns: u64,
     ) -> Result<()> {
+        self.push_timed_with_duration(data, is_keyframe, pts_ns, dts_ns, None)
+    }
+
+    pub(crate) fn push_timed_with_duration(
+        &mut self,
+        data: &[u8],
+        is_keyframe: bool,
+        pts_ns: u64,
+        dts_ns: u64,
+        duration_ns: Option<u64>,
+    ) -> Result<()> {
         let independent = segments::independent_frame(data, self.codec);
         let mut previous = None;
         if independent
@@ -305,6 +316,9 @@ impl RecordingState {
             let buffer_ref = buffer.get_mut().unwrap();
             buffer_ref.set_pts(gst::ClockTime::from_nseconds(pts_ns));
             buffer_ref.set_dts(gst::ClockTime::from_nseconds(dts_ns));
+            // Without a duration, MP4 finalization can exclude the last sample
+            // when the codec has no frame-rate timing in its parameter sets.
+            buffer_ref.set_duration(duration_ns.map(gst::ClockTime::from_nseconds));
 
             if !is_keyframe {
                 buffer_ref.set_flags(gst::BufferFlags::DELTA_UNIT);

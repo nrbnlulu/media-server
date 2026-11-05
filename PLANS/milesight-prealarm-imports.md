@@ -31,10 +31,11 @@ existing-player seeks and finite `ended` behavior. Live camera and NVR exports
 also completed through the authenticated HTTP/WebSocket API. Temporary diagnostic
 media and credentials are not repository fixtures.
 
-Next: playback-only signaling and player/UI clip integration, including clip-start
-selection, reconnect position, bounded seeking and finite ended behavior. Then
-resume backend B1/B2 job integration and retention row synchronization. Generic
-ONVIF replay remains deferred; the current scope is Milesight.
+Playback-only signaling is implemented; see `playback-only-sessions.md` for the
+session design and validation. Backend B1/B2/B3 and application clip UI are also
+implemented. Next: confirm visual playback in the running Flutter UI, then backend
+retention-row synchronization. Generic ONVIF replay remains deferred; the current
+scope is Milesight.
 
 Authentication (#531), including playback authorization and player token support,
 is the final implementation stage after playback, UI and backend integration. It

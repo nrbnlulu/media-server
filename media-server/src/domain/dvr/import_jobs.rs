@@ -366,8 +366,8 @@ impl ImportManager {
             .collect()
     }
 }
-fn completed_in(root: &Path) -> Result<Option<ImportResult>> {
-    if !root.exists() {
+pub(crate) fn completed_in(root: &Path) -> Result<Option<ImportResult>> {
+    if !root.exists() || root.join(".import-staging").exists() {
         return Ok(None);
     }
     ensure!(

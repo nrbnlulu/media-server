@@ -76,6 +76,14 @@ impl WebrtcManager {
                             let _ = app_state.delete_webrtc_session(&session_id_clone).await;
                         }
                     }
+                    RTCPeerConnectionState::Connected => {
+                        if let Some(app_state) = app_state_clone.upgrade()
+                            && let Err(error) =
+                                app_state.session_transport_ready(&session_id_clone).await
+                        {
+                            log::warn!("Failed to start playback: {error:#}");
+                        }
+                    }
                     _ => {}
                 }
             })
@@ -92,41 +100,52 @@ impl WebrtcManager {
             ),
         );
 
-        conn.add_track(track.clone()).await?;
+        let negotiation: anyhow::Result<String> = async {
+            conn.add_track(track.clone()).await?;
 
-        let offer = RTCSessionDescription::offer(request.offer)?;
-        log::debug!(
-            "Offer SDP type: {:?}, sdp length: {}",
-            offer.sdp_type,
-            offer.sdp.len()
-        );
-
-        log::debug!("Setting remote description (offer)");
-        conn.set_remote_description(offer).await?;
-
-        log::debug!("Creating answer");
-        let answer = conn.create_answer(None).await?;
-        log::debug!(
-            "Answer created, type: {:?}, sdp length: {}",
-            answer.sdp_type,
-            answer.sdp.len()
-        );
-
-        log::debug!("Setting local description (answer)");
-        conn.set_local_description(answer.clone()).await?;
-
-        log::debug!("Waiting for ICE gathering to complete");
-        conn.gathering_complete_promise().await.recv().await;
-        log::info!("ICE gathering complete for session {}", session_id);
-
-        let answer_sdp = if let Some(local_desc) = conn.local_description().await {
+            let offer = RTCSessionDescription::offer(request.offer)?;
             log::debug!(
-                "Final answer SDP with ICE candidates, length: {}",
-                local_desc.sdp.len()
+                "Offer SDP type: {:?}, sdp length: {}",
+                offer.sdp_type,
+                offer.sdp.len()
             );
-            local_desc.sdp
-        } else {
-            bail!("No local description available");
+
+            log::debug!("Setting remote description (offer)");
+            conn.set_remote_description(offer).await?;
+
+            log::debug!("Creating answer");
+            let answer = conn.create_answer(None).await?;
+            log::debug!(
+                "Answer created, type: {:?}, sdp length: {}",
+                answer.sdp_type,
+                answer.sdp.len()
+            );
+
+            log::debug!("Setting local description (answer)");
+            conn.set_local_description(answer.clone()).await?;
+
+            log::debug!("Waiting for ICE gathering to complete");
+            conn.gathering_complete_promise().await.recv().await;
+            log::info!("ICE gathering complete for session {}", session_id);
+
+            let answer_sdp = if let Some(local_desc) = conn.local_description().await {
+                log::debug!(
+                    "Final answer SDP with ICE candidates, length: {}",
+                    local_desc.sdp.len()
+                );
+                local_desc.sdp
+            } else {
+                bail!("No local description available");
+            };
+            Ok(answer_sdp)
+        }
+        .await;
+        let answer_sdp = match negotiation {
+            Ok(answer) => answer,
+            Err(error) => {
+                let _ = conn.close().await;
+                return Err(error);
+            }
         };
         let session = Arc::new(WebRtcSession::new(
             source_id, track, session_id, conn, codec,
@@ -170,6 +189,9 @@ impl WebRtcSession {
         }
     }
 
+    pub fn connected(&self) -> bool {
+        self.conn.connection_state() == RTCPeerConnectionState::Connected
+    }
     pub fn session_id(&self) -> &Uuid {
         &self.session_id
     }

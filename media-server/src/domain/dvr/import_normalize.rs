@@ -272,7 +272,19 @@ pub fn normalize(
         } else {
             bytes
         };
-        writer.as_mut().unwrap().push_timed(&bytes, key, pts, dts)?;
+        let duration_ns = if retime {
+            Some(u64::try_from(
+                1_000_000_000i128 * i128::from(fps.denominator()) / i128::from(fps.numerator()),
+            )?)
+        } else if packet.duration() > 0 {
+            Some(u64::try_from(ns(packet.duration(), base)?)?)
+        } else {
+            None
+        };
+        writer
+            .as_mut()
+            .unwrap()
+            .push_timed_with_duration(&bytes, key, pts, dts, duration_ns)?;
         written += 1;
     }
     let mut writer = writer.ok_or_else(|| anyhow!("corrupt: no IDR frame"))?;
@@ -367,6 +379,30 @@ pub(crate) mod tests {
             std::fs::remove_dir_all(root).unwrap();
         }
     }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn imports_without_sps_timing_preserve_segment_tail_frames() {
+        init_media();
+        let root = std::env::temp_dir().join(format!("ms-no-sps-timing-{}", uuid::Uuid::new_v4()));
+        let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/import-h264-no-sps-timing.mp4");
+        let result =
+            normalize(&input, &root, 1_700_000_000_000, &CancellationToken::new()).unwrap();
+        assert_eq!(result.codec, "h264");
+        assert_eq!(result.actual_start_ms, 1_700_000_000_000);
+        assert!((20_800..=20_900).contains(&(result.actual_end_ms - result.actual_start_ms)));
+        let files = segments::list_in(&root).unwrap();
+        assert_eq!(files.len(), 2);
+        let mut frames = 0;
+        for segment in files {
+            let mut reader = super::super::reader::SegmentReader::open(segment).unwrap();
+            while reader.next().unwrap().is_some() {
+                frames += 1;
+            }
+        }
+        assert_eq!(frames, 626);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn cancelled_import_does_not_publish_segments() {
         let root = std::env::temp_dir().join(format!("ms-normalize-{}", uuid::Uuid::new_v4()));

@@ -1,7 +1,7 @@
 use crate::app::VideoSourceId;
 use crate::common::VideoCodec;
 use crate::common::rtp::RtpPacket;
-use crate::common::traits::{RtpConsumer, RtpVideoPublisher, VideoSource};
+use crate::common::traits::{RtpConsumer, RtpVideoPublisher};
 use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
@@ -525,7 +525,8 @@ async fn write_messages<S>(
 pub async fn handle_incoming_wsc_rtp_websocket(
     ws: WebSocket,
     publisher: Arc<WscRtpPublisher>,
-    source: Arc<dyn VideoSource>,
+    active_source: Option<media_server_api_models::VideoSourceInput>,
+    state: Arc<crate::app::GlobalState>,
     force_websocket_transport: bool,
     playback_events: bool,
 ) {
@@ -569,7 +570,6 @@ pub async fn handle_incoming_wsc_rtp_websocket(
 
     let holepunch_port = udp_port_result.as_ref().map(|(p, _)| *p).unwrap_or(0);
 
-    let active_source = source.active_input();
     if send_wsc_rtp_message(
         &mut sender,
         WscRtpServerMessage::Init {
@@ -662,6 +662,11 @@ pub async fn handle_incoming_wsc_rtp_websocket(
         let _ = send_wsc_rtp_message(&mut sender, WscRtpServerMessage::FallingBackRtpToWs).await;
     }
 
+    if let Err(error) = state.session_transport_ready(&session_id).await {
+        log::warn!("Failed to start clip session {session_id}: {error:#}");
+        publisher.shutdown();
+        return;
+    }
     let mut udp_timeline = WireTimeline::new();
     loop {
         tokio::select! {
